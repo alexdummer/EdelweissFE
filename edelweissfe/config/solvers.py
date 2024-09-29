@@ -47,6 +47,7 @@ import importlib
 
 solverLibrary = {
     "NIST": "nonlinearimplicitstatic",
+    "NEST": "nonlinearexplicitstatic",
     "NISTParallel": "nonlinearimplicitstaticparallelmk2",
     "NISTParallelForMarmotElements": "nonlinearimplicitstaticparallel",
     "NISTPArcLength": "nonlinearimplicitstaticparallelarclength",
