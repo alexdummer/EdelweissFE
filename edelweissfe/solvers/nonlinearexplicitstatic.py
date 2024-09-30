@@ -73,6 +73,7 @@ def getRungeKuttaParameters(rungeKuttaStages: int):
     elif rungeKuttaStages == 3:
         # parameters for stage 2
         _alpha[21] = 2 / 3
+        # parameters for stage 3
         _alpha[31] = 0
         _alpha[32] = 2 / 3
 
@@ -85,9 +86,69 @@ def getRungeKuttaParameters(rungeKuttaStages: int):
         _lambda[1] = 0
         _lambda[2] = -3 / 8
         _lambda[3] = 3 / 8
+    elif rungeKuttaStages == 4:
+        # parameters for stage 2
+        _alpha[21] = -0.5
+        # parameters for stage 3
+        _alpha[31] = 0.6684895833
+        _alpha[32] = -0.2434895833
+        # parameters for stage 4
+        _alpha[41] = -2.323685857
+        _alpha[42] = 1.125483559
+        _alpha[43] = 2.198202298
+
+        # parameters for increment estimate
+        _omega[1] = 0.03431372549
+        _omega[2] = 0.02705627706
+        _omega[3] = 0.7440130202
+        _omega[4] = 0.1946169772
+
+        # parameters for error control
+        _lambda[1] = 0.03431372549
+        _lambda[2] = -0.01262626262
+        _lambda[3] = -0.0289338397
+        _lambda[4] = 0.00724637679
+
+    elif rungeKuttaStages == 6:
+        # parameters for stage 2
+        _alpha[21] = 0.2
+        # parameters for stage 3
+        _alpha[31] = 3 / 40
+        _alpha[32] = 9 / 40
+        # parameters for stage 4
+        _alpha[41] = 3 / 10
+        _alpha[42] = -9 / 10
+        _alpha[43] = 6 / 5
+        # parameters for stage 5
+        _alpha[51] = -11 / 54
+        _alpha[52] = 5 / 2
+        _alpha[53] = -70 / 27
+        _alpha[54] = 35 / 27
+        # parameters for stage 6
+        _alpha[61] = 1631 / 55296
+        _alpha[62] = 175 / 512
+        _alpha[63] = 575 / 13824
+        _alpha[64] = 44275 / 110592
+        _alpha[65] = 253 / 4096
+
+        # parameters for increment estimate
+        _omega[1] = 37 / 378
+        _omega[2] = 0
+        _omega[3] = 250 / 621
+        _omega[4] = 125 / 594
+        _omega[5] = 0
+        _omega[6] = 512 / 1771
+
+        # parameters for error control
+        _lambda[1] = -277 / 64512
+        _lambda[2] = 0
+        _lambda[3] = 6925 / 370944
+        _lambda[4] = -6925 / 202752
+        _lambda[5] = -277 / 14336
+        _lambda[6] = 277 / 7084
 
     else:
-        raise NotImplementedError("runge-kutta-stages must be between 2 and 5")
+        raise NotImplementedError("runge-kutta-stages must be 2, 3, 4 or 6")
 
     return _alpha, _omega, _lambda
 
@@ -107,6 +168,7 @@ class NEST(NonlinearSolverBase):
 
     SolverSpecificOptions = {
         "runge-kutta-stages": 2,
+        "runge-kutta-error-tolerance": 1e-3,
         "linsolver": "pardiso",
     }
 
@@ -191,7 +253,7 @@ class NEST(NonlinearSolverBase):
         self.rkAlpha, self.rkOmega, self.rkLambda = getRungeKuttaParameters(self.options.get("runge-kutta-stages", 2))
         self.rkStages = self.options.get("runge-kutta-stages", 2)
 
-        self.tol = self.options.get("error-tolerance", 1e-3)
+        self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)
 
         U = self.theDofManager.constructDofVector()
         P = self.theDofManager.constructDofVector()
