@@ -44,9 +44,7 @@ from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import (
     ConditionalStop,
     CutbackRequest,
-    DivergingSolution,
     ReachedMaxIncrements,
-    ReachedMaxIterations,
     ReachedMinIncrementSize,
     StepFailed,
 )
@@ -175,10 +173,6 @@ class NEST(NonlinearSolverBase):
     def __init__(self, jobInfo, journal, **kwargs):
         self.journal = journal
 
-        self.fieldCorrectionTolerances = jobInfo["fieldCorrectionTolerance"]
-        self.fluxResidualTolerances = jobInfo["fluxResidualTolerance"]
-        self.fluxResidualTolerancesAlt = jobInfo["fluxResidualToleranceAlternative"]
-
         self.options = self.SolverSpecificOptions.copy()
         self._updateOptions(kwargs, journal)
 
@@ -294,9 +288,6 @@ class NEST(NonlinearSolverBase):
                     self.identification,
                     level=1,
                 )
-                # self.journal.message(self.iterationHeader, self.identification, level=2)
-                # self.journal.message(self.iterationHeader2, self.identification, level=2)
-
                 try:
                     U, dU, P, incScaleFactor = self.solveIncrement(
                         U,
@@ -316,21 +307,6 @@ class NEST(NonlinearSolverBase):
                     step.discardAndChangeIncrement(max(e.cutbackSize, 0.25))
                     prevTimeStep = None
 
-                    statusInfoDict["iters"] = np.inf
-                    statusInfoDict["notes"] = str(e)
-
-                    for man in outputmanagers:
-                        man.finalizeFailedIncrement(
-                            statusInfoDict=statusInfoDict,
-                            currentComputingTimes=self.computationTimes,
-                        )
-
-                except (ReachedMaxIterations, DivergingSolution) as e:
-                    self.journal.message(str(e), self.identification, 1)
-                    step.discardAndChangeIncrement(0.25)
-                    prevTimeStep = None
-
-                    statusInfoDict["iters"] = np.inf
                     statusInfoDict["notes"] = str(e)
 
                     for man in outputmanagers:
@@ -341,8 +317,6 @@ class NEST(NonlinearSolverBase):
 
                 else:
                     prevTimeStep = timeStep
-                    # if iterationCounter >= criticalIter:
-                    #     step.preventIncrementIncrease()
 
                     # write results to nodes:
                     for fieldName, field in model.nodeFields.items():
@@ -354,15 +328,6 @@ class NEST(NonlinearSolverBase):
                         variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
 
                     model.advanceToTime(timeStep.totalTime)
-
-                    # self.journal.message(
-                    #     "Converged in {:} iteration(s)".format(iterationCounter),
-                    #     self.identification,
-                    #     1,
-                    # )
-
-                    # statusInfoDict["iters"] = iterationCounter
-                    # statusInfoDict["converged"] = True
 
                     fieldOutputController.finalizeIncrement()
                     for man in outputmanagers:
@@ -384,7 +349,7 @@ class NEST(NonlinearSolverBase):
 
         finally:
             self.journal.printTable(
-                [("Time in {:}".format(k), " {:10.4f}s".format(v)) for k, v in self.computationTimes.items()],
+                [("Time in {:}".format(k), " {:10.4E}s".format(v)) for k, v in self.computationTimes.items()],
                 self.identification,
             )
 
@@ -398,8 +363,8 @@ class NEST(NonlinearSolverBase):
         model: FEModel,
         timeStep: TimeStep,
         prevTimeStep: TimeStep,
-    ) -> tuple[DofVector, DofVector, DofVector, int, dict]:
-        """Standard Newton-Raphson scheme to solve for an increment.
+    ) -> tuple[DofVector, DofVector, DofVector, float]:
+        """Explicit Runge-Kutta scheme to solve for an increment.
 
         Parameters
         ----------
@@ -417,16 +382,10 @@ class NEST(NonlinearSolverBase):
             The list of active step actions.
         model
             The model tree.
-        increment
-            The increment.
-        lastIncrementSize
-            The size of the previous increment.
-        extrapolation
-            The type of extrapolation to be used.
-        maxIter
-            The maximum number of iterations to be used.
-        maxGrowingIter
-            The maximum number of growing residuals until the Newton-Raphson is terminated.
+        timeStep
+            The current time step.
+        prevTimeStep
+            The previous time step.
 
         Returns
         -------
@@ -435,8 +394,7 @@ class NEST(NonlinearSolverBase):
                 - the new solution vector
                 - the solution increment
                 - the new reaction vector
-                - the number of required iterations
-                - the history of residuals per field
+                - the scale factor for the next increment size
         """
 
         elements = model.elements
@@ -457,15 +415,16 @@ class NEST(NonlinearSolverBase):
 
         self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
 
-        # print( "U = ", U_n )
-        # print( "P = ", P )
-
         for geostatic in stepActions["geostatic"].values():
             geostatic.applyAtIterationStart()
+
         dU[:] = 0.0
+
+        # iterate over runge kutta stages
         for k in range(self.rkStages):
             U_np[:] = U_n
             dU_[k][:] = 0.0
+
             if k > 0:
                 for j in range(k + 1 - 1):
                     a = (k + 1) * 10 + 1 + j
@@ -486,24 +445,30 @@ class NEST(NonlinearSolverBase):
             K_ = self.assembleStiffnessCSR(K)
             K_ = self.applyDirichletK(K_, dirichlets)
 
+            # solve for increment
             dU_[k] = self.linearSolve(K_, R)
 
+            # update solution increment
             dU += self.rkOmega[k + 1] * dU_[k]
 
+            # update error measure
             err += self.rkLambda[k + 1] * dU_[k]
 
         normErr = np.linalg.norm(err)
-        self.journal.message("estimated error {:5.2e}".format(normErr), self.identification)
+        self.journal.message("Estimated error {:5.2e}".format(normErr), self.identification, 2)
 
         if normErr > self.tol:
-            raise CutbackRequest(f"estimated error = {normErr}", np.sqrt(self.tol / normErr) * 0.9)
+            raise CutbackRequest("Estimated error too high!", np.sqrt(self.tol / normErr) * 0.9, 2)
 
+        # update solution
         U_np[:] = U_n
         U_np += dU
+
+        # compute elements once more to get the final reaction
         P[:] = K[:] = F[:] = PExt[:] = 0.0
         P, K, F = self.computeElements(elements, U_np, dU, P, K, F, timeStep)
 
-        # new increment size
+        # compute new increment size scale factor
         beta = max(0.1, min(np.sqrt(self.tol / (normErr + 1e-15)) * 0.9, 2))
 
         return U_np, dU, P, beta
