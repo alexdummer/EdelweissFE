@@ -154,6 +154,21 @@ extensions += [
     )
 ]
 
+print("Gather the extension for the NESTParallel solver")
+extensions += [
+    Extension(
+        "*",
+        sources=["edelweissfe/solvers/nonlinearexplicitstaticparallel.pyx"],
+        include_dirs=[numpy.get_include()],
+        language="c++",
+        extra_compile_args=[
+            "-fopenmp",
+            "-Wno-maybe-uninitialized",
+        ],
+        extra_link_args=["-fopenmp"],
+    )
+]
+
 print("Gather the extension for the NISTParallel (MarmotElements only) solver")
 extensions += [
     Extension(

@@ -458,7 +458,7 @@ class NEST(NonlinearSolverBase):
         self.journal.message("Estimated error {:5.2e}".format(normErr), self.identification, 2)
 
         if normErr > self.tol:
-            raise CutbackRequest("Estimated error too high!", np.sqrt(self.tol / normErr) * 0.9, 2)
+            raise CutbackRequest("Estimated error too high!", np.sqrt(self.tol / normErr) * 0.9)
 
         # update solution
         U_np[:] = U_n
