@@ -30,6 +30,8 @@
 # @author: Matthias Neuner
 
 
+from time import time as getCurrentTime
+
 import numpy as np
 
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
