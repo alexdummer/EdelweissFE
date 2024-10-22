@@ -30,7 +30,6 @@
 #
 # @author: Matthias Neuner, Paul Hofer
 
-import numpy as np
 
 from edelweissfe.sections.base.sectionbase import Section as SectionBase
 
@@ -41,7 +40,6 @@ documentation = {
     "elementSets": "comma separated list of element sets for this section",
     "material": "the material to be assigned",
     "materialParameterFromField, index=[index of material parameter], value=[name of analytical field], type=[either 'setToValue' or 'scale']": "(optional) set or scale a material parameter using the value of the given analytical field; modify the field value using the optional keyword f(p,f)=[...] (p...value of parameter from material definition; f...value of analytical field)",
-    "density": "the density to be assigned",
 }
 
 
@@ -49,7 +47,7 @@ class Section(SectionBase):
     def __init__(self, name, options, materialName, model, **kwargs):
         super().__init__(name, options, materialName, model, **kwargs)
 
-        self.density = kwargs.get("density", 1)
+        # self.density = kwargs.get("density", 1)
 
     def assignSectionPropertiesToElement(self, element, **kwargs):
         material = kwargs.get("material", self.material)
@@ -60,10 +58,6 @@ class Section(SectionBase):
 
         element.initializeElement()
 
-        density = self.density
-        elProperties = np.array([density], dtype=float)
-
-        element.setProperties(elProperties)
         # to make sure all elProviders work
         if not isinstance(material, dict):
             element.setMaterial(material)
