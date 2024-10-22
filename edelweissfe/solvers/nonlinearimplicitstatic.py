@@ -503,8 +503,8 @@ class NIST:
 
         Parameters
         ----------
-        distributedLoads
-            The list of distributed loads.
+        bodyForces
+            The list of body forces.
         U_np
             The current solution vector.
         PExt

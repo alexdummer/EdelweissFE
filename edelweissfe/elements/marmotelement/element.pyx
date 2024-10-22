@@ -271,6 +271,13 @@ cdef class MarmotElementWrapper:
                                     &U[0],
                                     &time[0],
                                     dTime)
+
+    def computeLumpedInertia( self, double[::1] M ):
+        """Compute the lumped mass matrix of the underlying MarmotElement"""
+
+        self.marmotElement.computeLumpedInertia(&M[0])
+
+
     def acceptLastState(self,):
         """Accept the computed state (in nonlinear iteration schemes)."""
 

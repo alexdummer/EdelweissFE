@@ -50,6 +50,8 @@ solverLibrary = {
     "NISTParallel": "nonlinearimplicitstaticparallelmk2",
     "NISTParallelForMarmotElements": "nonlinearimplicitstaticparallel",
     "NISTPArcLength": "nonlinearimplicitstaticparallelarclength",
+    "NED": "nonlinearexplicitdynamic",
+    "NEDParallel": "nonlinearexplicitdynamicparallel",
 }
 
 

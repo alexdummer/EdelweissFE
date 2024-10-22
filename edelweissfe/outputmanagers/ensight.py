@@ -73,7 +73,7 @@ def writeCInt(f, ndarray):
 
 
 def writeC80(f, string):
-    np.asarray(string, dtype="a80").tofile(f)
+    np.asarray(string, dtype="S80").tofile(f)
 
 
 ensightPerNodeVariableTypes = {

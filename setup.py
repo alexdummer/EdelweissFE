@@ -153,6 +153,20 @@ extensions += [
         extra_link_args=["-fopenmp"],
     )
 ]
+print("Gather the extension for the NEDParallel solver")
+extensions += [
+    Extension(
+        "*",
+        sources=["edelweissfe/solvers/nonlinearexplicitdynamicparallel.pyx"],
+        include_dirs=[numpy.get_include()],
+        language="c++",
+        extra_compile_args=[
+            "-fopenmp",
+            "-Wno-maybe-uninitialized",
+        ],
+        extra_link_args=["-fopenmp"],
+    )
+]
 
 print("Gather the extension for the NISTParallel (MarmotElements only) solver")
 extensions += [
