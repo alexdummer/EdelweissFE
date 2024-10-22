@@ -119,16 +119,18 @@ class OutputManager(OutputManagerBase):
         return incrementComputingTimeTotal, incrementComputingTimes
 
     def printIncrementComputingTimes(self, incCompTimeTotal, incCompTimesIndividual):
-        self.journal.printTable(
-            [
-                (
-                    "Time in {:}".format(k),
-                    " {:.5e}s ({:>4.1f}%)".format(v, v / incCompTimeTotal * 100),
-                )
-                for k, v in incCompTimesIndividual.items()
-            ],
-            self.identification,
-        )
+
+        if incCompTimeTotal != 0.0:
+            self.journal.printTable(
+                [
+                    (
+                        "Time in {:}".format(k),
+                        " {:.5e}s ({:>4.1f}%)".format(v, v / incCompTimeTotal * 100),
+                    )
+                    for k, v in incCompTimesIndividual.items()
+                ],
+                self.identification,
+            )
 
     def writeIncrementComputingTimesToFile(self, incCompTimeTotal, incCompTimesIndividual, statusInfoDict):
         with open(self.exportFile, "a") as f:

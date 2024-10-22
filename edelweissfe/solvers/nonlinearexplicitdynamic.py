@@ -65,19 +65,15 @@ class NED:
     identification = "NEDSolver"
 
     NEDOptions = {
-        "defaultMaxIter": 10,
-        "defaultCriticalIter": 5,
-        "defaultMaxGrowingIter": 10,
-        "extrapolation": "linear",
-        "linsolver": "pardiso",
+        "runge-kutta-2": False,
+        # "defaultCriticalIter": 5,
+        # "defaultMaxGrowingIter": 10,
+        # "extrapolation": "linear",
+        # "linsolver": "pardiso",
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
         self.journal = journal
-
-        # self.fieldCorrectionTolerances = jobInfo["fieldCorrectionTolerance"]
-        # self.fluxResidualTolerances = jobInfo["fluxResidualTolerance"]
-        # self.fluxResidualTolerancesAlt = jobInfo["fluxResidualToleranceAlternative"]
 
         self.options = self.NEDOptions.copy()
         self._updateOptions(kwargs, journal)
@@ -96,7 +92,7 @@ class NED:
         for k, v in updatedOptions.items():
             if k in self.NEDOptions:
                 journal.message("Updating option {:}={:}".format(k, v), self.identification)
-                self.options[k] = type(self.NISTOptions[k])(updatedOptions[k])
+                self.options[k] = type(self.NEDOptions[k])(updatedOptions[k])
             else:
                 raise AttributeError("Invalid option {:} for {:}".format(k, self.identification))
 
@@ -146,37 +142,16 @@ class NED:
                 "scalar variables",
             ]
 
-        nVariables = len(presentVariableNames)
-        self.iterationHeader = ("{:^25}" * nVariables).format(*presentVariableNames)
-        self.iterationHeader2 = (" {:<10}  {:<10}  ").format("||R||∞", "||ddU||∞") * nVariables
-        self.iterationMessageTemplate = "{:11.2e}{:1}{:11.2e}{:1} "
-
-        # U = self.theDofManager.constructDofVector()
-        # V = self.theDofManager.constructDofVector()
-        # K = self.theDofManager.constructVIJSystemMatrix()
-
-        # self.csrGenerator = CSRGenerator(K)
+        # nVariables = len(presentVariableNames)
 
         self.computationTimes = createTimingDict()
 
         try:
-            self._updateOptions(step.actions["options"]["NISTSolver"].options, self.journal)
+            self._updateOptions(step.actions["options"]["NEDSolver"].options, self.journal)
         except KeyError:
             pass
 
-        # extrapolation = self.options["extrapolation"]
-        # self.linSolver = (
-        #     getLinSolverByName(self.options["linsolver"]) if "linsolver" in self.options else getDefaultLinSolver()
-        # )
-
-        # maxIter = step.maxIter
-        # criticalIter = step.criticalIter
-        # maxGrowingIter = step.maxGrowIter
-
-        # nodes = model.nodes
-        # elements = model.elements
-        # constraints = model.constraints
-        M = scipy.sparse.diags(np.zeros(self.theDofManager.nDof), format="diag")  # initialize lumped mass matrix
+        M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
         U = self.theDofManager.constructDofVector()  # initialize displacement vector
         V = self.theDofManager.constructDofVector()  # initilize velocity vector
         P = self.theDofManager.constructDofVector()  # initialize reaction vector
@@ -216,8 +191,8 @@ class NED:
                     self.identification,
                     level=1,
                 )
-                self.journal.message(self.iterationHeader, self.identification, level=2)
-                self.journal.message(self.iterationHeader2, self.identification, level=2)
+                # self.journal.message(self.iterationHeader, self.identification, level=2)
+                # self.journal.message(self.iterationHeader2, self.identification, level=2)
 
                 try:
                     U, dU, V, P = self.solveIncrement(
@@ -280,7 +255,6 @@ class NED:
                     #     1,
                     # )
 
-                    # statusInfoDict["iters"] = iterationCounter
                     statusInfoDict["converged"] = True
 
                     fieldOutputController.finalizeIncrement()
@@ -310,7 +284,7 @@ class NED:
     def solveIncrement(
         self,
         U_n: DofVector,
-        dU: DofVector,
+        dU_: DofVector,
         V: DofVector,
         P: DofVector,
         M: scipy.sparse.diags,
@@ -318,7 +292,6 @@ class NED:
         model: FEModel,
         timeStep: TimeStep,
         prevTimeStep: TimeStep,
-        extrapolation: str,
     ) -> tuple[DofVector, DofVector, DofVector, DofVector]:
         """Standard explicit update scheme to solve for an increment.
 
@@ -365,49 +338,188 @@ class NED:
         # incNumber, incrementSize, stepProgress, dT, stepTime, totalTime = timeStep
 
         elements = model.elements
-        constraints = model.constraints
-
+        # constraints = model.constraints
+        dU = self.theDofManager.constructDofVector()
         R = self.theDofManager.constructDofVector()
-        F = self.theDofManager.constructDofVector()
         PExt = self.theDofManager.constructDofVector()
         U_np = self.theDofManager.constructDofVector()
 
         dirichlets = stepActions["dirichlet"].values()
-        nodeforces = stepActions["nodeforces"].values()
+        # nodeforces = stepActions["nodeforces"].values()
         distributedLoads = stepActions["distributedload"].values()
         bodyForces = stepActions["bodyforce"].values()
 
         self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
 
-        # dU, isExtrapolatedIncrement = self.extrapolateLastIncrement(
-        #     extrapolation, timeStep, dU, dirichlets, prevTimeStep, model
-        # )
-
         for geostatic in stepActions["geostatic"].values():
             geostatic.applyAtIterationStart()
 
+        if timeStep.timeIncrement == 0.0:
+            return U_n, dU_, V, P
+
+        dU[:] = dU_
         U_np[:] = U_n
 
-        P[:] = M[:] = F[:] = PExt[:] = 0.0
+        if prevTimeStep is None:
 
-        P, M, F = self.computeElements(elements, U_np, dU, P, F, timeStep)
-        PExt = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_np, PExt, timeStep)
-        PExt = self.assembleConstraints(constraints, U_np, dU, PExt, timeStep)
+            prevTimeStep = TimeStep(
+                timeStep.number,
+                timeStep.stepProgressIncrement,
+                timeStep.stepProgress,
+                timeStep.timeIncrement * 0,
+                timeStep.stepTime,
+                timeStep.totalTime - timeStep.timeIncrement,
+            )
+        # if self.options["runge-kutta-2"]:
+        #
+        #     P[:] = M[:] = PExt[:] = 0.0
+        #     P, M = self.computeElements(elements, U_np, dU, P, M, prevTimeStep)
+        #     PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
+        #     PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
+        #
+        #     # first stage
+        #     MInverse = 1.0 / M.T
+        #
+        #     R[:] = P + PExt
+        #
+        #     # enforce dirichlet boundary conditions
+        #     for dirichlet in dirichlets:
+        #         R[self.findDirichletIndices(dirichlet)] = 0.0
+        #
+        #     # update velocity vector with lumped mass matrix
+        #     v1 = MInverse * R * timeStep.timeIncrement
+        #
+        #     # for dirichlet in dirichlets:
+        #     #     v1[self.findDirichletIndices(dirichlet)] = (
+        #     #     dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
+        #     # )
+        #     dU1 = v1 * timeStep.timeIncrement
+        #     # stage 2
+        #     U_np[:] = U_n + 0.5 * dU1
+        #     dU[:] = 0.5 * dU1
+        #
+        #     ts = TimeStep(
+        #         timeStep.number,
+        #         timeStep.stepProgressIncrement,
+        #         timeStep.stepProgress,
+        #         timeStep.timeIncrement / 2,
+        #         timeStep.stepTime,
+        #         timeStep.totalTime - timeStep.timeIncrement / 2,
+        #     )
+        #     P[:] = M[:] = PExt[:] = 0.0
+        #     P, M = self.computeElements(elements, U_np, dU, P, M, ts)
+        #     PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, ts)
+        #     PExt = self.computeBodyForces(bodyForces, U_np, PExt, ts)
+        #
+        #     R[:] = P + PExt
+        #
+        #     # enforce dirichlet boundary conditions
+        #     for dirichlet in dirichlets:
+        #         R[self.findDirichletIndices(dirichlet)] = 0.0
+        #
+        #     # update velocity vector with lumped mass matrix
+        #     v2 = MInverse * R * timeStep.timeIncrement
+        #     #
+        #     # for dirichlet in dirichlets:
+        #     #     v2[self.findDirichletIndices(dirichlet)] = (
+        #     #     dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
+        #     # )
+        #     dU2 = v2 * timeStep.timeIncrement
+        #
+        #     V += 0.5 * (v1 + v2)
+        #
+        #     # # stage 3
+        #     # U_np[:] = U_n
+        #     # U_np += 1 / 2 * dU2
+        #     # dU[:] = 1 / 2 * dU2
+        #     # ts = TimeStep(
+        #     #     timeStep.number,
+        #     #     timeStep.stepProgressIncrement,
+        #     #     timeStep.stepProgress,
+        #     #     timeStep.timeIncrement / 2,
+        #     #     timeStep.stepTime,
+        #     #     timeStep.totalTime - timeStep.timeIncrement / 2,
+        #     # )
+        #     #
+        #     # P[:] = M[:] = PExt[:] = 0.0
+        #     # P, M = self.computeElements(elements, U_np, dU, P, M, ts)
+        #     # PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, ts)
+        #     # PExt = self.computeBodyForces(bodyForces, U_np, PExt, ts)
+        #     #
+        #     # # first stage
+        #     # MInverse = 1.0 / M.T
+        #     #
+        #     # R[:] = P + PExt
+        #     #
+        #     # # enforce dirichlet boundary conditions
+        #     # for dirichlet in dirichlets:
+        #     #     R[self.findDirichletIndices(dirichlet)] = 0.0
+        #     #
+        #     # # update velocity vector with lumped mass matrix
+        #     # v3 = MInverse * R * timeStep.timeIncrement
+        #     # dU3 = v3 * timeStep.timeIncrement
+        #     #
+        #     #
+        #     # # stage 3
+        #     # U_np[:] = U_n
+        #     # U_np += dU3
+        #     # dU[:] = dU3
+        #     # ts =  timeStep
+        #     #
+        #     # P[:] = M[:] = PExt[:] = 0.0
+        #     # P, M = self.computeElements(elements, U_np, dU, P, M, ts)
+        #     # PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, ts)
+        #     # PExt = self.computeBodyForces(bodyForces, U_np, PExt, ts)
+        #     #
+        #     # # first stage
+        #     # MInverse = 1.0 / M.T
+        #     #
+        #     # R[:] = P + PExt
+        #     #
+        #     # # enforce dirichlet boundary conditions
+        #     # for dirichlet in dirichlets:
+        #     #     R[self.findDirichletIndices(dirichlet)] = 0.0
+        #     #
+        #     # # update velocity vector with lumped mass matrix
+        #     # v4 = MInverse * R * timeStep.timeIncrement
+        #     # dU4 = v4 * timeStep.timeIncrement
+        #     # V += 1 / 6 * (v1 + 2*v2 + 2*v3 + v4)
+        # else:
 
-        R[:] = P
-        R += PExt
-        U_np += dU
+        # ts
+        P[:] = M[:] = PExt[:] = 0.0
+        P, M = self.computeElements(elements, U_np, dU, P, M, prevTimeStep)
+        PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
+        PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
 
+        R[:] = P + PExt
+
+        # enforce dirichlet boundary conditions
         for dirichlet in dirichlets:
             R[self.findDirichletIndices(dirichlet)] = 0.0
 
-        V += M.inv() * R * timeStep.timeIncrement
+        # update velocity vector with lumped mass matrix
+        V += 1.0 / M.T * R * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
+
         for dirichlet in dirichlets:
             V[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
 
-        dU = V * timeStep.timeIncrement
+        # update displacement increment vector
+        inc = V * timeStep.timeIncrement
+        dU[:] = inc
+        # enforce dirichlet boundary conditions
+        for dirichlet in dirichlets:
+            dU[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten()
 
-        U_np += dU
+        # update displacement vector
+        U_np[:] = U_n + dU
+
+        P[:] = M[:] = PExt[:] = 0.0
+        P, M = self.computeElements(elements, U_np, dU, P, M, timeStep)
+        PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, timeStep)
+        PExt = self.computeBodyForces(bodyForces, U_np, PExt, timeStep)
+
+        P += PExt
 
         return U_np, dU, V, P
 
@@ -448,8 +560,8 @@ class NED:
             for faceID, elementSet in dLoad.surface.items():
                 for el in elementSet:
                     Pe = np.zeros(el.nDof)
-
-                    el.computeDistributedLoadWithoutStiffness(dLoad.loadType, Pe, faceID, load, U_np[el], time, dT)
+                    Ke = np.zeros((el.nDof, el.nDof)).ravel()
+                    el.computeDistributedLoad(dLoad.loadType, Pe, Ke, faceID, load, U_np[el], time, dT)
 
                     PExt[el] += Pe
 
@@ -493,8 +605,9 @@ class NED:
             force = bForce.getCurrentLoad(timeStep)
             for el in bForce.elementSet:
                 Pe = np.zeros(el.nDof)
+                Ke = np.zeros((el.nDof, el.nDof)).ravel()
 
-                el.computeBodyForceWithoutStiffness(Pe, force, U_np[el], time, dT)
+                el.computeBodyForce(Pe, Ke, force, U_np[el], time, dT)
 
                 PExt[el] += Pe
 
@@ -508,9 +621,9 @@ class NED:
         U_np: DofVector,
         dU: DofVector,
         P: DofVector,
-        M: scipy.sparse.diags,
+        M: DofVector,
         timeStep: TimeStep,
-    ) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+    ) -> tuple[DofVector, DofVector]:
         """Loop over all elements, and evalute them.
         Is is called by solveStep() in each iteration.
 
@@ -518,10 +631,10 @@ class NED:
         ----------
         elements
             The list of finite elements.
-        U_np
+        U_n
             The current solution vector.
         dU
-            The current solution increment vector.
+            The  solution increment vector.
         P
             The reaction vector.
         timeStep
@@ -539,14 +652,16 @@ class NED:
 
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
-
+        P[:] = M[:] = 0.0
         for el in elements.values():
             Pe = np.zeros(el.nDof)
-
-            el.computeYourselfWithoutStiffness(Pe, U_np[el], dU[el], time, dT)
+            Me = np.zeros(el.nDof)
+            Ke = np.zeros((el.nDof, el.nDof)).ravel()
+            el.computeYourself(Ke, Pe, U_np[el], dU[el], time, dT)
+            el.computeLumpedInertia(Me)
 
             P[el] += Pe
-
+            M[el] += Me
         toc = getCurrentTime()
         self.computationTimes["elements"] += toc - tic
 
@@ -642,8 +757,8 @@ class NED:
             PExt[
                 self.theDofManager.idcsOfFieldsOnNodeSetsInDofVector[cLoad.field][cLoad.nodeSet]
             ] += cLoad.getCurrentLoad(timeStep).flatten()
-        PExt = self.computeDistributedLoadsWithoutStiffness(distributedLoads, U_np, PExt, timeStep)
-        PExt = self.computeBodyForcesWithoutStiffness(bodyForces, U_np, PExt, timeStep)
+        PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, timeStep)
+        PExt = self.computeBodyForces(bodyForces, U_np, PExt, timeStep)
 
         return PExt
 
