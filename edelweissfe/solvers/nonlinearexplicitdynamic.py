@@ -27,16 +27,17 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-from time import time as getCurrentTime
 
 import numpy as np
 import scipy
 
+import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.timing import createTimingDict
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
+from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
 from edelweissfe.stepactions.base.stepactionbase import StepActionBase
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import (
@@ -51,7 +52,7 @@ from edelweissfe.utils.exceptions import (
 from edelweissfe.utils.fieldoutput import FieldOutputController
 
 
-class NED:
+class NED(NonlinearSolverBase):
     """This is the Nonlinear Explicit Dynamic -- solver.
 
     Parameters
@@ -65,11 +66,7 @@ class NED:
     identification = "NEDSolver"
 
     NEDOptions = {
-        "runge-kutta-2": False,
-        # "defaultCriticalIter": 5,
-        # "defaultMaxGrowingIter": 10,
-        # "extrapolation": "linear",
-        # "linsolver": "pardiso",
+        "scheme": "central-difference",
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
@@ -249,12 +246,6 @@ class NED:
 
                     model.advanceToTime(timeStep.totalTime)
 
-                    # self.journal.message(
-                    #     "Converged in {:} iteration(s)".format(iterationCounter),
-                    #     self.identification,
-                    #     1,
-                    # )
-
                     statusInfoDict["converged"] = True
 
                     fieldOutputController.finalizeIncrement()
@@ -276,10 +267,9 @@ class NED:
             self.applyStepActionsAtStepEnd(model, step.actions)
 
         finally:
-            self.journal.printTable(
-                [("Time in {:}".format(k), " {:10.4f}s".format(v)) for k, v in self.computationTimes.items()],
-                self.identification,
-            )
+            prettyTable = performancetiming.makePrettyTable()
+            self.journal.printPrettyTable(prettyTable, self.identification)
+            performancetiming.times.clear()
 
     def solveIncrement(
         self,
@@ -293,7 +283,7 @@ class NED:
         timeStep: TimeStep,
         prevTimeStep: TimeStep,
     ) -> tuple[DofVector, DofVector, DofVector, DofVector]:
-        """Standard explicit update scheme to solve for an increment.
+        """Standard explicit update scheme using central differences to solve for an increment.
 
         Parameters
         ----------
@@ -313,29 +303,20 @@ class NED:
             The list of active step actions.
         model
             The model tree.
-        increment
-            The increment.
-        lastIncrementSize
-            The size of the previous increment.
-        extrapolation
-            The type of extrapolation to be used.
-        maxIter
-            The maximum number of iterations to be used.
-        maxGrowingIter
-            The maximum number of growing residuals until the Newton-Raphson is terminated.
+        timeStep
+            The time step.
+        prevTimeStep
+            The previous time step.
 
         Returns
         -------
-        tuple[DofVector,DofVector,DofVector,int,dict]
+        tuple[DofVector,DofVector,DofVector,DofVector]
             A tuple containing
                 - the new solution vector
                 - the solution increment
+                - the new velocity vector
                 - the new reaction vector
-                - the number of required iterations
-                - the history of residuals per field
         """
-
-        # incNumber, incrementSize, stepProgress, dT, stepTime, totalTime = timeStep
 
         elements = model.elements
         # constraints = model.constraints
@@ -348,6 +329,9 @@ class NED:
         # nodeforces = stepActions["nodeforces"].values()
         distributedLoads = stepActions["distributedload"].values()
         bodyForces = stepActions["bodyforce"].values()
+
+        if self.options["scheme"] != "central-difference":
+            raise NotImplementedError("Only central-difference scheme is implemented")
 
         self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
 
@@ -370,121 +354,6 @@ class NED:
                 timeStep.stepTime,
                 timeStep.totalTime - timeStep.timeIncrement,
             )
-        # if self.options["runge-kutta-2"]:
-        #
-        #     P[:] = M[:] = PExt[:] = 0.0
-        #     P, M = self.computeElements(elements, U_np, dU, P, M, prevTimeStep)
-        #     PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
-        #     PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
-        #
-        #     # first stage
-        #     MInverse = 1.0 / M.T
-        #
-        #     R[:] = P + PExt
-        #
-        #     # enforce dirichlet boundary conditions
-        #     for dirichlet in dirichlets:
-        #         R[self.findDirichletIndices(dirichlet)] = 0.0
-        #
-        #     # update velocity vector with lumped mass matrix
-        #     v1 = MInverse * R * timeStep.timeIncrement
-        #
-        #     # for dirichlet in dirichlets:
-        #     #     v1[self.findDirichletIndices(dirichlet)] = (
-        #     #     dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
-        #     # )
-        #     dU1 = v1 * timeStep.timeIncrement
-        #     # stage 2
-        #     U_np[:] = U_n + 0.5 * dU1
-        #     dU[:] = 0.5 * dU1
-        #
-        #     ts = TimeStep(
-        #         timeStep.number,
-        #         timeStep.stepProgressIncrement,
-        #         timeStep.stepProgress,
-        #         timeStep.timeIncrement / 2,
-        #         timeStep.stepTime,
-        #         timeStep.totalTime - timeStep.timeIncrement / 2,
-        #     )
-        #     P[:] = M[:] = PExt[:] = 0.0
-        #     P, M = self.computeElements(elements, U_np, dU, P, M, ts)
-        #     PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, ts)
-        #     PExt = self.computeBodyForces(bodyForces, U_np, PExt, ts)
-        #
-        #     R[:] = P + PExt
-        #
-        #     # enforce dirichlet boundary conditions
-        #     for dirichlet in dirichlets:
-        #         R[self.findDirichletIndices(dirichlet)] = 0.0
-        #
-        #     # update velocity vector with lumped mass matrix
-        #     v2 = MInverse * R * timeStep.timeIncrement
-        #     #
-        #     # for dirichlet in dirichlets:
-        #     #     v2[self.findDirichletIndices(dirichlet)] = (
-        #     #     dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
-        #     # )
-        #     dU2 = v2 * timeStep.timeIncrement
-        #
-        #     V += 0.5 * (v1 + v2)
-        #
-        #     # # stage 3
-        #     # U_np[:] = U_n
-        #     # U_np += 1 / 2 * dU2
-        #     # dU[:] = 1 / 2 * dU2
-        #     # ts = TimeStep(
-        #     #     timeStep.number,
-        #     #     timeStep.stepProgressIncrement,
-        #     #     timeStep.stepProgress,
-        #     #     timeStep.timeIncrement / 2,
-        #     #     timeStep.stepTime,
-        #     #     timeStep.totalTime - timeStep.timeIncrement / 2,
-        #     # )
-        #     #
-        #     # P[:] = M[:] = PExt[:] = 0.0
-        #     # P, M = self.computeElements(elements, U_np, dU, P, M, ts)
-        #     # PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, ts)
-        #     # PExt = self.computeBodyForces(bodyForces, U_np, PExt, ts)
-        #     #
-        #     # # first stage
-        #     # MInverse = 1.0 / M.T
-        #     #
-        #     # R[:] = P + PExt
-        #     #
-        #     # # enforce dirichlet boundary conditions
-        #     # for dirichlet in dirichlets:
-        #     #     R[self.findDirichletIndices(dirichlet)] = 0.0
-        #     #
-        #     # # update velocity vector with lumped mass matrix
-        #     # v3 = MInverse * R * timeStep.timeIncrement
-        #     # dU3 = v3 * timeStep.timeIncrement
-        #     #
-        #     #
-        #     # # stage 3
-        #     # U_np[:] = U_n
-        #     # U_np += dU3
-        #     # dU[:] = dU3
-        #     # ts =  timeStep
-        #     #
-        #     # P[:] = M[:] = PExt[:] = 0.0
-        #     # P, M = self.computeElements(elements, U_np, dU, P, M, ts)
-        #     # PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, ts)
-        #     # PExt = self.computeBodyForces(bodyForces, U_np, PExt, ts)
-        #     #
-        #     # # first stage
-        #     # MInverse = 1.0 / M.T
-        #     #
-        #     # R[:] = P + PExt
-        #     #
-        #     # # enforce dirichlet boundary conditions
-        #     # for dirichlet in dirichlets:
-        #     #     R[self.findDirichletIndices(dirichlet)] = 0.0
-        #     #
-        #     # # update velocity vector with lumped mass matrix
-        #     # v4 = MInverse * R * timeStep.timeIncrement
-        #     # dU4 = v4 * timeStep.timeIncrement
-        #     # V += 1 / 6 * (v1 + 2*v2 + 2*v3 + v4)
-        # else:
 
         # ts
         P[:] = M[:] = PExt[:] = 0.0
@@ -523,6 +392,7 @@ class NED:
 
         return U_np, dU, V, P
 
+    @performancetiming.timeit("distributed loads")
     def computeDistributedLoads(
         self,
         distributedLoads: list[StepActionBase],
@@ -550,8 +420,6 @@ class NED:
             The augmented load vector.
         """
 
-        tic = getCurrentTime()
-
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
 
@@ -565,10 +433,9 @@ class NED:
 
                     PExt[el] += Pe
 
-        toc = getCurrentTime()
-        self.computationTimes["distributed loads"] += toc - tic
         return PExt
 
+    @performancetiming.timeit("body forces")
     def computeBodyForces(
         self,
         bodyForces: list[StepActionBase],
@@ -596,8 +463,6 @@ class NED:
             The augmented load vector and system matrix.
         """
 
-        tic = getCurrentTime()
-
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
 
@@ -611,10 +476,9 @@ class NED:
 
                 PExt[el] += Pe
 
-        toc = getCurrentTime()
-        self.computationTimes["body forces"] += toc - tic
         return PExt
 
+    @performancetiming.timeit("elements")
     def computeElements(
         self,
         elements: list,
@@ -648,8 +512,6 @@ class NED:
             - The modified accumulated flux vector.
         """
 
-        tic = getCurrentTime()
-
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
         P[:] = M[:] = 0.0
@@ -662,11 +524,10 @@ class NED:
 
             P[el] += Pe
             M[el] += Me
-        toc = getCurrentTime()
-        self.computationTimes["elements"] += toc - tic
 
         return P, M
 
+    @performancetiming.timeit("assemble constraints")
     def assembleConstraints(
         self,
         constraints: list[ConstraintBase],
@@ -702,8 +563,6 @@ class NED:
             - The modified system matrix.
         """
 
-        tic = getCurrentTime()
-
         for constraint in constraints.values():
             # Kc = K[constraint].reshape(constraint.nDof, constraint.nDof, order="F")
             Pc = np.zeros(constraint.nDof)
@@ -712,9 +571,6 @@ class NED:
 
             # instead of PExt[constraint] += Pe, np.add.at allows for repeated indices
             np.add.at(PExt, PExt.entitiesInDofVector[constraint], Pc)
-
-        toc = getCurrentTime()
-        self.computationTimes["constraints"] += toc - tic
 
         return PExt
 

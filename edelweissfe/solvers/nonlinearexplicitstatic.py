@@ -33,6 +33,7 @@
 
 import numpy as np
 
+import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
 from edelweissfe.config.timing import createTimingDict
 from edelweissfe.models.femodel import FEModel
@@ -51,7 +52,7 @@ from edelweissfe.utils.exceptions import (
 from edelweissfe.utils.fieldoutput import FieldOutputController
 
 
-def getRungeKuttaParameters(rungeKuttaStages: int):
+def getRungeKuttaParameters(rungeKuttaStages: int) -> tuple[dict, dict, dict]:
 
     _alpha = {}
     _omega = {}
@@ -348,10 +349,9 @@ class NEST(NonlinearSolverBase):
             self.applyStepActionsAtStepEnd(model, step.actions)
 
         finally:
-            self.journal.printTable(
-                [("Time in {:}".format(k), " {:10.4E}s".format(v)) for k, v in self.computationTimes.items()],
-                self.identification,
-            )
+            prettyTable = performancetiming.makePrettyTable()
+            self.journal.printPrettyTable(prettyTable, self.identification)
+            performancetiming.times.clear()
 
     def solveIncrement(
         self,

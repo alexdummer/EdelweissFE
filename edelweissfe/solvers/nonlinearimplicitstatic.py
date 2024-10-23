@@ -34,6 +34,7 @@ from time import time as getCurrentTime
 
 import numpy as np
 
+import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
 from edelweissfe.config.timing import createTimingDict
 from edelweissfe.models.femodel import FEModel
@@ -298,10 +299,13 @@ class NIST(NonlinearSolverBase):
             self.applyStepActionsAtStepEnd(model, step.actions)
 
         finally:
-            self.journal.printTable(
-                [("Time in {:}".format(k), " {:10.4e}s".format(v)) for k, v in self.computationTimes.items()],
-                self.identification,
-            )
+            prettyTable = performancetiming.makePrettyTable()
+            self.journal.printPrettyTable(prettyTable, self.identification)
+            performancetiming.times.clear()
+            # self.journal.printTable(
+            #     [("Time in {:}".format(k), " {:10.4e}s".format(v)) for k, v in self.computationTimes.items()],
+            #     self.identification,
+            # )
 
     def solveIncrement(
         self,

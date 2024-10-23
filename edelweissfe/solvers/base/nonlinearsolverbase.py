@@ -25,9 +25,6 @@
 #  The full text of the license can be found in the file LICENSE.md at
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
-# Created on Sun Jan  8 20:37:35 2017
-
-# @author: Matthias Neuner
 
 from abc import ABC, abstractmethod
 from time import time as getCurrentTime
@@ -36,6 +33,7 @@ import numpy as np
 from numpy import ndarray
 from scipy.sparse import csr_matrix
 
+import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.dofmanager import DofVector, VIJSystemMatrix
@@ -109,6 +107,7 @@ class NonlinearSolverBase(ABC):
     ) -> tuple[DofVector, DofVector, DofVector, int, dict]:
         pass
 
+    @performancetiming.timeit("distributed loads")
     def computeDistributedLoads(
         self,
         distributedLoads: list[StepActionBase],
@@ -139,8 +138,6 @@ class NonlinearSolverBase(ABC):
             The augmented load vector and system matrix.
         """
 
-        tic = getCurrentTime()
-
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
 
@@ -155,10 +152,9 @@ class NonlinearSolverBase(ABC):
 
                     PExt[el] += Pe
 
-        toc = getCurrentTime()
-        self.computationTimes["distributed loads"] += toc - tic
         return PExt, K
 
+    @performancetiming.timeit("body forces")
     def computeBodyForces(
         self,
         bodyForces: list[StepActionBase],
@@ -208,6 +204,7 @@ class NonlinearSolverBase(ABC):
         self.computationTimes["body forces"] += toc - tic
         return PExt, K
 
+    @performancetiming.timeit("dirichlet K on CSR")
     def applyDirichletK(self, K: VIJSystemMatrix, dirichlets: list[StepActionBase]) -> VIJSystemMatrix:
         """Apply the dirichlet bcs on the global stiffness matrix
         Is called by solveStep() before solving the global system.
@@ -244,6 +241,7 @@ class NonlinearSolverBase(ABC):
 
         return K
 
+    @performancetiming.timeit("dirichlet R")
     def applyDirichlet(self, timeStep: TimeStep, R: DofVector, dirichlets: list[StepActionBase]):
         """Apply the dirichlet bcs on the residual vector
         Is called by solveStep() before solving the global equatuon system.
@@ -274,6 +272,7 @@ class NonlinearSolverBase(ABC):
 
         return R
 
+    @performancetiming.timeit("convergence check")
     def checkConvergence(
         self,
         R: DofVector,
@@ -376,6 +375,7 @@ class NonlinearSolverBase(ABC):
 
         return convergedAtAll, nodesWithLargestResidual
 
+    @performancetiming.timeit("linear solve")
     def linearSolve(self, A: csr_matrix, b: DofVector) -> ndarray:
         """Solve the linear equation system.
 
@@ -402,6 +402,7 @@ class NonlinearSolverBase(ABC):
 
         return ddU
 
+    @performancetiming.timeit("assmble stiffness CSR")
     def assembleStiffnessCSR(self, K: VIJSystemMatrix) -> csr_matrix:
         """Construct a CSR matrix from VIJ format.
 
@@ -443,6 +444,7 @@ class NonlinearSolverBase(ABC):
 
         return spatialAveragedFluxes
 
+    @performancetiming.timeit("elements")
     def computeElements(
         self,
         elements: list,
@@ -481,8 +483,6 @@ class NonlinearSolverBase(ABC):
             - The modified accumulated flux vector.
         """
 
-        tic = getCurrentTime()
-
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
 
@@ -495,11 +495,9 @@ class NonlinearSolverBase(ABC):
             P[el] += Pe
             F[el] += abs(Pe)
 
-        toc = getCurrentTime()
-        self.computationTimes["elements"] += toc - tic
-
         return P, K, F
 
+    @performancetiming.timeit("assemble constraints")
     def assembleConstraints(
         self,
         constraints: list[ConstraintBase],
@@ -536,8 +534,6 @@ class NonlinearSolverBase(ABC):
             - The modified system matrix.
         """
 
-        tic = getCurrentTime()
-
         for constraint in constraints.values():
             Kc = K[constraint].reshape(constraint.nDof, constraint.nDof, order="F")
             Pc = np.zeros(constraint.nDof)
@@ -547,11 +543,9 @@ class NonlinearSolverBase(ABC):
             # instead of PExt[constraint] += Pe, np.add.at allows for repeated indices
             np.add.at(PExt, PExt.entitiesInDofVector[constraint], Pc)
 
-        toc = getCurrentTime()
-        self.computationTimes["constraints"] += toc - tic
-
         return PExt, K
 
+    @performancetiming.timeit("assemble loads")
     def assembleLoads(
         self,
         nodeForces: list[StepActionBase],
