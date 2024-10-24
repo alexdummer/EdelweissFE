@@ -32,6 +32,7 @@ import numpy as np
 
 cimport libcpp.cast
 cimport numpy as np
+from libcpp.string cimport string
 
 from edelweissfe.elements.marmotsingleqpelement.marmot cimport (
     MarmotMaterial,
