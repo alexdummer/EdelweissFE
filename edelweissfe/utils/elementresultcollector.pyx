@@ -26,7 +26,6 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-
 cimport numpy as np
 
 import numpy as np
@@ -42,17 +41,19 @@ cdef class ElementResultCollector:
     cdef double[:, :, ::1] res_
     cdef double** resultPointers
 
-    def __init__(self, elements:list, quadraturePoints:range, result:str):
+    def __init__(self, elements: list, quadraturePoints: range, result: str):
         """
         A cdef class for collecting element results (by using the permanent results pointer (i.e., a numpy array)
         in large array of all elements and all quadrature points.
 
         Collecting elemental results may be a performance critical part.
         This cdef class allows for the efficient gathering.
-        A 3D array is assembled if multiple quadrature points are requested (shape ``[elements, quadraturePoints, resultVector]`` )
-        or a 2D array for one quadrature point ( shape ``[elements, resultVector]`` ).
+        A 3D array is assembled if multiple quadrature points
+        are requested (shape ``[elements, quadraturePoints, resultVector]``)
+        or a 2D array for one quadrature point (shape ``[elements, resultVector]``).
 
-        Method :func:`~edelweissfe.utils.elementresultcollector.ElementResultCollector.getCurrentResults` updates the assembly array and passes it back.
+        Method :func:`~edelweissfe.utils.elementresultcollector.ElementResultCollector.getCurrentResults`
+        updates the assembly array and passes it back.
 
         The caller is responsible to make a copy of it, if persistent results are needed!
 
@@ -69,17 +70,19 @@ cdef class ElementResultCollector:
         # hotfix for cython compile error associated with 'range' typing of argument quadraturePoints
         # this is due to a bug in in cython 0.29.xx and should be fixed in cython 3.x.x
         # https://github.com/cython/cython/issues/4002
-        quadraturePoints:range
+        quadraturePoints: range
 
         self.nEls = len(elements)
         self.nGauss = len(quadraturePoints)
 
         # assemble a 2d list of all permanent result arrays (=continously updated np arrays)
-        resultsPointerList = [ [ el.getResultArray(result, qp, getPersistentView=True) for qp in quadraturePoints ] for el in elements ]
+        resultsPointerList = [
+                [el.getResultArray(result, qp, getPersistentView=True) for qp in quadraturePoints]
+                for el in elements]
         self.nSize = resultsPointerList[0][0].shape[0]
 
         # allocate an equivalent 2D C-array for the pointers to each elements results
-        self.resultPointers = <double**> malloc ( sizeof(double*) * self.nEls * self.nGauss )
+        self.resultPointers = <double**> malloc (sizeof(double*) * self.nEls * self.nGauss)
 
         cdef double* ptr
         cdef double[::1] res
@@ -88,10 +91,10 @@ cdef class ElementResultCollector:
             for j, gPt in enumerate(el):
                 res = gPt
                 ptr = <double*> &res[0]
-                self.resultPointers[ i * self.nGauss + j ] = ptr
+                self.resultPointers[i * self.nGauss + j] = ptr
 
         # initialize the large assembly array
-        self.resultsTable = np.empty([self.nEls, self.nGauss, self.nSize]  )
+        self.resultsTable = np.empty([self.nEls, self.nGauss, self.nSize])
 
         # an internal use only memoryview is created for accesing the assembly
         self.res_ = self.resultsTable
@@ -100,7 +103,7 @@ cdef class ElementResultCollector:
         if self.nGauss == 1:
             self.resultsTable = self.resultsTable.reshape(self.nEls, -1)
 
-    def update(self, ):
+    def update(self,):
         """Update all results."""
 
         cdef int i, j, k
@@ -109,7 +112,7 @@ cdef class ElementResultCollector:
                 for k in range(self.nSize):
                     # most inner loop: could also be handled by copying the complete vector at once,
                     # but this version turned out to be faster!
-                    self.res_[i,j,k] = self.resultPointers[ i * self.nGauss + j ][k]
+                    self.res_[i, j, k] = self.resultPointers[i * self.nGauss + j][k]
 
     def getCurrentResults(self,) -> np.ndarray:
         """Update and get current results.
@@ -124,4 +127,4 @@ cdef class ElementResultCollector:
         return self.resultsTable
 
     def __dealloc__(self):
-        free ( self.resultPointers )
+        free (self.resultPointers)

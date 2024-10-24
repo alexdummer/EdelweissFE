@@ -30,7 +30,6 @@
 
 import numpy as np
 
-cimport cython
 cimport libcpp.cast
 cimport numpy as np
 
@@ -43,11 +42,6 @@ from edelweissfe.elements.marmotsingleqpelement.marmot cimport (
 
 from edelweissfe.utils.exceptions import CutbackRequest
 
-from libc.stdlib cimport free, malloc
-from libcpp.memory cimport allocator, make_unique, unique_ptr
-from libcpp.string cimport string
-from libcpp.vector cimport vector
-
 
 cdef class MarmotMaterialHypoElasticWrapper:
 
@@ -56,13 +50,13 @@ cdef class MarmotMaterialHypoElasticWrapper:
     cdef readonly list fields
     cdef readonly int nU
 
-    cdef double[::1] stateVars, stressInStateVars, strainInStateVars, stateVarsMaterial, materialProperties, dStress_dStrainInStateVars
+    cdef double[::1] stateVars, stressInStateVars, strainInStateVars
+    cdef double[::1] stateVarsMaterial, materialProperties, dStress_dStrainInStateVars
 
-    def __init__(self, ):
+    def __init__(self,):
 
         self.fields = ["strain symmetric"]
         self.nU = 6
-
 
     def createMaterial(self, materialName, materialProperties):
 
@@ -80,12 +74,12 @@ cdef class MarmotMaterialHypoElasticWrapper:
         self.marmotMaterialHypoElastic.setCharacteristicElementLength(values[0])
 
     def computeYourself(self,
-                         double[::1] Ke,
-                         double[::1] Pe,
-                         const double[::1] U,
-                         const double[::1] dU,
-                         const double[::1] time,
-                         double dTime):
+                        double[::1] Ke,
+                        double[::1] Pe,
+                        const double[::1] U,
+                        const double[::1] dU,
+                        const double[::1] time,
+                        double dTime):
 
         cdef double pNewDT
         pNewDT = 1e36
@@ -142,13 +136,13 @@ cdef class MarmotMaterialHypoElasticWrapper:
         if result == "dStress_dStrain":
             return np.array(self.dStress_dStrainInStateVars, copy= not getPersistentView)
 
-        cdef string result_ =  result.encode('UTF-8')
+        cdef string result_ = result.encode("UTF-8")
 
         cdef StateView res = self.marmotMaterialHypoElastic.getStateView(result_)
 
-        cdef double[::1] theView = <double[:res.stateSize]> ( res.stateLocation )
+        cdef double[::1] theView = <double[:res.stateSize]> (res.stateLocation)
 
-        return np.array(  theView, copy= not getPersistentView)
+        return np.array(theView, copy= not getPersistentView)
 
     def __dealloc__(self):
 
