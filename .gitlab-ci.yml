@@ -10,4 +10,4 @@ linting:
     - isort --check-only --profile black .
     - black --check --line-length 120 .
     - flake8 --ignore=E203,E501 --extend-ignore=W503 --max-line-length=120  .
-    - cython-lint --max-line-length=120
+    - cython-lint --max-line-length=120 .
