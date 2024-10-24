@@ -26,7 +26,11 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-def applyDirichletK(nls, K, dirichlets):
+from edelweissfe.numerics.dofmanager import VIJSystemMatrix
+from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
+
+
+def applyDirichletK(nls: NonlinearSolverBase, K: VIJSystemMatrix, dirichlets: list) -> VIJSystemMatrix:
     """Apply the dirichlet bcs on the global stiffnes matrix
     Is called by solveStep() before solving the global sys.
     http://stackoverflux.com/questions/12129948/scipy-sparse-set-row-to-zeros
@@ -35,9 +39,11 @@ def applyDirichletK(nls, K, dirichlets):
 
     Parameters
     ----------
-    K
+    nls: NonLinearSolverBase
+        The nonlinear solver.
+    K: VIJSystemMatrix
         The system matrix.
-    dirichlets
+    dirichlets: list
         The list of dirichlet boundary conditions.
 
     Returns
@@ -55,14 +61,14 @@ def applyDirichletK(nls, K, dirichlets):
     indptr_ = K.indptr
     data_ = K.data
 
-    for dirichlet in dirichlets: # for each bc
+    for dirichlet in dirichlets:  # for each bc
         dirichletIndices = nls.findDirichletIndices(dirichlet)
-        for i in dirichletIndices: # for each node dof in the BC
-            for j in range ( indptr_[i] , indptr_ [i+1] ): # iterate along row
+        for i in dirichletIndices:  # for each node dof in the BC
+            for j in range (indptr_[i] , indptr_ [i+1]):  # iterate along row
                 if i == indices_ [j]:
-                    data_[ j ] = 1.0 # diagonal entry
+                    data_[j] = 1.0  # diagonal entry
                 else:
-                    data_[ j ] = 0.0 # off diagonal entry
+                    data_[j] = 0.0  # off diagonal entry
 
     K.eliminate_zeros()
 
