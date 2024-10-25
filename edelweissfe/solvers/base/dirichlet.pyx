@@ -30,7 +30,7 @@ from edelweissfe.numerics.dofmanager import VIJSystemMatrix
 from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
 
 
-def applyDirichletK(nls: NonlinearSolverBase, K: VIJSystemMatrix, dirichlets: list) -> VIJSystemMatrix:
+def applyDirichletK(nls: NonlinearSolverBase, K: VIJSystemMatrix, dirichlets: dict_values) -> VIJSystemMatrix:
     """Apply the dirichlet bcs on the global stiffnes matrix
     Is called by solveStep() before solving the global sys.
     http://stackoverflux.com/questions/12129948/scipy-sparse-set-row-to-zeros
