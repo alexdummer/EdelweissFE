@@ -13,7 +13,7 @@
 #  University of Innsbruck,
 #  2017 - today
 #
-#  Matthias Neuner matthias.neuner@uibk.ac.at
+#  Alexander Dummer alexander.dummer@uibk.ac.at
 #
 #  This file is part of EdelweissFE.
 #
@@ -26,22 +26,31 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-"""
-Parallel implementation of the NEST solver.
-"""
 import os
 from multiprocessing import cpu_count
 
 import edelweissfe.utils.performancetiming as performancetiming
+from edelweissfe.numerics.dofmanager import DofVector, VIJSystemMatrix
 from edelweissfe.solvers.base.dirichlet import applyDirichletK as applyDirichletsFast
 from edelweissfe.solvers.base.parallelelementcomputation import (
-    computeElementsInParallel,
+    computeElementsForImplicitDynamicsInParallel,
 )
-from edelweissfe.solvers.nonlinearexplicitstatic import NEST
+from edelweissfe.solvers.nonlinearimplicitdynamic import NID
+from edelweissfe.timesteppers.timestep import TimeStep
 
 
-class NESTParallel(NEST):
-    identification = "NESTPSolver"
+class NIDParallel(NID):
+    """This is the parallel Nonlinear Implicit Dynamic -- solver.
+
+    Parameters
+    ----------
+    jobInfo
+        A dictionary containing the job information.
+    journal
+        The journal instance for logging.
+    """
+
+    identification = "NIDPSolver"
 
     def solveStep(self, step, model, fieldOutputController, outputmanagers):
         # determine number of threads
@@ -56,10 +65,20 @@ class NESTParallel(NEST):
         self.journal.message("Using {:} threads".format(self.numThreads), self.identification)
         return super().solveStep(step, model, fieldOutputController, outputmanagers)
 
-    @performancetiming.timeit("dirichlet K on CSR")
+    @performancetiming.timeit("dirichlet")
     def applyDirichletK(self, K, dirichlets):
         return applyDirichletsFast(self, K, dirichlets)
 
     @performancetiming.timeit("elements")
-    def computeElements(self, elements, Un1, dU, P, K, F, timeStep):
-        return computeElementsInParallel(self, elements, Un1, dU, P, K, F, timeStep)
+    def computeElements(
+        self,
+        elements: list,
+        U_np: DofVector,
+        dU: DofVector,
+        P: DofVector,
+        K: VIJSystemMatrix,
+        M: DofVector,
+        F: DofVector,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+        return computeElementsForImplicitDynamicsInParallel(self, elements, U_np, dU, P, K, M, F, timeStep)

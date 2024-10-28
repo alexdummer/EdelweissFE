@@ -14,6 +14,7 @@
 #  2017 - today
 #
 #  Matthias Neuner matthias.neuner@uibk.ac.at
+#  Alexander Dummer alexander.dummer@uibk.ac.at
 #
 #  This file is part of EdelweissFE.
 #
@@ -38,10 +39,50 @@ from edelweissfe.elements.marmotelement.element cimport (
     MarmotElementWrapper,
 )
 
+from edelweissfe.numerics.dofmanager import DofVector, VIJSystemMatrix
 from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
+from edelweissfe.timesteppers.timestep import TimeStep
 
 
-def computeElementsInParallel(nls: NonlinearSolverBase, elements, Un1, dU, P, K, F, timeStep):
+def computeElementsInParallel(nls: NonlinearSolverBase,
+                              elements: dict,
+                              Un1: DofVector,
+                              dU: DofVector,
+                              P: DofVector,
+                              K: VIJSystemMatrix,
+                              F: DofVector,
+                              timeStep: TimeStep) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+    """
+    Compute the elements in parallel for quasi-static anlysis.
+
+    Parameters
+    ----------
+    nls : NonlinearSolverBase
+        The nonlinear solver.
+    elements : dict
+        The elements to compute.
+    Un1 : DofVector
+        The displacement vector.
+    dU : DofVector
+        The displacement increment vector.
+    P : DofVector
+        The internal force vector.
+    K : VIJSystemMatrix
+        The stiffness matrix.
+    F : DofVector
+        The flux vector.
+    timeStep : TimeStep
+        The time step.
+
+    Returns
+    -------
+    P : DofVector
+        The internal force vector.
+    K : VIJSystemMatrix
+        The stiffness matrix.
+    F : DofVector
+        The flux vector.
+    """
 
     cdef:
         double[::1] time = np.array([timeStep.stepTime, timeStep.totalTime])
@@ -126,7 +167,45 @@ def computeElementsInParallel(nls: NonlinearSolverBase, elements, Un1, dU, P, K,
     return P, K, F
 
 
-def computeElementsInParallelForMarmotElements(nls: NonlinearSolverBase, elements, Un1, dU, P, K, F, timeStep):
+def computeElementsInParallelForMarmotElements(nls: NonlinearSolverBase,
+                                               elements: dict,
+                                               Un1: DofVector,
+                                               dU: DofVector,
+                                               P: DofVector,
+                                               K: VIJSystemMatrix,
+                                               F: DofVector,
+                                               timeStep: TimeStep) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+    """
+    Compute the elements in parallel for quasi-static anlysis for Marmot Elements only.
+
+    Parameters
+    ----------
+    nls : NonlinearSolverBase
+        The nonlinear solver.
+    elements : dict
+        The elements to compute.
+    Un1 : DofVector
+        The displacement vector.
+    dU : DofVector
+        The displacement increment vector.
+    P : DofVector
+        The internal force vector.
+    K : VIJSystemMatrix
+        The stiffness matrix.
+    F : DofVector
+        The flux vector.
+    timeStep : TimeStep
+        The time step.
+
+    Returns
+    -------
+    P : DofVector
+        The internal force vector.
+    K : VIJSystemMatrix
+        The stiffness matrix.
+    F : DofVector
+        The flux vector.
+    """
 
     cdef:
         double[::1] time = np.array([timeStep.stepTime, timeStep.totalTime])
@@ -230,7 +309,7 @@ def computeElementsForExplicitDynamicsInParallel(nls: NonlinearSolverBase,
                                                  dU: DofVector,
                                                  P: DofVector,
                                                  M: DofVector,
-                                                 timeStep: TimeStep):
+                                                 timeStep: TimeStep)-> tuple[DofVector, DofVector]:
     """
     Compute the elements in parallel for explicit dynamics.
 
@@ -240,6 +319,23 @@ def computeElementsForExplicitDynamicsInParallel(nls: NonlinearSolverBase,
         The nonlinear solver.
     elements : dict
         The elements to compute.
+    Un1 : DofVector
+        The displacement vector.
+    dU : DofVector
+        The displacement increment vector.
+    P : DofVector
+        The internal force vector.
+    M : DofVector
+        The diagonal of the lumped mass matrix.
+    timeStep : TimeStep
+        The time step.
+
+    Returns
+    -------
+    P : DofVector
+        The internal force vector.
+    M : DofVector
+        The diagonal of the lumped mass matrix.
     """
 
     # workaround for the fact that no stiffness matrix is present in the NED solver
@@ -330,3 +426,137 @@ def computeElementsForExplicitDynamicsInParallel(nls: NonlinearSolverBase,
             M_mView[IDX[elIdxInVIJ + j]] += Me[elIdxInPe + j]
 
     return P, M
+
+
+def computeElementsForImplicitDynamicsInParallel(nls: NonlinearSolverBase,
+                                                 elements: dict,
+                                                 Un1: DofVector,
+                                                 dU: DofVector,
+                                                 P: DofVector,
+                                                 K: VIJSystemMatrix,
+                                                 M: DofVector,
+                                                 F: DofVector,
+                                                 timeStep: TimeStep
+                                                 ) -> tuple[DofVector, VIJSystemMatrix, DofVector, DofVector]:
+    """
+    Compute the elements in parallel for implicit dynamics.
+
+    Parameters
+    ----------
+    nls : NonlinearSolverBase
+        The nonlinear solver.
+    elements : dict
+        The elements to compute.
+    Un1 : DofVector
+        The displacement vector.
+    dU : DofVector
+        The displacement increment vector.
+    P : DofVector
+        The internal force vector.
+    K : VIJSystemMatrix
+        The stiffness matrix.
+    M : DofVector
+        The diagonal of the lumped mass matrix.
+    F : DofVector
+        The flux vector.
+    timeStep : TimeStep
+        The time step.
+
+    Returns
+    -------
+    P : DofVector
+        The internal force vector.
+    K : VIJSystemMatrix
+        The stiffness matrix.
+    M : DofVector
+        The diagonal of the lumped mass matrix.
+    F : DofVector
+        The flux vector.
+    """
+
+    cdef:
+        double[::1] time = np.array([timeStep.stepTime, timeStep.totalTime])
+        double dT = timeStep.timeIncrement
+
+    cdef:
+        int elNDof, elIdxInVIJ, elIdxInPe, threadID, currentIdxInU
+        int desiredThreads = nls.numThreads
+        int nElements = len(elements.values())
+        list elList = list(elements.values())
+
+        long[::1] IDX = K.I
+        double[::1] K_mView = K
+        double[::1] UN1_mView = Un1
+        double[::1] dU_mView = dU
+        double[::1] P_mView = P
+        double[::1] F_mView = F
+        double[::1] M_mView = M
+
+        # oversized Buffers for parallel computing:
+        # tables [nThreads x max(elements.ndof)] for U & dU (can be overwritten during parallel computing)
+        maxNDofOfAnyEl = nls.theDofManager.largestNumberOfElNDof
+        double[:, ::1] UN1e = np.empty((desiredThreads, maxNDofOfAnyEl),)
+        double[:, ::1] dUe = np.empty((desiredThreads, maxNDofOfAnyEl),)
+        # oversized buffer for Pe (size = sum(elements.ndof))
+        double[::1] Pe = np.zeros(nls.theDofManager.accumulatedElementNDof)
+        double[::1] Me = np.zeros(nls.theDofManager.accumulatedElementNDof)
+
+        # lists (indices and nDofs), which can be accessed parallely
+        int[::1] elIndicesInVIJ = np.empty((nElements,), dtype=np.intc)
+        int[::1] elIndexInPe = np.empty((nElements,), dtype=np.intc)
+        int[::1] elNDofs = np.empty((nElements,), dtype=np.intc)
+
+        int i, j = 0
+
+    # TODO: this could be done once (__init__) and stored permanently in a cdef class
+    for i in range(nElements):
+        # prepare all lists for upcoming parallel element computing
+        el = elList[i]
+        elIndicesInVIJ[i] = nls.theDofManager.idcsOfHigherOrderEntitiesInVIJ[el]
+        elNDofs[i] = el.nDof
+        # each element gets its place in the Pe buffer
+        elIndexInPe[i] = j
+        j += elNDofs[i]
+
+    for i in prange(nElements,
+                    schedule="dynamic",
+                    num_threads=desiredThreads,
+                    nogil=True):
+
+        threadID = threadid()
+        elIdxInVIJ = elIndicesInVIJ[i]
+        elIdxInPe = elIndexInPe[i]
+        elNDof = elNDofs[i]
+
+        for j in range (elNDof):
+            # copy global U & dU to buffer memories for element eval.
+            currentIdxInU = IDX[elIndicesInVIJ[i] + j]
+            UN1e[threadID, j] = UN1_mView[currentIdxInU]
+            dUe[threadID, j] = dU_mView[currentIdxInU]
+
+        # for accessing the element in the list, and for passing the parameters
+        # we have to enable the gil.
+        # This prevents a parallel execution in the meanwhile,
+        # so we hope the method computeYourself AGAIN releases the gil INSIDE.
+        # Otherwise, a truly parallel execution won't happen at all!
+        with gil:
+            elList[i].computeYourself(K_mView[elIdxInVIJ : elIdxInVIJ + elNDof ** 2],
+                                      Pe[elIdxInPe : elIdxInPe + elNDof],
+                                      UN1e[threadID, :],
+                                      dUe[threadID, :],
+                                      time,
+                                      dT)
+
+            elList[i].computeLumpedInertia(Me[elIdxInPe : elIdxInPe + elNDof])
+
+    # successful elements evaluation: condense oversize Pe buffer -> P
+    for i in range(nElements):
+        elIdxInVIJ = elIndicesInVIJ[i]
+        elIdxInPe = elIndexInPe[i]
+        elNDof = elNDofs[i]
+        for j in range (elNDof):
+            P_mView[IDX[elIdxInVIJ + j]] += Pe[elIdxInPe + j]
+            M_mView[IDX[elIdxInVIJ + j]] += Me[elIdxInPe + j]
+            F_mView[IDX[elIdxInVIJ + j]] += abs(Pe[elIdxInPe + j])
+
+    return P, K, M, F
