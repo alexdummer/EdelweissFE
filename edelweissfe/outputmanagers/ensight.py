@@ -493,7 +493,7 @@ class EnsightChunkWiseCase:
 
         filename = self.fileNames[ensightGeometry.name]
 
-        with open(filename, mode="wb") as f:
+        with open(filename, mode="ab") as f:
             if ensightGeometry.name not in self.geometryTrends:
                 self.geometryTrends[ensightGeometry.name] = timeAndFileSetNumber
                 writeC80(f, "C Binary")
@@ -528,7 +528,7 @@ class EnsightChunkWiseCase:
 
         filename = self.fileNames[ensightVariable.name]
 
-        with open(filename, mode="wb") as f:
+        with open(filename, mode="ab") as f:
 
             if ensightVariable.name not in self.variableTrends:
                 self.variableTrends[ensightVariable.name] = (
@@ -625,7 +625,7 @@ def createUnstructuredPartFromElementSet(setName, elementSet: list, partID: int)
         if elShape not in elementDict:
             elementDict[elShape] = dict()
         elNodeIndices = []
-        for node in element.nodes:
+        for node in element.visualizationNodes:
             # if the node is already in the dict, get its index,
             # else insert it, and get the current idx = counter. increase the counter
             idx = partNodes.setdefault(node, nodeCounter)
@@ -758,7 +758,6 @@ class OutputManager(OutputManagerBase):
         variableJob["part"] = part
 
         if nEntries != len(fieldOutput.associatedSet):
-            print(len(fieldOutput.associatedSet))
             raise Exception(
                 "Variable {:} result size ({:}) does not match the number of nodes ({:})".format(
                     variableJob["name"], nEntries, len(variableJob["part"].nodes)
