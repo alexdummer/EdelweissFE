@@ -26,10 +26,8 @@
 #  The full text of the license can be found in the file LICENSE.md at
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
-# Created on Sun Jan  8 20:37:35 2017
 
-# @author: Matthias Neuner
-
+import json
 
 import numpy as np
 
@@ -169,6 +167,7 @@ class NEST(NonlinearSolverBase):
         "runge-kutta-stages": 2,
         "runge-kutta-error-tolerance": 1e-3,
         "linsolver": "pardiso",
+        "linsolverConfigFile": "",
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
@@ -240,8 +239,12 @@ class NEST(NonlinearSolverBase):
         except KeyError:
             pass
 
+        linsolverOptions = self.options["linsolverConfigFile"]
+        linsolverOptionDict = json.load(open(linsolverOptions, "r")) if linsolverOptions else ""
         self.linSolver = (
-            getLinSolverByName(self.options["linsolver"]) if "linsolver" in self.options else getDefaultLinSolver()
+            getLinSolverByName(self.options["linsolver"], linsolverOptionDict)
+            if "linsolver" in self.options
+            else getDefaultLinSolver()
         )
 
         # get parameters for runge kutta scheme
@@ -429,6 +432,7 @@ class NEST(NonlinearSolverBase):
                 for j in range(k + 1 - 1):
                     a = (k + 1) * 10 + 1 + j
                     dU_[k] += self.rkAlpha[a] * dU_[j]
+
             U_np += dU_[k]
 
             P[:] = K[:] = F[:] = PExt[:] = 0.0
@@ -454,15 +458,15 @@ class NEST(NonlinearSolverBase):
             # update error measure
             err += self.rkLambda[k + 1] * dU_[k]
 
-        normErr = np.linalg.norm(err)
+        # update solution
+        U_np[:] = U_n
+        U_np += dU
+
+        normErr = np.linalg.norm(err) / (np.linalg.norm(U_np) + 1e-16)
         self.journal.message("Estimated error {:5.2e}".format(normErr), self.identification, 2)
 
         if normErr > self.tol:
             raise CutbackRequest("Estimated error too high!", np.sqrt(self.tol / normErr) * 0.9)
-
-        # update solution
-        U_np[:] = U_n
-        U_np += dU
 
         # compute elements once more to get the final reaction
         P[:] = K[:] = F[:] = PExt[:] = 0.0
