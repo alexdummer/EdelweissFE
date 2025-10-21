@@ -164,7 +164,6 @@ extensions += [
     )
 ]
 
-<<<<<<< HEAD
 print("Gather the extensions for fast dirichlet application")
 extensions += [
     Extension(
@@ -179,7 +178,6 @@ extensions += [
         extra_link_args=["-fopenmp"],
     )
 ]
-=======
 if buildWithMarmot:
     print("Gather the extension for the NISTParallel (MarmotElements only) solver")
     extensions += [
@@ -195,7 +193,6 @@ if buildWithMarmot:
             extra_link_args=["-fopenmp"],
         )
     ]
->>>>>>> alex/build-without-marmot
 
 print("Gather the pardiso interface")
 extensions += [
@@ -239,10 +236,7 @@ if buildPanuaPardiso:
             optional=True,
         )
     ]
-<<<<<<< HEAD
-=======
 
->>>>>>> alex/build-without-marmot
 if buildKLU:
     print("Gather the KLU interface")
     extensions += [
