@@ -347,9 +347,9 @@ class DisplacementElement(BaseElement):
             # Jacobi determinant
             detJ = lin.det(self.J[i])
             # get stiffness matrix for element j in point i
-            K += B.T @ C @ B * detJ * self._t * self._weight[i]
+            K[:] += B.T @ C @ B * detJ * self._t * self._weight[i]
             # calculate P
-            P -= B.T @ stress[self._activeVoigtIndices] * detJ * self._weight[i] * self._t
+            P[:] -= B.T @ stress[self._activeVoigtIndices] * detJ * self._weight[i] * self._t
             # update strain in stateVars
             self._stateVarsTemp[i][6:12] += self._dStrain[i]
 
@@ -394,7 +394,7 @@ class DisplacementElement(BaseElement):
             # Jacobi determinant
             detJ = lin.det(self.J[i])
             # calculate P
-            P -= B.T @ stress[self._activeVoigtIndices] * detJ * self._weight[i] * self._t
+            P[:] -= B.T @ stress[self._activeVoigtIndices] * detJ * self._weight[i] * self._t
             # update strain in stateVars
             self._stateVarsTemp[i][6:12] += self._dStrain[i]
 
@@ -421,7 +421,7 @@ class DisplacementElement(BaseElement):
 
         N = computeNOperator(self._xi, self._eta, self._zeta, self._nInt, self.nNodes, self.nSpatialDimensions)
         for i in range(self._nInt):
-            P += np.outer(N[i], load).flatten() * lin.det(self.J[i]) * self._t * self._weight[i]
+            P[:] += np.outer(N[i], load).flatten() * lin.det(self.J[i]) * self._t * self._weight[i]
 
     def computeConsistentMassMatrix(self, M: np.ndarray):
         """Compute the consistent mass matrix.

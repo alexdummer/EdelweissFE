@@ -29,10 +29,7 @@
 
 import numpy as np
 
-from edelweissfe.utils.exceptions import CutbackRequest
-
 from cython.parallel cimport prange, threadid
-from libc.stdlib cimport free, malloc
 
 # from edelweissfe.elements.marmotelement.element cimport (
 #     MarmotElement,
@@ -365,7 +362,6 @@ def computeElementsForExplicitDynamicsInParallel(nls: NonlinearSolverBase,
         # oversized buffer for Pe (size = sum(elements.ndof))
         double[::1] Pe = np.zeros(nls.theDofManager.accumulatedElementNDof)
         double[::1] Me = np.zeros(nls.theDofManager.accumulatedElementNDof)
-        double[::1] Ke = np.zeros(K.size)
         # lists (indices and nDofs), which can be accessed parallely
         int[::1] elIndicesInVIJ = np.empty((nElements,), dtype=np.intc)
         int[::1] elIndexInPe = np.empty((nElements,), dtype=np.intc)
@@ -408,7 +404,7 @@ def computeElementsForExplicitDynamicsInParallel(nls: NonlinearSolverBase,
         # so we hope the method computeYourself AGAIN releases the gil INSIDE.
         # Otherwise, a truly parallel execution won't happen at all!
         with gil:
-            elList[i].computeYourself(Ke[elIdxInVIJ : elIdxInVIJ + elNDof**2],
+            elList[i].computeYourselfWithoutStiffness(
                                       Pe[elIdxInPe : elIdxInPe + elNDof],
                                       UN1e[threadID, :],
                                       dUe[threadID, :],
