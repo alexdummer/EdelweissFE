@@ -1,8 +1,8 @@
-*material, name=VonMises, id=mat
+*material, name=VonMises, id=mat, provider=edelweiss
 210000, 0.3, 550, 1000, 200, 1400
 
 *job, name=job, domain=3d
-*solver, solver=NISTParallel, name=theSolver
+*solver, solver=NIST, name=theSolver
 
 *modelGenerator, generator=boxGen, name=gen
 x0      =0
@@ -15,6 +15,7 @@ lX      =30
 lY      =50
 lZ      =10
 elType  =C3D8
+elProvider=edelweiss
 
 *section, name=section1, material=mat, type=solid
 all

@@ -1,4 +1,4 @@
-*material, name=LINEARELASTIC, id=mat
+*material, name=LINEARELASTIC, id=mat, provider=edelweiss
 200000, 0.3
 
 *section, name=section1, material=mat, type=solid

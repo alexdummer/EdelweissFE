@@ -1,4 +1,4 @@
-*material, name=LinearElastic, id=mat
+*material, name=LinearElastic, id=mat, provider=edelweiss
 30000.0, 0.15
 
 *job, name=job, domain=2d
@@ -12,6 +12,7 @@ nY      =10
 l       =50
 h       =50
 elType  =CPE4
+elProvider=edelweiss
 
 *section, name=section1, material=mat, type=plane, thickness=1.
 ** materialParameterFromField, index=0, field=AnalyticalField-01, type=settovalue
@@ -24,8 +25,8 @@ all
 create=perNode, elSet=all, field=displacement, result=U, name=displacement
 create=perElement, elSet=all, result=strain, name=strain, quadraturePoint=0:4, f(x)='np.mean(x,axis=1)'
 create=perElement, elSet=all, result=stress, name=stress, quadraturePoint=0:4, f(x)='np.mean(x,axis=1)'
-create=fromExpression, elSet=all, expression="[el._materialProperties[0] for el in model.elementSets['all']]", name=E
-create=fromExpression, elSet=all, expression="[el._materialProperties[1] for el in model.elementSets['all']]", name=nu
+create=fromExpression, elSet=all, expression="[el.material._materialProperties[0] for el in model.elementSets['all']]", name=E
+create=fromExpression, elSet=all, expression="[el.material._materialProperties[1] for el in model.elementSets['all']]", name=nu
 
 *output, type=ensight, name=test
 create=perNode, fieldOutput=displacement
@@ -58,4 +59,5 @@ dirichlet,  name=x0u, nSet=gen_left,      field=displacement, 1=0.
 dirichlet,  name=y0u, nSet=gen_bottom,    field=displacement, 2=0.
 
 *step, solver=theSolver, stepLength=1
-distributedload, name=y1u, surface=gen_top,  field=displacement, magnitude=100, type=pressure
+** distributedload, name=y1u, surface=gen_top,  field=displacement, magnitude=100, type=pressure
+dirichlet,  name=y1u, nSet=gen_top,     field=displacement, 2=-.16666666667

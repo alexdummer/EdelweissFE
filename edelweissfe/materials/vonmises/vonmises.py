@@ -123,6 +123,10 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         self._dfy_ddKappa = lambda kappa_: self.HLin + self.deltaYieldStress * self.delta * np.exp(-self.delta * kappa_)
         self._G = self._E / (2 * (1.0 + self._v))
 
+        self.kappaOld = np.zeros(1)  # initialize kappaOld
+
+        super().__init__(materialProperties)
+
     def elasticityMatrix(self) -> np.ndarray:
         """Initalize a 3D material elasticity matrix.
 
@@ -294,6 +298,6 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         """
 
         if result == "kappa":
-            return self.kappaOld
+            return memoryview(self.kappaOld)
         else:
             raise Exception("This result doesn't exist for the current material.")

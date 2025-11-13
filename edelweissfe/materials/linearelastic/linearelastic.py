@@ -59,6 +59,7 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
     def __init__(self, materialProperties: np.ndarray):
         self._E = materialProperties[0]  # set E
         self._v = materialProperties[1]  # set v
+        super().__init__(materialProperties)
 
     def elasticityMatrixPlaneStress(self) -> np.ndarray:
         """Initalize a 2D plane stress material elasticity matrix.

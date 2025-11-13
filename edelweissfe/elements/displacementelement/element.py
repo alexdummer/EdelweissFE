@@ -408,12 +408,23 @@ class DisplacementElement(BaseElement):
         np.ndarray
             The result.
         """
-
         try:
-            return self._stateVars[quadraturePoint][result]
-        except KeyError:  # result in material
-            self.material.assignCurrentStateVars(self._stateVarsRef[quadraturePoint][12:])
-            return self.material.getResult(result)
+            assert quadraturePoint < self._nInt
+        except AssertionError:
+            raise Exception(f"The requested quadrature point {quadraturePoint} does not exist in this element.")
+        try:
+            if result in ["stress", "strain"]:
+                if getPersistentView:
+                    return memoryview(self._stateVars[quadraturePoint][result])
+                else:
+                    return self._stateVarsRef[quadraturePoint][result]
+            else:  # result in material
+                if getPersistentView:
+                    return memoryview(self.material.getResult(result))
+                else:
+                    return self.material.getResult(result)
+        except KeyError:
+            raise Exception(f"The requested result '{result}' does not exist for this element/material.")
 
     def getCoordinatesAtCenter(self) -> np.ndarray:
         """Compute the underlying MarmotElement centroid coordinates.
@@ -448,4 +459,4 @@ class DisplacementElement(BaseElement):
         """
 
         N = computeNOperator(self._xi, self._eta, self._zeta, self._nInt, self.nNodes, self.nSpatialDimensions)
-        return self._nodesCoordinates @ N
+        return (self._nodesCoordinates @ N).transpose()  # qp coordinates row-wise

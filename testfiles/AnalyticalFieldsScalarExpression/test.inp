@@ -1,4 +1,4 @@
-*material, name=LinearElastic, id=linE
+*material, name=LinearElastic, id=linE, provider=edelweiss
 **Isotropic
 **E    nu
 1.8e4, 0.22
@@ -17,7 +17,7 @@ lX      =1
 lY      =1
 lZ      =2
 elType  =C3D8
-
+elProvider=edelweiss
 *section, name=section1, material=linE, type=solid
 all
 

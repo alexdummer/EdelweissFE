@@ -44,6 +44,16 @@ class BaseHypoElasticMaterial(ABC):
     @property
     def materialProperties(self) -> np.ndarray:
         """The properties the material has."""
+        return self._materialProperties
+
+    def setMaterialProperties(self, materialProperties: np.ndarray):
+        """Set the material properties.
+
+        Parameters
+        ----------
+        materialProperties
+            The numpy array containing the material properties for the requested material."""
+        self._materialProperties = materialProperties
 
     @abstractmethod
     def getNumberOfRequiredStateVars(self) -> int:
@@ -54,9 +64,9 @@ class BaseHypoElasticMaterial(ABC):
         int
             Number of needed material state Vars."""
 
-    @abstractmethod
     def __init__(self, materialProperties: np.ndarray):
         """Initialize."""
+        self.setMaterialProperties(materialProperties)
 
     @abstractmethod
     def assignCurrentStateVars(self, currentStateVars: np.ndarray):
