@@ -30,9 +30,6 @@
 from edelweissfe.elements.displacementelement.element import DisplacementElement
 from edelweissfe.elements.displacementtlelement.element import DisplacementTLElement
 from edelweissfe.elements.marmotelement.element import MarmotElementWrapper
-from edelweissfe.elements.marmotsingleqpelement.element import (
-    MarmotMaterialWrappingElement,
-)
 from edelweissfe.sets.orderedset import ImmutableOrderedSet
 from edelweissfe.utils.meshtools import extractNodesFromElementSet
 
@@ -56,7 +53,6 @@ class ElementSet(ImmutableOrderedSet):
     ):
         self.allowedObjectTypes = [
             MarmotElementWrapper,
-            MarmotMaterialWrappingElement,
             DisplacementElement,
             DisplacementTLElement,
         ]
