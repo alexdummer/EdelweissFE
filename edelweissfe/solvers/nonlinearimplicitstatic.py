@@ -450,7 +450,51 @@ class NIST:
             K_ = self.applyDirichletK(K_, dirichlets)
 
             ddU = self.linearSolve(K_, R)
-            dU += ddU
+            alpha = 1
+            lineSearch = True
+            if lineSearch and iterationCounter > 0:
+                # check is residual is reduced, otherwise do a backtracking line search
+                # this needs reevaluation of the residual at U_np + alpha*ddU
+                U_trial = self.theDofManager.constructDofVector()
+                dU_trial = self.theDofManager.constructDofVector()
+                P_trial = self.theDofManager.constructDofVector()
+                for lsIteration in range(5):
+                    U_trial[:] = U_np + alpha * ddU
+                    dU_trial[:] = dU + alpha * ddU
+                    # dirichletIndices = np.concatenate([self.findDirichletIndices(d) for d in dirichlets])
+
+                    # U_trial[dirichletIndices] -= alpha * ddU[dirichletIndices]
+                    # dU_trial[dirichletIndices] -= alpha * ddU[dirichletIndices]
+
+                    P_trial[:] = K[:] = F[:] = PExt[:] = 0.0
+
+                    P_trial, K, F = self.computeElements(elements, U_trial, dU_trial, P_trial, K, F, timeStep)
+                    PExt, K = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_trial, PExt, K, timeStep)
+                    PExt, K = self.assembleConstraints(constraints, U_trial, dU_trial, PExt, K, timeStep)
+
+                    R_trial = P_trial
+                    R_trial += PExt
+
+                    for dirichlet in dirichlets:
+                        R_trial[self.findDirichletIndices(dirichlet)] = 0.0
+
+                    normRTrial = np.linalg.norm(R_trial, np.inf)
+                    normRCurrent = np.linalg.norm(R, np.inf)
+
+                    if normRTrial <= normRCurrent:
+                        break
+                    else:
+                        alpha *= 0.5
+                        # self.journal.message(
+                        #     "Line search iteration {:}: reducing alpha to {:}".format(lsIteration, alpha),
+                        #     self.identification,
+                        #     level=3,
+                        # )
+                        print("Line search iteration {:}: reducing alpha to {:}".format(lsIteration, alpha))
+                        print("normRTrial: ", normRTrial, " normRCurrent: ", normRCurrent)
+            # only apply alpha for non-dirichlet dofs
+
+            dU += alpha * ddU
             iterationCounter += 1
 
         return U_np, dU, P, iterationCounter, incrementResidualHistory

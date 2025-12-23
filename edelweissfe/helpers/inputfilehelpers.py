@@ -197,7 +197,6 @@ def fillFEModelFromInputFile(model: FEModel, inputfile: dict, journal: Journal) 
     model = abqModelConstructor.createGeometryFromInputFile(model, inputfile)
     model = abqModelConstructor.createMaterialsFromInputFile(model, inputfile)
     model = abqModelConstructor.createAdvancedMaterialsFromInputFile(model, inputfile)
-    model = abqModelConstructor.createConstraintsFromInputFile(model, inputfile)
     model = abqModelConstructor.createAnalyticalFieldsFromInputFile(model, inputfile)
     model = abqModelConstructor.createSectionsFromInputFile(model, inputfile)
 
@@ -207,6 +206,8 @@ def fillFEModelFromInputFile(model: FEModel, inputfile: dict, journal: Journal) 
             continue
         gen = generatorDefinition["generator"]
         model = getGeneratorFunction(gen)(generatorDefinition, model, journal)
+
+    model = abqModelConstructor.createConstraintsFromInputFile(model, inputfile)
 
     return model
 

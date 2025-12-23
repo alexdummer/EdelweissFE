@@ -1,4 +1,4 @@
-*material, name=LinearElastic, id=linearelastic
+*material, name=LinearElastic, id=linearelastic, provider=edelweiss
 2.1e4, 0.22
 
 *job, name=c3d8job, domain=3d
@@ -17,6 +17,7 @@ phi     =90
 lY      =1000
 exG     =False
 elType  =C3D20
+elProvider=edelweiss
 
 *section, name=section1, material=linearelastic, type=solid
 all
