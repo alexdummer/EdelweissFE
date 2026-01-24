@@ -7,7 +7,7 @@ all
 *job, name=c3d8job, domain=2d
 *solver, solver=NEST, name=theSolver
 runge-kutta-stages=6
-runge-kutta-error-tolerance=1e-4
+runge-kutta-error-tolerance=1e-5
 
 *modelGenerator, generator=planeRectQuad, name=gen
 l=10

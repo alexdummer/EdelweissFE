@@ -94,7 +94,7 @@ def computeElementsInParallel(nls: NonlinearSolverBase,
         int nElements = len(elements.values())
         list elList = list(elements.values())
 
-        long[::1] IDX = K.I
+        int[::1] IDX = K.I
         double[::1] K_mView = K
         double[::1] UN1_mView = Un1
         double[::1] dU_mView = dU
@@ -217,7 +217,7 @@ def computeElementsInParallelForMarmotElements(nls: NonlinearSolverBase,
         int nElements = len(elements.values())
         list elList = list(elements.values())
 
-        long[::1] IDX = K.I
+        int[::1] IDX = K.I
         double[::1] K_mView = K
         double[::1] UN1_mView = Un1
         double[::1] dU_mView = dU
@@ -351,7 +351,7 @@ def computeElementsForExplicitDynamicsInParallel(nls: NonlinearSolverBase,
         int nElements = len(elements.values())
         list elList = list(elements.values())
 
-        long[::1] IDX = K.I
+        int[::1] IDX = K.I
         double[::1] UN1_mView = Un1
         double[::1] dU_mView = dU
         double[::1] P_mView = P
@@ -484,7 +484,7 @@ def computeElementsForImplicitDynamicsInParallel(nls: NonlinearSolverBase,
         int nElements = len(elements.values())
         list elList = list(elements.values())
 
-        long[::1] IDX = K.I
+        int[::1] IDX = K.I
         double[::1] K_mView = K
         double[::1] UN1_mView = Un1
         double[::1] dU_mView = dU
