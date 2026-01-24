@@ -148,7 +148,7 @@ def makePrettyTable(maxLevels: int = 4) -> PrettyTable:
         prettytable.add_row(
             (
                 "{:}{:}".format(" " * level, cat),
-                "{:}{:10.4f}s".format(" " * level, t),
+                "{:}{:10.4E}s".format(" " * level, t),
                 calls,
             )
         )

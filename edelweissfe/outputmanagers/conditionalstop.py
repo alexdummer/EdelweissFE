@@ -60,6 +60,7 @@ class OutputManager(OutputManagerBase):
     def updateDefinition(self, **kwargs: dict):
         # for defline in definitionLines:
         entry = {}
+        print(kwargs)
         entry["stop"] = createModelAccessibleFunction(
             kwargs["stop"], self.model, fieldOutputs=self.fieldOutputController.fieldOutputs
         )

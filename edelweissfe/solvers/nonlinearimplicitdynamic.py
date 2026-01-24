@@ -13,7 +13,7 @@
 #  University of Innsbruck,
 #  2017 - today
 #
-#  Matthias Neuner matthias.neuner@uibk.ac.at
+#  Alexander Dummer alexander.dummer@uibk.ac.at
 #
 #  This file is part of EdelweissFE.
 #
@@ -25,14 +25,9 @@
 #  The full text of the license can be found in the file LICENSE.md at
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
-# Created on Sun Jan  8 20:37:35 2017
-
-# @author: Matthias Neuner
-
-import json
-from time import time as getCurrentTime
 
 import numpy as np
+import scipy
 
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
@@ -55,8 +50,42 @@ from edelweissfe.utils.exceptions import (
 from edelweissfe.utils.fieldoutput import FieldOutputController
 
 
-class NIST(NonlinearSolverBase):
-    """This is the Nonlinear Implicit STatic -- solver.
+def computeParamentersForGeneralizedAlpha(rho, alphaM, alphaF, beta, gamma):
+    """Compute the parameters for the generalized alpha method.
+
+    Parameters
+    ----------
+    rho
+        The rho parameter.
+    alphaM
+        The alphaM parameter.
+    alphaF
+        The alphaF parameter.
+    beta
+        The beta parameter.
+    gamma
+        The gamma parameter.
+
+    Returns
+    -------
+    tuple[float,float,float,float]
+        The computed parameters.
+    """
+
+    if alphaM != alphaM:
+        alphaM = (2.0 * rho - 1.0) / (rho + 1.0)
+    if alphaF != alphaF:
+        alphaF = rho / (rho + 1.0)
+    if beta != beta:
+        beta = (1 - alphaM + alphaF) ** 2 / 4
+    if gamma != gamma:
+        gamma = 0.5 - alphaM + alphaF
+
+    return alphaM, alphaF, beta, gamma
+
+
+class NID(NonlinearSolverBase):
+    """This is the Nonlinear Implicit Dynamic -- solver.
 
     Parameters
     ----------
@@ -66,15 +95,21 @@ class NIST(NonlinearSolverBase):
         The journal instance for logging.
     """
 
-    identification = "NISTSolver"
+    identification = "NIDSolver"
 
     SolverSpecificOptions = {
+        "rho": 0.9,
+        "alphaM": np.nan,
+        "alphaF": np.nan,
+        "beta": np.nan,
+        "gamma": np.nan,
+        "alphaR": 0.0,
+        "betaR": 0.0,
+        "linsolver": "pardiso",
+        "extrapolation": "off",
         "defaultMaxIter": 10,
         "defaultCriticalIter": 5,
         "defaultMaxGrowingIter": 10,
-        "extrapolation": "linear",
-        "linsolver": "pardiso",
-        "linsolverConfigFile": "",
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
@@ -139,6 +174,8 @@ class NIST(NonlinearSolverBase):
         self.iterationMessageTemplate = "{:11.2e}{:1}{:11.2e}{:1} "
 
         U = self.theDofManager.constructDofVector()
+        V = self.theDofManager.constructDofVector()
+        A = self.theDofManager.constructDofVector()
         K = self.theDofManager.constructVIJSystemMatrix()
 
         self.csrGenerator = CSRGenerator(K)
@@ -151,24 +188,21 @@ class NIST(NonlinearSolverBase):
             pass
 
         extrapolation = self.options["extrapolation"]
-        linsolverOptions = self.options["linsolverConfigFile"]
-        linsolverOptionDict = json.load(open(linsolverOptions, "r")) if linsolverOptions else ""
         self.linSolver = (
-            getLinSolverByName(self.options["linsolver"], linsolverOptionDict)
-            if "linsolver" in self.options
-            else getDefaultLinSolver()
+            getLinSolverByName(self.options["linsolver"]) if "linsolver" in self.options else getDefaultLinSolver()
         )
 
         maxIter = step.maxIter
         criticalIter = step.criticalIter
         maxGrowingIter = step.maxGrowIter
-        cutbackFactor = step.cutbackFactor
 
         # nodes = model.nodes
         # elements = model.elements
         # constraints = model.constraints
 
         U = self.theDofManager.constructDofVector()
+        V = self.theDofManager.constructDofVector()
+        A = self.theDofManager.constructDofVector()
         P = self.theDofManager.constructDofVector()
         dU = self.theDofManager.constructDofVector()
 
@@ -210,8 +244,10 @@ class NIST(NonlinearSolverBase):
                 self.journal.message(self.iterationHeader2, self.identification, level=2)
 
                 try:
-                    U, dU, P, iterationCounter, incrementResidualHistory = self.solveIncrement(
+                    U, V, A, dU, P, iterationCounter, incrementResidualHistory = self.solveIncrement(
                         U,
+                        V,
+                        A,
                         dU,
                         P,
                         K,
@@ -226,41 +262,33 @@ class NIST(NonlinearSolverBase):
 
                 except CutbackRequest as e:
                     self.journal.message(str(e), self.identification, 1)
-                    step.discardAndChangeIncrement(max(e.cutbackSize, cutbackFactor))
+                    step.discardAndChangeIncrement(max(e.cutbackSize, 0.25))
                     prevTimeStep = None
 
                     statusInfoDict["iters"] = np.inf
                     statusInfoDict["notes"] = str(e)
 
-                    tic = getCurrentTime()
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
                             currentComputingTimes=self.computationTimes,
                         )
-                    toc = getCurrentTime()
-                    self.computationTimes["output"] += toc - tic
 
                 except (ReachedMaxIterations, DivergingSolution) as e:
                     self.journal.message(str(e), self.identification, 1)
-                    step.discardAndChangeIncrement(cutbackFactor)
+                    step.discardAndChangeIncrement(0.25)
                     prevTimeStep = None
 
                     statusInfoDict["iters"] = np.inf
                     statusInfoDict["notes"] = str(e)
 
-                    tic = getCurrentTime()
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
                             currentComputingTimes=self.computationTimes,
                         )
-                    toc = getCurrentTime()
-                    self.computationTimes["output"] += toc - tic
-
                 else:
                     prevTimeStep = timeStep
-
                     if iterationCounter >= criticalIter:
                         step.preventIncrementIncrease()
 
@@ -285,14 +313,11 @@ class NIST(NonlinearSolverBase):
                     statusInfoDict["converged"] = True
 
                     fieldOutputController.finalizeIncrement()
-                    tic = getCurrentTime()
                     for man in outputmanagers:
                         man.finalizeIncrement(
                             currentComputingTimes=self.computationTimes,
                             statusInfoDict=statusInfoDict,
                         )
-                    toc = getCurrentTime()
-                    self.computationTimes["output"] += toc - tic
 
         except (ReachedMaxIncrements, ReachedMinIncrementSize):
             self.journal.errorMessage("Incrementation failed", self.identification)
@@ -309,14 +334,12 @@ class NIST(NonlinearSolverBase):
             prettyTable = performancetiming.makePrettyTable()
             self.journal.printPrettyTable(prettyTable, self.identification)
             performancetiming.times.clear()
-            # self.journal.printTable(
-            #     [("Time in {:}".format(k), " {:10.4e}s".format(v)) for k, v in self.computationTimes.items()],
-            #     self.identification,
-            # )
 
     def solveIncrement(
         self,
         U_n: DofVector,
+        V_n: DofVector,
+        A_n: DofVector,
         dU: DofVector,
         P: DofVector,
         K: VIJSystemMatrix,
@@ -328,12 +351,16 @@ class NIST(NonlinearSolverBase):
         maxIter: int,
         maxGrowingIter: int,
     ) -> tuple[DofVector, DofVector, DofVector, int, dict]:
-        """Standard Newton-Raphson scheme to solve for an increment.
+        """Implicit generalized alpha time-integration to solve for an increment.
 
         Parameters
         ----------
         Un
             The old solution vector.
+        Vn
+            The old velocity vector.
+        An
+            The old acceleration vector.
         dU
             The old solution increment.
         P
@@ -377,8 +404,15 @@ class NIST(NonlinearSolverBase):
 
         R = self.theDofManager.constructDofVector()
         F = self.theDofManager.constructDofVector()
+        M = self.theDofManager.constructDofVector()
         PExt = self.theDofManager.constructDofVector()
         U_np = self.theDofManager.constructDofVector()
+        A_np = self.theDofManager.constructDofVector()
+        V_np = self.theDofManager.constructDofVector()
+        U_int = self.theDofManager.constructDofVector()
+        dU_int = self.theDofManager.constructDofVector()
+        A_int = self.theDofManager.constructDofVector()
+        V_int = self.theDofManager.constructDofVector()
         ddU = None
 
         dirichlets = stepActions["dirichlet"].values()
@@ -392,6 +426,28 @@ class NIST(NonlinearSolverBase):
             extrapolation, timeStep, dU, dirichlets, prevTimeStep, model
         )
 
+        # time integration parameters
+        alphaM, alphaF, beta, gamma = computeParamentersForGeneralizedAlpha(
+            self.options.get("rho"),
+            self.options.get("alphaM"),
+            self.options.get("alphaF"),
+            self.options.get("beta"),
+            self.options.get("gamma"),
+        )
+
+        # Rayleigh damping parameters
+        alphaR = self.options.get("alphaR")
+        betaR = self.options.get("betaR")
+
+        timeStep_int = TimeStep(
+            timeStep.number,
+            timeStep.stepProgressIncrement,
+            timeStep.stepProgress,
+            timeStep.timeIncrement * (1 - alphaF),
+            timeStep.stepTime,
+            timeStep.totalTime - (1 - alphaF) * timeStep.timeIncrement,
+        )
+        dT = timeStep.timeIncrement
         while True:
             for geostatic in stepActions["geostatic"].values():
                 geostatic.applyAtIterationStart()
@@ -399,14 +455,48 @@ class NIST(NonlinearSolverBase):
             U_np[:] = U_n
             U_np += dU
 
-            P[:] = K[:] = F[:] = PExt[:] = 0.0
+            # update acceleration
+            A_np[:] = A_n
+            if dT != 0:
+                A_np[:] *= -(0.5 - beta) / beta
+                A_np[:] += 1 / beta / dT / dT * dU
+                A_np[:] -= 1 / beta / dT * V_n
+            A_int[:] = (1 - alphaM) * A_np + alphaM * A_n
 
-            P, K, F = self.computeElements(elements, U_np, dU, P, K, F, timeStep)
-            PExt, K = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_np, PExt, K, timeStep)
-            PExt, K = self.assembleConstraints(constraints, U_np, dU, PExt, K, timeStep)
+            # update velocity
+            V_np[:] = V_n
+            V_np[:] += (1 - gamma) * dT * A_n
+            V_np[:] += gamma * dT * A_np
+            V_int[:] = (1 - alphaF) * V_np + alphaF * V_n
+
+            # inetrmediate displacement
+            U_int[:] = (1 - alphaF) * U_np + alphaF * U_n
+            dU_int[:] = U_int - U_n
+
+            P[:] = K[:] = M[:] = F[:] = PExt[:] = 0.0
+
+            # intermediate time
+
+            P, K, M, F = self.computeElements(elements, U_int, dU_int, P, K, M, F, timeStep_int)
+            PExt, K = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_int, PExt, K, timeStep_int)
+            PExt, K = self.assembleConstraints(constraints, U_int, dU_int, PExt, K, timeStep_int)
 
             R[:] = P
             R += PExt
+
+            K_ = self.assembleStiffnessCSR(K)
+            R[:] = R - M.T * (A_int + alphaR * V_int) - K_ * V_int * betaR
+
+            # check for zero increment
+            if dT != 0:
+                K_ *= 1 - alphaF
+                K_ += (1 - alphaF) * (1 + gamma) / beta / dT * K_ * betaR
+                K_ = self.addVectorToCSRDiagonal(
+                    K_,
+                    (1 - alphaM) * (1.0 / beta / dT / dT + gamma / beta / dT * alphaR) * M,
+                )
+
+            K_ = self.applyDirichletK(K_, dirichlets)
 
             if iterationCounter == 0 and not isExtrapolatedIncrement and dirichlets:
                 # first iteration? apply dirichlet bcs and unconditionally solve
@@ -421,6 +511,9 @@ class NIST(NonlinearSolverBase):
                 )
 
                 if converged:
+                    # compute elements once more with correct increment
+                    P[:] = K[:] = M[:] = F[:] = 0.0
+                    P, K, M, F = self.computeElements(elements, U_np, dU, P, K, M, F, timeStep)
                     break
 
                 if self.checkDivergingSolution(incrementResidualHistory, maxGrowingIter):
@@ -431,11 +524,79 @@ class NIST(NonlinearSolverBase):
                     self.printResidualOutlierNodes(nodesWithLargestResidual)
                     raise ReachedMaxIterations("Reached max. iterations in current increment, cutting back")
 
-            K_ = self.assembleStiffnessCSR(K)
-            K_ = self.applyDirichletK(K_, dirichlets)
-
             ddU = self.linearSolve(K_, R)
             dU += ddU
             iterationCounter += 1
 
-        return U_np, dU, P, iterationCounter, incrementResidualHistory
+        return U_np, V_np, A_np, dU, P, iterationCounter, incrementResidualHistory
+
+    def addVectorToCSRDiagonal(self, csr: scipy.sparse.csr_matrix, vec: DofVector):
+
+        indices_ = csr.indices
+        indptr_ = csr.indptr
+        data_ = csr.data
+
+        for i in range(vec.size):  # for each node dof in the BC
+            for j in range(indptr_[i], indptr_[i + 1]):  # iterate along row
+                if i == indices_[j]:
+                    data_[j] += vec[i]  # diagonal entry
+        return csr
+
+    @performancetiming.timeit("elements")
+    def computeElements(
+        self,
+        elements: list,
+        U_np: DofVector,
+        dU: DofVector,
+        P: DofVector,
+        K: VIJSystemMatrix,
+        M: DofVector,
+        F: DofVector,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+        """Loop over all elements, and evalute them.
+        Is is called by solveStep() in each iteration.
+
+        Parameters
+        ----------
+        elements
+            The list of finite elements.
+        U_np
+            The current solution vector.
+        dU
+            The current solution increment vector.
+        P
+            The reaction vector.
+        K
+            The system matrix.
+        M
+            The lumped mass matrix.
+        F
+            The vector of accumulated fluxes for convergence checks.
+        timeStep
+            The time step.
+
+        Returns
+        -------
+        tuple[DofVector,VIJSystemMatrix,DofVector]
+            - The modified reaction vector.
+            - The modified system matrix.
+            - The modified accumulated flux vector.
+        """
+
+        time = np.array([timeStep.stepTime, timeStep.totalTime])
+        dT = timeStep.timeIncrement
+
+        for el in elements.values():
+            Ke = K[el]
+            Pe = np.zeros(el.nDof)
+            Me = np.zeros(el.nDof)
+
+            el.computeYourself(Ke, Pe, U_np[el], dU[el], time, dT)
+            el.computeLumpedInertia(Me)
+
+            P[el] += Pe
+            M[el] += Me
+            F[el] += abs(Pe)
+
+        return P, K, M, F

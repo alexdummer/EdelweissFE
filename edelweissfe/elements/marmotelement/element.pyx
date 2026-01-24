@@ -83,7 +83,7 @@ cdef class MarmotElementWrapper:
         self._nDof = self.marmotElement.getNDofPerElement()
 
         cdef vector[vector[string]] fields = self.marmotElement.getNodeFields()
-        self._fields = [[s.decode("utf-8")  for s in n] for n in fields]
+        self._fields = [[s.decode("utf-8") for s in n] for n in fields]
 
         cdef vector[int] permutationPattern = self.marmotElement.getDofIndicesPermutationPattern()
         self._dofIndicesPermutation = np.asarray(permutationPattern)
@@ -222,7 +222,7 @@ cdef class MarmotElementWrapper:
                                const double[::1] U,
                                const double[::1] dU,
                                const double[::1] time,
-                               double dTime, ) nogil except *:
+                               double dTime) nogil except *:
         """Evaluate residual and stiffness for given time, field, and field increment."""
 
         if not self._hasMaterial:
@@ -234,7 +234,8 @@ cdef class MarmotElementWrapper:
 
             pNewDT = 1e36
 
-            self.marmotElement.computeYourself(&U[0], &dU[0],
+            self.marmotElement.computeYourself(&U[0],
+                                               &dU[0],
                                                &Pe[0],
                                                &Ke[0],
                                                &time[0],
@@ -279,6 +280,11 @@ cdef class MarmotElementWrapper:
                                     &U[0],
                                     &time[0],
                                     dTime)
+
+    def computeLumpedInertia(self, double[::1] M):
+        """Compute the lumped mass matrix of the underlying MarmotElement"""
+
+        self.marmotElement.computeLumpedInertia(&M[0])
 
     def acceptLastState(self, ):
         """Accept the computed state (in nonlinear iteration schemes)."""

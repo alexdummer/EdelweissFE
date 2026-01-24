@@ -54,6 +54,7 @@ print("*" * 80)
 marmot_dir = expanduser(os.environ.get("MARMOT_INSTALL_DIR", default_install_prefix))
 mkl_include = expanduser(os.environ.get("MKL_INCLUDE_DIR", join(default_install_prefix, "include")))
 buildPanuaPardiso = True if expanduser(os.environ.get("BUILD_PANUA_PARDISO", "0")) == "1" else False
+buildKLU = True if expanduser(os.environ.get("BUILD_KLU", "0")) == "1" else False
 
 print("Marmot install directory (overwrite via environment var. MARMOT_INSTALL_DIR):")
 print(marmot_dir)
@@ -151,11 +152,11 @@ extensions += [
     )
 ]
 
-print("Gather the extension for the NISTParallel solver")
+print("Gather the extensions for parallel element evaluations")
 extensions += [
     Extension(
         "*",
-        sources=["edelweissfe/solvers/nonlinearimplicitstaticparallelmk2.pyx"],
+        sources=["edelweissfe/solvers/base/parallelelementcomputation.pyx"],
         include_dirs=[numpy.get_include()],
         language="c++",
         extra_compile_args=[
@@ -166,12 +167,12 @@ extensions += [
     )
 ]
 
-print("Gather the extension for the NISTParallel (MarmotElements only) solver")
+print("Gather the extensions for fast dirichlet application")
 extensions += [
     Extension(
         "*",
-        sources=["edelweissfe/solvers/nonlinearimplicitstaticparallel.pyx"],
-        include_dirs=[numpy.get_include()] + [join(marmot_dir, "include")],
+        sources=["edelweissfe/solvers/base/dirichlet.pyx"],
+        include_dirs=[numpy.get_include()],
         language="c++",
         extra_compile_args=[
             "-fopenmp",
@@ -223,38 +224,38 @@ if buildPanuaPardiso:
             optional=True,
         )
     ]
-
-# print("Gather the KLU interface")
-# extensions += [
-#     Extension(
-#         "*",
-#         sources=[
-#             "edelweissfe/linsolve/klu/klu.pyx",
-#             "edelweissfe/linsolve/klu/kluInterface.c",
-#         ],
-#         include_dirs=[
-#             numpy.get_include(),
-#         ],
-#         libraries=[
-#             "klu",
-#             "btf",
-#             "amd",
-#             "colamd",
-#             "metis",
-#             "cholmod",
-#             "camd",
-#             "ccolamd",
-#             "iomp5",
-#             "suitesparseconfig",
-#         ],
-#         language="c",
-#         extra_compile_args=[
-#             "-fopenmp",
-#             "-Wno-maybe-uninitialized",
-#         ],
-#         extra_link_args=["-fopenmp"],
-#     )
-# ]
+if buildKLU:
+    print("Gather the KLU interface")
+    extensions += [
+        Extension(
+            "*",
+            sources=[
+                "edelweissfe/linsolve/klu/klu.pyx",
+                "edelweissfe/linsolve/klu/kluInterface.c",
+            ],
+            include_dirs=[
+                numpy.get_include(),
+            ],
+            libraries=[
+                "klu",
+                "btf",
+                "amd",
+                "colamd",
+                "metis",
+                "cholmod",
+                "camd",
+                "ccolamd",
+                "iomp5",
+                "suitesparseconfig",
+            ],
+            language="c",
+            extra_compile_args=[
+                "-fopenmp",
+                "-Wno-maybe-uninitialized",
+            ],
+            extra_link_args=["-fopenmp"],
+        )
+    ]
 
 print("Now compile!")
 

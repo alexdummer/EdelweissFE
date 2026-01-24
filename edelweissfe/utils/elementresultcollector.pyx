@@ -26,7 +26,6 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-
 cimport numpy as np
 
 import numpy as np
@@ -43,19 +42,19 @@ cdef class ElementResultCollector:
     cdef double[:, :, ::1] res_
     cdef double** resultPointers
 
-    def __init__(self, elements: list, quadraturePoints, result: str):
+    def __init__(self, elements: list, quadraturePoints: range, result: str):
         """
         A cdef class for collecting element results (by using the permanent results pointer (i.e., a numpy array)
         in large array of all elements and all quadrature points.
 
         Collecting elemental results may be a performance critical part.
         This cdef class allows for the efficient gathering.
-        A 3D array is assembled if multiple quadrature points are requested (shape ``[elements, \
-    quadraturePoints, resultVector]``)
+        A 3D array is assembled if multiple quadrature points
+        are requested (shape ``[elements, quadraturePoints, resultVector]``)
         or a 2D array for one quadrature point (shape ``[elements, resultVector]``).
 
-        Method :func:`~edelweissfe.utils.elementresultcollector.ElementResultCollector.getCurrentResults` \
-    updates the assembly array and passes it back.
+        Method :func:`~edelweissfe.utils.elementresultcollector.ElementResultCollector.getCurrentResults`
+        updates the assembly array and passes it back.
 
         The caller is responsible to make a copy of it, if persistent results are needed!
 

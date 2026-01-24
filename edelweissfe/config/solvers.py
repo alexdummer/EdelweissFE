@@ -32,8 +32,13 @@
 Currently, EdelweissFE provides
 
  * a nonlinear implicit static solver (NIST),
+ * a nonlinear explicit static solver (NEST),
+ * a nonlinear implicit dynamic solver (NID),
+ * a nonlinear explicit dynamic solver (NED),
  * a parallel nonlinear implicit static solver (NISTParallel),
  * a parallel nonlinear implicit static solver tuned for marmot elements (NISTParallelForMarmotElements),
+ * a parallel nonlinear explicit static solver (NESTParallel),
+ * a parallel nonlinear explicit dynamic solver (NEDParallel),
  * and a parallel arc length solver (NISTPArcLength).
 
 Choose the solver in the ``*solver`` definition:
@@ -47,8 +52,14 @@ import importlib
 
 solverLibrary = {
     "NIST": "nonlinearimplicitstatic",
+    "NEST": "nonlinearexplicitstatic",
+    "NID": "nonlinearimplicitdynamic",
+    "NED": "nonlinearexplicitdynamic",
     "NISTParallel": "nonlinearimplicitstaticparallelmk2",
     "NISTParallelForMarmotElements": "nonlinearimplicitstaticparallel",
+    "NESTParallel": "nonlinearexplicitstaticparallel",
+    "NIDParallel": "nonlinearimplicitdynamicparallel",
+    "NEDParallel": "nonlinearexplicitdynamicparallel",
     "NISTPArcLength": "nonlinearimplicitstaticparallelarclength",
 }
 
