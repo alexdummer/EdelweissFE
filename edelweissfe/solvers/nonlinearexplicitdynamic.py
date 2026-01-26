@@ -29,7 +29,6 @@
 
 
 import numpy as np
-import scipy
 
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.timing import createTimingDict
@@ -149,10 +148,18 @@ class NED(NonlinearSolverBase):
             pass
 
         M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
+        Minv = self.theDofManager.constructDofVector()  # initialize inverse lumped mass matrix
         U = self.theDofManager.constructDofVector()  # initialize displacement vector
         V = self.theDofManager.constructDofVector()  # initilize velocity vector
         P = self.theDofManager.constructDofVector()  # initialize reaction vector
         dU = self.theDofManager.constructDofVector()  # initialize displacement increment vector
+
+        for el in model.elements.values():
+            Me = np.zeros(el.nDof)
+            el.computeLumpedInertia(Me)
+            M[el] += Me
+
+        Minv[M != 0.0] = 1.0 / M[M != 0.0]
 
         for fieldName, field in model.nodeFields.items():
             U = self.theDofManager.writeNodeFieldToDofVector(U, field, "U")
@@ -188,8 +195,6 @@ class NED(NonlinearSolverBase):
                     self.identification,
                     level=1,
                 )
-                # self.journal.message(self.iterationHeader, self.identification, level=2)
-                # self.journal.message(self.iterationHeader2, self.identification, level=2)
 
                 try:
                     U, dU, V, P = self.solveIncrement(
@@ -197,7 +202,7 @@ class NED(NonlinearSolverBase):
                         dU,
                         V,
                         P,
-                        M,
+                        Minv,
                         step.actions,
                         model,
                         timeStep,
@@ -277,7 +282,7 @@ class NED(NonlinearSolverBase):
         dU_: DofVector,
         V: DofVector,
         P: DofVector,
-        M: scipy.sparse.diags,
+        Minv: DofVector,
         stepActions: list,
         model: FEModel,
         timeStep: TimeStep,
@@ -356,8 +361,8 @@ class NED(NonlinearSolverBase):
             )
 
         # ts
-        P[:] = M[:] = PExt[:] = 0.0
-        P, M = self.computeElements(elements, U_np, dU, P, M, prevTimeStep)
+        P[:] = PExt[:] = 0.0
+        P = self.computeElements(elements, U_np, dU, P, prevTimeStep)
         PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
         PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
 
@@ -368,7 +373,7 @@ class NED(NonlinearSolverBase):
             R[self.findDirichletIndices(dirichlet)] = 0.0
 
         # update velocity vector with lumped mass matrix
-        V += 1.0 / M.T * R * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
+        V += Minv.T * R * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
 
         for dirichlet in dirichlets:
             V[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
@@ -383,8 +388,8 @@ class NED(NonlinearSolverBase):
         # update displacement vector
         U_np[:] = U_n + dU
 
-        P[:] = M[:] = PExt[:] = 0.0
-        P, M = self.computeElements(elements, U_np, dU, P, M, timeStep)
+        P[:] = PExt[:] = 0.0
+        P = self.computeElements(elements, U_np, dU, P, timeStep)
         PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, timeStep)
         PExt = self.computeBodyForces(bodyForces, U_np, PExt, timeStep)
 
@@ -485,9 +490,8 @@ class NED(NonlinearSolverBase):
         U_np: DofVector,
         dU: DofVector,
         P: DofVector,
-        M: DofVector,
         timeStep: TimeStep,
-    ) -> tuple[DofVector, DofVector]:
+    ) -> tuple[DofVector]:
         """Loop over all elements, and evalute them.
         Is is called by solveStep() in each iteration.
 
@@ -514,18 +518,14 @@ class NED(NonlinearSolverBase):
 
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
-        P[:] = M[:] = 0.0
+        P[:] = 0.0
         for el in elements.values():
             Pe = np.zeros(el.nDof)
-            Me = np.zeros(el.nDof)
-            Ke = np.zeros((el.nDof, el.nDof)).ravel()
-            el.computeYourself(Ke, Pe, U_np[el], dU[el], time, dT)
-            el.computeLumpedInertia(Me)
+            el.computeYourselfExplicit(Pe, U_np[el], dU[el], time, dT)
 
             P[el] += Pe
-            M[el] += Me
 
-        return P, M
+        return P
 
     @performancetiming.timeit("assemble constraints")
     def assembleConstraints(

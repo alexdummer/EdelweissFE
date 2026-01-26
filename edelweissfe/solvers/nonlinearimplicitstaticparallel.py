@@ -25,34 +25,45 @@
 #  The full text of the license can be found in the file LICENSE.md at
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
+# Created on Mon Sep 24 13:52:01 2018
+
+# @author: matthias
 """
-Created on Sun Jan  8 20:37:35 2017
-
-@author: matthias
-
-Fri Oct 6 2018:
-
-    This solver is now deprecated since it is replaced by its sucessor mk2.
-    This version (mk1) directly accesses the underlying MarmotElement, and thus
-    it is able to completely release the GIL throughout the complete prange loop.
-    Naturally, it is compatible only with cython elements based on MarmotElements.
-    However, it seems that there is no measurable performance advantage over mk2, which
-    is not dependent on a  underlying MarmotElement (and is thus also compatible with python or
-    cython elements).
-    This solver remains for teaching purposes to demonstrate how to interact with cpp objects.
+Parallel implementation of the NIST solver.
 """
+
+import os
+from multiprocessing import cpu_count
 
 import edelweissfe.utils.performancetiming as performancetiming
+from edelweissfe.solvers.base.dirichlet import applyDirichletK as applyDirichletsFast
 from edelweissfe.solvers.base.parallelelementcomputation import (
-    computeElementsInParallelForMarmotElements,
+    computeElementsInParallel,
 )
-from edelweissfe.solvers.nonlinearimplicitstaticparallelmk2 import NISTParallel
+from edelweissfe.solvers.nonlinearimplicitstatic import NIST
 
 
-class NISTParallelForMarmotElements(NISTParallel):
+class NISTParallel(NIST):
 
     identification = "NISTPSolver"
 
+    def solveStep(self, step, model, fieldOutputController, outputmanagers):
+        # determine number of threads
+        self.numThreads = cpu_count()
+
+        if "OMP_NUM_THREADS" in os.environ:
+            self.numThreads = int(os.environ["OMP_NUM_THREADS"])  # higher priority than .inp settings
+        # else:
+        #     if "NISTSolver" in step.actions["options"]:
+        #         self.numThreads = int(step.actions["options"][self.identification].get('numThreads', self.numThreads))
+
+        self.journal.message("Using {:} threads".format(self.numThreads), self.identification)
+        return super().solveStep(step, model, fieldOutputController, outputmanagers)
+
+    @performancetiming.timeit("dirichlet")
+    def applyDirichletK(self, K, dirichlets):
+        return applyDirichletsFast(self, K, dirichlets)
+
     @performancetiming.timeit("elements")
     def computeElements(self, elements, Un1, dU, P, K, F, timeStep):
-        return computeElementsInParallelForMarmotElements(self, elements, Un1, dU, P, K, F, timeStep)
+        return computeElementsInParallel(elements, Un1, dU, P, K, F, timeStep)

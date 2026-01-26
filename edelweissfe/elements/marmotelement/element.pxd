@@ -96,6 +96,13 @@ cdef extern from "Marmot/MarmotElement.h":
                              double dT,
                              double& pNewdT) except +ValueError
 
+        void computeYourselfExplicit(const double* QTotal,
+                                     const double* dQ,
+                                     double* Pe,
+                                     const double* time,
+                                     double dT,
+                                     double& pNewdT) except +ValueError
+
         void setInitialConditions(StateTypes state,
                                   const double* values)
 
@@ -168,3 +175,10 @@ cdef class MarmotElementWrapper:
                                const double[::1] dU,
                                const double[::1] time,
                                double dTime) nogil except *
+
+    cpdef void computeYourselfExplicit(self,
+                                       double[::1] Pe,
+                                       const double[::1] U,
+                                       const double[::1] dU,
+                                       const double[::1] time,
+                                       double dTime) nogil except *
