@@ -99,7 +99,7 @@ extensions += [
         sources=[
             "edelweissfe/elements/marmotsingleqpelement/marmotmaterialhypoelasticwrapper.pyx",
         ],
-        include_dirs=[join(marmot_dir, "include"), numpy.get_include()],
+        include_dirs=[join(marmot_dir, "include"), join(sys.prefix, "include/eigen3"), numpy.get_include()],
         libraries=["Marmot"],
         library_dirs=[join(marmot_dir, "lib")],
         runtime_library_dirs=[join(marmot_dir, "lib")],
@@ -154,20 +154,20 @@ extensions += [
     )
 ]
 
-print("Gather the extensions for parallel element evaluations")
-extensions += [
-    Extension(
-        "*",
-        sources=["edelweissfe/solvers/base/parallelelementcomputation.pyx"],
-        include_dirs=[numpy.get_include()],
-        language="c++",
-        extra_compile_args=[
-            "-fopenmp",
-            "-Wno-maybe-uninitialized",
-        ],
-        extra_link_args=["-fopenmp"],
-    )
-]
+# print("Gather the extensions for parallel element evaluations")
+# extensions += [
+#     Extension(
+#         "*",
+#         sources=["edelweissfe/solvers/base/parallelelementcomputation.pyx"],
+#         include_dirs=[numpy.get_include()],
+#         language="c++",
+#         extra_compile_args=[
+#             "-fopenmp",
+#             "-Wno-maybe-uninitialized",
+#         ],
+#         extra_link_args=["-fopenmp"],
+#     )
+# ]
 
 print("Gather the extensions for fast dirichlet application")
 extensions += [

@@ -62,4 +62,4 @@ class NESTParallel(NEST):
 
     @performancetiming.timeit("elements")
     def computeElements(self, elements, Un1, dU, P, K, F, timeStep):
-        return computeElementsInParallel(self, elements, Un1, dU, P, K, F, timeStep)
+        return computeElementsInParallel(elements, Un1, dU, P, K, F, timeStep)

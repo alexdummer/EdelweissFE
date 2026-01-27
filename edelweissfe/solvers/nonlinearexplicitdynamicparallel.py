@@ -38,7 +38,7 @@ from multiprocessing import cpu_count
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.numerics.dofmanager import DofVector
 from edelweissfe.solvers.base.parallelelementcomputation import (
-    computeElementsForExplicitDynamicsInParallel,
+    computeElementsInParallelForExplicit,
 )
 from edelweissfe.solvers.nonlinearexplicitdynamic import NED
 from edelweissfe.timesteppers.timestep import TimeStep
@@ -67,7 +67,6 @@ class NEDParallel(NED):
         U_np: DofVector,
         dU: DofVector,
         P: DofVector,
-        M: DofVector,
         timeStep: TimeStep,
-    ) -> tuple[DofVector, DofVector]:
-        return computeElementsForExplicitDynamicsInParallel(self, elements, U_np, dU, P, M, timeStep)
+    ) -> DofVector:
+        return computeElementsInParallelForExplicit(elements, U_np, dU, P, timeStep)
