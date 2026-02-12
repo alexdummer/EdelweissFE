@@ -38,6 +38,7 @@ from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.dofmanager import DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
+from edelweissfe.solvers.base.dirichlet import applyDirichletK
 from edelweissfe.stepactions.base.stepactionbase import StepActionBase
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import DivergingSolution
@@ -206,40 +207,7 @@ class NonlinearSolverBase(ABC):
 
     @performancetiming.timeit("dirichlet K on CSR")
     def applyDirichletK(self, K: VIJSystemMatrix, dirichlets: list[StepActionBase]) -> VIJSystemMatrix:
-        """Apply the dirichlet bcs on the global stiffness matrix
-        Is called by solveStep() before solving the global system.
-        http://stackoverflux.com/questions/12129948/scipy-sparse-set-row-to-zeros
-
-        Parameters
-        ----------
-        K
-            The system matrix.
-        dirichlets
-            The list of dirichlet boundary conditions.
-
-        Returns
-        -------
-        VIJSystemMatrix
-            The modified system matrix.
-        """
-
-        if dirichlets:
-            tic = getCurrentTime()
-            for dirichlet in dirichlets:
-                for row in self.findDirichletIndices(dirichlet):  # dirichlet.indices:
-                    K.data[K.indptr[row] : K.indptr[row + 1]] = 0.0
-
-            # K[row, row] = 1.0 @ once, faster than within the loop above:
-            diag = K.diagonal()
-            diag[np.concatenate([self.findDirichletIndices(d) for d in dirichlets])] = 1.0
-            K.setdiag(diag)
-
-            K.eliminate_zeros()
-
-            toc = getCurrentTime()
-            self.computationTimes["dirichlet K"] += toc - tic
-
-        return K
+        return applyDirichletK(self, K, dirichlets)
 
     @performancetiming.timeit("dirichlet R")
     def applyDirichlet(self, timeStep: TimeStep, R: DofVector, dirichlets: list[StepActionBase]):
@@ -402,7 +370,7 @@ class NonlinearSolverBase(ABC):
 
         return ddU
 
-    @performancetiming.timeit("assmble stiffness CSR")
+    @performancetiming.timeit("assemble stiffness CSR")
     def assembleStiffnessCSR(self, K: VIJSystemMatrix) -> csr_matrix:
         """Construct a CSR matrix from VIJ format.
 
@@ -415,10 +383,7 @@ class NonlinearSolverBase(ABC):
         csr_matrix
             The system matrix in compressed sparse row format.
         """
-        tic = getCurrentTime()
         KCsr = self.csrGenerator.updateCSR(K)
-        toc = getCurrentTime()
-        self.computationTimes["CSR generation"] += toc - tic
         return KCsr
 
     def computeSpatialAveragedFluxes(self, F: DofVector) -> float:

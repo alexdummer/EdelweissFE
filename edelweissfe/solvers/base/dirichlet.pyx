@@ -14,6 +14,7 @@
 #  2017 - today
 #
 #  Matthias Neuner matthias.neuner@uibk.ac.at
+#  ALexander Dummer alexander.dummer@uibk.ac.at
 #
 #  This file is part of EdelweissFE.
 #
@@ -26,11 +27,18 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
+import numpy as np
+
 from edelweissfe.numerics.dofmanager import VIJSystemMatrix
-from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
+
+cimport cython
+
+from collections.abc import Iterable
 
 
-def applyDirichletK(nls: NonlinearSolverBase, K: VIJSystemMatrix, dirichlets: dict_values) -> VIJSystemMatrix:
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def applyDirichletK(nls, K: VIJSystemMatrix, dirichlets: Iterable) -> VIJSystemMatrix:
     """Apply the dirichlet bcs on the global stiffnes matrix
     Is called by solveStep() before solving the global sys.
     http://stackoverflux.com/questions/12129948/scipy-sparse-set-row-to-zeros
@@ -51,25 +59,29 @@ def applyDirichletK(nls: NonlinearSolverBase, K: VIJSystemMatrix, dirichlets: di
     VIJSystemMatrix
         The modified system matrix.
     """
+    # precompute the dirichlet indices for all dirichlet bcs
+    all_indices = []
+    for d in dirichlets:
+        all_indices.append(nls.findDirichletIndices(d))
 
-    cdef int  i, j
-    cdef int [::1] indices_, indptr_,
-    cdef long[::1] dirichletIndices
-    cdef double[::1] data_
+    cdef long[::1] dirichletIndices = np.concatenate(all_indices).astype(np.int64)
 
-    indices_ = K.indices
-    indptr_ = K.indptr
-    data_ = K.data
+    cdef int i, j, row
+    cdef int [::1] indices = K.indices
+    cdef int [::1] indptr = K.indptr
+    cdef double[::1] data = K.data
+    cdef int n_indices = dirichletIndices.shape[0]
 
-    for dirichlet in dirichlets:  # for each bc
-        dirichletIndices = nls.findDirichletIndices(dirichlet)
-        for i in dirichletIndices:  # for each node dof in the BC
-            for j in range (indptr_[i] , indptr_ [i+1]):  # iterate along row
-                if i == indices_ [j]:
-                    data_[j] = 1.0  # diagonal entry
-                else:
-                    data_[j] = 0.0  # off diagonal entry
+    for i in range(n_indices):
+        row = dirichletIndices[i]
 
+        # Access the range for this specific row once
+        for j in range(indptr[row], indptr[row + 1]):
+            if indices[j] == row:
+                data[j] = 1.0  # Diagonal
+            else:
+                data[j] = 0.0  # Off-diagonal
+
+    # clean up the matrix
     K.eliminate_zeros()
-
     return K

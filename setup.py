@@ -73,24 +73,7 @@ extensions = [
     )
 ]
 
-# print(
-#     "Gather the extension for the single quadrature point element using MarmotMaterials, linked to the Marmot library"
-# )
-# extensions += [
-#     Extension(
-#         "*",
-#         sources=[
-#             "edelweissfe/elements/marmotsingleqpelement/marmot.pyx",
-#         ],
-#         include_dirs=[join(marmot_dir, "include"), numpy.get_include()],
-#         libraries=["Marmot"],
-#         library_dirs=[join(marmot_dir, "lib")],
-#         runtime_library_dirs=[join(marmot_dir, "lib")],
-#         language="c++",
-#         extra_compile_args=["-O3", "-std=c++20"],
-#     )
-# ]
-
+print("Gather the extension for wrapping a hypoelastic Marmot material")
 extensions += [
     Extension(
         "*",
@@ -151,21 +134,6 @@ extensions += [
         extra_link_args=["-fopenmp"],
     )
 ]
-
-# print("Gather the extensions for parallel element evaluations")
-# extensions += [
-#     Extension(
-#         "*",
-#         sources=["edelweissfe/solvers/base/parallelelementcomputation.pyx"],
-#         include_dirs=[numpy.get_include()],
-#         language="c++",
-#         extra_compile_args=[
-#             "-fopenmp",
-#             "-Wno-maybe-uninitialized",
-#         ],
-#         extra_link_args=["-fopenmp"],
-#     )
-# ]
 
 print("Gather the extensions for fast dirichlet application")
 extensions += [
