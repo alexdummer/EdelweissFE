@@ -166,6 +166,7 @@ class NEST(NonlinearSolverBase):
     SolverSpecificOptions = {
         "runge-kutta-stages": 2,
         "runge-kutta-error-tolerance": 1e-3,
+        "runge-kutta-error-control": "on",
         "linsolver": "pardiso",
         "linsolverConfigFile": "",
     }
@@ -465,7 +466,7 @@ class NEST(NonlinearSolverBase):
         normErr = np.linalg.norm(err) / (np.linalg.norm(U_np) + 1e-16)
         self.journal.message("Estimated error {:5.2e}".format(normErr), self.identification, 2)
 
-        if normErr > self.tol:
+        if normErr > self.tol and self.options.get("runge-kutta-error-control", "on") != "off":
             raise CutbackRequest("Estimated error too high!", np.sqrt(self.tol / normErr) * 0.9)
 
         # compute elements once more to get the final reaction
@@ -473,6 +474,9 @@ class NEST(NonlinearSolverBase):
         P, K, F = self.computeElements(elements, U_np, dU, P, K, F, timeStep)
 
         # compute new increment size scale factor
-        beta = max(0.1, min(np.sqrt(self.tol / (normErr + 1e-15)) * 0.9, 2))
+        if self.options.get("runge-kutta-error-control", "on") == "off":
+            beta = 1.0
+        else:
+            beta = max(0.1, min(np.sqrt(self.tol / (normErr + 1e-15)) * 0.9, 2))
 
         return U_np, dU, P, beta
