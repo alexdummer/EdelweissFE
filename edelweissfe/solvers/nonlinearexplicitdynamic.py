@@ -65,7 +65,10 @@ class NED(NonlinearSolverBase):
     identification = "NEDSolver"
 
     NEDOptions = {
-        "scheme": "central-difference",
+        "first-order-fields": list(),
+        "second-order-fields": list(),
+        "first-order-scheme": "forward-euler",
+        "second-order-scheme": "central-difference",
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
@@ -88,7 +91,11 @@ class NED(NonlinearSolverBase):
         for k, v in updatedOptions.items():
             if k in self.NEDOptions:
                 journal.message("Updating option {:}={:}".format(k, v), self.identification)
-                self.options[k] = type(self.NEDOptions[k])(updatedOptions[k])
+                if isinstance(self.NEDOptions[k], list):
+                    for item in v.split(","):
+                        self.options[k].append(item.strip())
+                else:
+                    self.options[k] = type(self.NEDOptions[k])(updatedOptions[k])
             else:
                 raise AttributeError("Invalid option {:} for {:}".format(k, self.identification))
 
@@ -147,22 +154,37 @@ class NED(NonlinearSolverBase):
         except KeyError:
             pass
 
+        # initialize mass and damping matrices
         M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
         Minv = self.theDofManager.constructDofVector()  # initialize inverse lumped mass matrix
+
+        D = self.theDofManager.constructDofVector()  # initialize damping matrix
+        Dinv = self.theDofManager.constructDofVector()  # initialize inverse damping matrix
+
         U = self.theDofManager.constructDofVector()  # initialize displacement vector
         V = self.theDofManager.constructDofVector()  # initilize velocity vector
         P = self.theDofManager.constructDofVector()  # initialize reaction vector
-        dU = self.theDofManager.constructDofVector()  # initialize displacement increment vector
 
+        M[:] = D[:] = 0.0
         for el in model.elements.values():
             Me = np.zeros(el.nDof)
             el.computeLumpedInertia(Me)
             M[el] += Me
+            De = np.zeros(el.nDof)
+            el.computeLumpedDamping(De)
+            D[el] += De
 
+        # compute inverses
         Minv[M != 0.0] = 1.0 / M[M != 0.0]
+        Dinv[D != 0.0] = 1.0 / D[D != 0.0]
+
+        # delete M and D to save memory
+        del M
+        del D
 
         for fieldName, field in model.nodeFields.items():
             U = self.theDofManager.writeNodeFieldToDofVector(U, field, "U")
+            P = self.theDofManager.writeNodeFieldToDofVector(P, field, "P")
 
         for variable in model.scalarVariables.values():
             U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]] = variable.value
@@ -197,12 +219,12 @@ class NED(NonlinearSolverBase):
                 )
 
                 try:
-                    U, dU, V, P = self.solveIncrement(
+                    U, V, P = self.solveIncrement(
                         U,
-                        dU,
                         V,
                         P,
                         Minv,
+                        Dinv,
                         step.actions,
                         model,
                         timeStep,
@@ -244,7 +266,6 @@ class NED(NonlinearSolverBase):
                     for fieldName, field in model.nodeFields.items():
                         self.theDofManager.writeDofVectorToNodeField(U, field, "U")
                         self.theDofManager.writeDofVectorToNodeField(P, field, "P")
-                        self.theDofManager.writeDofVectorToNodeField(dU, field, "dU")
 
                     for variable in model.scalarVariables.values():
                         variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
@@ -279,23 +300,21 @@ class NED(NonlinearSolverBase):
     def solveIncrement(
         self,
         U_n: DofVector,
-        dU_: DofVector,
         V: DofVector,
         P: DofVector,
         Minv: DofVector,
+        Dinv: DofVector,
         stepActions: list,
         model: FEModel,
         timeStep: TimeStep,
         prevTimeStep: TimeStep,
     ) -> tuple[DofVector, DofVector, DofVector, DofVector]:
-        """Standard explicit update scheme using central differences to solve for an increment.
+        """Standard explicit update scheme to solve for an increment.
 
         Parameters
         ----------
         Un
             The old solution vector.
-        dU
-            The old solution increment.
         V
             The old velocity vector.
         P
@@ -325,29 +344,16 @@ class NED(NonlinearSolverBase):
 
         elements = model.elements
         # constraints = model.constraints
-        dU = self.theDofManager.constructDofVector()
         R = self.theDofManager.constructDofVector()
-        PExt = self.theDofManager.constructDofVector()
         U_np = self.theDofManager.constructDofVector()
-
+        dU = self.theDofManager.constructDofVector()  # initialize displacement increment vector
         dirichlets = stepActions["dirichlet"].values()
         # nodeforces = stepActions["nodeforces"].values()
         distributedLoads = stepActions["distributedload"].values()
         bodyForces = stepActions["bodyforce"].values()
 
-        if self.options["scheme"] != "central-difference":
-            raise NotImplementedError("Only central-difference scheme is implemented")
-
-        self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
-
-        for geostatic in stepActions["geostatic"].values():
-            geostatic.applyAtIterationStart()
-
         if timeStep.timeIncrement == 0.0:
-            return U_n, dU_, V, P
-
-        dU[:] = dU_
-        U_np[:] = U_n
+            return U_n, V, P
 
         if prevTimeStep is None:
 
@@ -355,47 +361,55 @@ class NED(NonlinearSolverBase):
                 timeStep.number,
                 timeStep.stepProgressIncrement,
                 timeStep.stepProgress,
-                timeStep.timeIncrement * 0,
+                timeStep.timeIncrement,
                 timeStep.stepTime,
                 timeStep.totalTime - timeStep.timeIncrement,
             )
 
         # ts
-        P[:] = PExt[:] = 0.0
-        P = self.computeElements(elements, U_np, dU, P, prevTimeStep)
-        PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
-        PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
+        # P[:] = PExt[:] = 0.0
+        # P = self.computeElements(elements, U_np, dU, P, prevTimeStep)
+        # PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
+        # PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
 
-        R[:] = P + PExt
+        R[:] = P
 
         # enforce dirichlet boundary conditions
         for dirichlet in dirichlets:
             R[self.findDirichletIndices(dirichlet)] = 0.0
-
-        # update velocity vector with lumped mass matrix
-        V += Minv.T * R * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
-
-        for dirichlet in dirichlets:
             V[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
+
+        # loop over fields for velocity update
+        for fieldName in self.theDofManager.fields:
+            ids = self.theDofManager.idcsOfFieldsInDofVector[fieldName]
+            if fieldName in self.options["first-order-fields"]:
+                V[ids] += Dinv[ids].T * R[ids]
+            elif fieldName in self.options["second-order-fields"]:
+                V[ids] += Minv[ids].T * R[ids] * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
+            else:
+                raise ValueError("Field {:} not assigned to first- or second-order update scheme".format(fieldName))
 
         # update displacement increment vector
         inc = V * timeStep.timeIncrement
         dU[:] = inc
-        # enforce dirichlet boundary conditions
-        for dirichlet in dirichlets:
-            dU[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten()
+        # # enforce dirichlet boundary conditions
+        # for dirichlet in dirichlets:
+        #     dU[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten()
 
         # update displacement vector
         U_np[:] = U_n + dU
 
-        P[:] = PExt[:] = 0.0
+        self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
+
+        for geostatic in stepActions["geostatic"].values():
+            geostatic.applyAtIterationStart()
+
+        P[:] = 0.0
         P = self.computeElements(elements, U_np, dU, P, timeStep)
-        PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, timeStep)
-        PExt = self.computeBodyForces(bodyForces, U_np, PExt, timeStep)
+        P = self.computeDistributedLoads(distributedLoads, U_np, P, timeStep)
+        P = self.computeBodyForces(bodyForces, U_np, P, timeStep)
 
-        P += PExt
-
-        return U_np, dU, V, P
+        return U_np, V, P
 
     @performancetiming.timeit("distributed loads")
     def computeDistributedLoads(

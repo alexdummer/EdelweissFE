@@ -1,12 +1,12 @@
 *material, name=VonMises, id=myMaterial
-210000, 0.3, 550, 1000, 200, 1400, 1
+210000, 0.3, 550, 1000, 200, 1400, 1, 0.00
 
 *section, name=section1, material=myMaterial, type=plane, thickness=1
 all
 
 *job, name=c3d8job, domain=2d
 *solver, solver=NED, name=theSolver
-
+second-order-fields="displacement,nonlocal damage"
 *modelGenerator, generator=planeRectQuad, name=gen
 l=10
 h=10

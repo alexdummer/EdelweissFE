@@ -309,6 +309,11 @@ cdef class MarmotElementWrapper:
 
         self.marmotElement.computeLumpedInertia(&M[0])
 
+    def computeLumpedDamping(self, double[::1] C):
+        """Compute the lumped damping matrix of the underlying MarmotElement"""
+
+        self.marmotElement.computeLumpedDamping(&C[0])
+
     def acceptLastState(self, ):
         """Accept the computed state (in nonlinear iteration schemes)."""
 

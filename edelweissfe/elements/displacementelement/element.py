@@ -346,7 +346,7 @@ class DisplacementElement(BaseElement):
             # update strain in stateVars
             self._stateVarsTemp[i][6:12] += self._dStrain[i]
 
-    def computeYourselfWithoutStiffness(
+    def computeYourselfExplicit(
         self,
         P: np.ndarray,
         U: np.ndarray,
@@ -354,12 +354,12 @@ class DisplacementElement(BaseElement):
         time: np.ndarray,
         dTime: float,
     ):
-        """Evaluate the residual and stiffness matrix for given time, field, and field increment due to a displacement or load.
+        """Evaluate the residual for given time, field, and field increment due to a displacement or load.
 
         Parameters
         ----------
         P
-            The external load vector gets calculated.
+            The internal load vector gets calculated.
         U
             The current solution vector.
         dU
@@ -518,7 +518,7 @@ class DisplacementElement(BaseElement):
         return self._nInt
 
     def getCoordinatesAtQuadraturePoints(self) -> np.ndarray:
-        """Compute the underlying MarmotElement qp coordinates.
+        """Compute the coordinates of the quadrature points.
 
         Returns
         -------
