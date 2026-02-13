@@ -456,6 +456,17 @@ class DisplacementElement(BaseElement):
         # compute lumped mass matrix by scaling the diagonal of the consistent mass matrix
         # M[:] = np.diagonal(cmm) * np.sum(cmm) / np.sum(np.diagonal(cmm))
 
+    def computeLumpedDamping(self, M: np.ndarray):
+        """Compute the lumped damping matrix.
+
+        Parameters
+        ----------
+        M
+            The mass matrix to be defined.
+        """
+
+        return np.zeros_like(M)
+
     def acceptLastState(
         self,
     ):
