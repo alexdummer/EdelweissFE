@@ -31,7 +31,6 @@ import concurrent.futures
 
 import numpy as np
 
-import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.elements.base.baseelement import BaseElement
 from edelweissfe.numerics.dofmanager import DofVector, VIJSystemMatrix
 from edelweissfe.numerics.parallelizationutilities import (
@@ -41,7 +40,6 @@ from edelweissfe.numerics.parallelizationutilities import (
 from edelweissfe.timesteppers.timestep import TimeStep
 
 
-@performancetiming.timeit("elements")
 def computeElementsInParallel(
     elements: dict, Un1: DofVector, dU: DofVector, P: DofVector, K: VIJSystemMatrix, F: DofVector, timeStep: TimeStep
 ) -> tuple[DofVector, VIJSystemMatrix, DofVector]:

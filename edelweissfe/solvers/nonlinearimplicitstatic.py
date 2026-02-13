@@ -30,18 +30,19 @@
 # @author: Matthias Neuner
 
 import json
-from time import time as getCurrentTime
 
 import numpy as np
 
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
-from edelweissfe.config.timing import createTimingDict
+from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.csrgenerator import CSRGenerator
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
+from edelweissfe.solvers.base.dirichlet import applyDirichletK
 from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
+from edelweissfe.stepactions.base.stepactionbase import StepActionBase
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import (
     ConditionalStop,
@@ -143,8 +144,6 @@ class NIST(NonlinearSolverBase):
 
         self.csrGenerator = CSRGenerator(K)
 
-        self.computationTimes = createTimingDict()
-
         try:
             self._updateOptions(step.actions["options"]["NISTSolver"].options, self.journal)
         except KeyError:
@@ -163,10 +162,6 @@ class NIST(NonlinearSolverBase):
         criticalIter = step.criticalIter
         maxGrowingIter = step.maxGrowIter
         cutbackFactor = step.cutbackFactor
-
-        # nodes = model.nodes
-        # elements = model.elements
-        # constraints = model.constraints
 
         U = self.theDofManager.constructDofVector()
         P = self.theDofManager.constructDofVector()
@@ -232,14 +227,11 @@ class NIST(NonlinearSolverBase):
                     statusInfoDict["iters"] = np.inf
                     statusInfoDict["notes"] = str(e)
 
-                    tic = getCurrentTime()
-                    for man in outputmanagers:
-                        man.finalizeFailedIncrement(
-                            statusInfoDict=statusInfoDict,
-                            currentComputingTimes=self.computationTimes,
-                        )
-                    toc = getCurrentTime()
-                    self.computationTimes["output"] += toc - tic
+                    # for man in outputmanagers:
+                    #     man.finalizeFailedIncrement(
+                    #         statusInfoDict=statusInfoDict,
+                    #         currentComputingTimes=self.computationTimes,
+                    #     )
 
                 except (ReachedMaxIterations, DivergingSolution) as e:
                     self.journal.message(str(e), self.identification, 1)
@@ -249,14 +241,11 @@ class NIST(NonlinearSolverBase):
                     statusInfoDict["iters"] = np.inf
                     statusInfoDict["notes"] = str(e)
 
-                    tic = getCurrentTime()
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
-                            currentComputingTimes=self.computationTimes,
+                            # currentComputingTimes=self.computationTimes,
                         )
-                    toc = getCurrentTime()
-                    self.computationTimes["output"] += toc - tic
 
                 else:
                     prevTimeStep = timeStep
@@ -285,14 +274,11 @@ class NIST(NonlinearSolverBase):
                     statusInfoDict["converged"] = True
 
                     fieldOutputController.finalizeIncrement()
-                    tic = getCurrentTime()
                     for man in outputmanagers:
                         man.finalizeIncrement(
-                            currentComputingTimes=self.computationTimes,
+                            # currentComputingTimes=self.computationTimes,
                             statusInfoDict=statusInfoDict,
                         )
-                    toc = getCurrentTime()
-                    self.computationTimes["output"] += toc - tic
 
         except (ReachedMaxIncrements, ReachedMinIncrementSize):
             self.journal.errorMessage("Incrementation failed", self.identification)
@@ -309,10 +295,6 @@ class NIST(NonlinearSolverBase):
             prettyTable = performancetiming.makePrettyTable()
             self.journal.printPrettyTable(prettyTable, self.identification)
             performancetiming.times.clear()
-            # self.journal.printTable(
-            #     [("Time in {:}".format(k), " {:10.4e}s".format(v)) for k, v in self.computationTimes.items()],
-            #     self.identification,
-            # )
 
     def solveIncrement(
         self,
@@ -368,7 +350,6 @@ class NIST(NonlinearSolverBase):
                 - the history of residuals per field
         """
 
-        # incNumber, incrementSize, stepProgress, dT, stepTime, totalTime = timeStep
         iterationCounter = 0
         incrementResidualHistory = dict.fromkeys(self.theDofManager.idcsOfFieldsInDofVector, (0.0, 0))
 
@@ -439,3 +420,246 @@ class NIST(NonlinearSolverBase):
             iterationCounter += 1
 
         return U_np, dU, P, iterationCounter, incrementResidualHistory
+
+    @performancetiming.timeit("distributed loads")
+    def computeDistributedLoads(
+        self,
+        distributedLoads: list[StepActionBase],
+        U_np: DofVector,
+        PExt: DofVector,
+        K: VIJSystemMatrix,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix]:
+        """Loop over all distributed loads acting on elements, and evaluate them.
+        Assembles into the global external load vector and the system matrix.
+
+        Parameters
+        ----------
+        distributedLoads
+            The list of distributed loads.
+        U_np
+            The current solution vector.
+        PExt
+            The external load vector to be augmented.
+        K
+            The system matrix to be augmented.
+        timeStep
+            The current time step.
+
+        Returns
+        -------
+        tuple[DofVector,VIJSystemMatrix]
+            The augmented load vector and system matrix.
+        """
+
+        time = np.array([timeStep.stepTime, timeStep.totalTime])
+        dT = timeStep.timeIncrement
+
+        for dLoad in distributedLoads:
+            load = dLoad.getCurrentLoad(timeStep)
+            for faceID, elementSet in dLoad.surface.items():
+                for el in elementSet:
+                    Ke = K[el]
+                    Pe = np.zeros(el.nDof)
+
+                    el.computeDistributedLoad(dLoad.loadType, Pe, Ke, faceID, load, U_np[el], time, dT)
+
+                    PExt[el] += Pe
+
+        return PExt, K
+
+    @performancetiming.timeit("body forces")
+    def computeBodyForces(
+        self,
+        bodyForces: list[StepActionBase],
+        U_np: DofVector,
+        PExt: DofVector,
+        K: VIJSystemMatrix,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix]:
+        """Loop over all body forces loads acting on elements, and evaluate them.
+        Assembles into the global external load vector and the system matrix.
+
+        Parameters
+        ----------
+        distributedLoads
+            The list of distributed loads.
+        U_np
+            The current solution vector.
+        PExt
+            The external load vector to be augmented.
+        K
+            The system matrix to be augmented.
+        increment
+            The increment.
+
+        Returns
+        -------
+        tuple[DofVector,VIJSystemMatrix]
+            The augmented load vector and system matrix.
+        """
+
+        time = np.array([timeStep.stepTime, timeStep.totalTime])
+        dT = timeStep.timeIncrement
+
+        for bForce in bodyForces:
+            force = bForce.getCurrentLoad(timeStep)
+            for el in bForce.elementSet:
+                Pe = np.zeros(el.nDof)
+                Ke = K[el]
+
+                el.computeBodyForce(Pe, Ke, force, U_np[el], time, dT)
+
+                PExt[el] += Pe
+
+        return PExt, K
+
+    @performancetiming.timeit("dirichlet K on CSR")
+    def applyDirichletK(self, K: VIJSystemMatrix, dirichlets: list[StepActionBase]) -> VIJSystemMatrix:
+        return applyDirichletK(self, K, dirichlets)
+
+    @performancetiming.timeit("elements")
+    def computeElements(
+        self,
+        elements: list,
+        U_np: DofVector,
+        dU: DofVector,
+        P: DofVector,
+        K: VIJSystemMatrix,
+        F: DofVector,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+        """Loop over all elements, and evalute them.
+        Is is called by solveStep() in each iteration.
+
+        Parameters
+        ----------
+        elements
+            The list of finite elements.
+        U_np
+            The current solution vector.
+        dU
+            The current solution increment vector.
+        P
+            The reaction vector.
+        K
+            The system matrix.
+        F
+            The vector of accumulated fluxes for convergence checks.
+        timeStep
+            The time step.
+
+        Returns
+        -------
+        tuple[DofVector,VIJSystemMatrix,DofVector]
+            - The modified reaction vector.
+            - The modified system matrix.
+            - The modified accumulated flux vector.
+        """
+
+        time = np.array([timeStep.stepTime, timeStep.totalTime])
+        dT = timeStep.timeIncrement
+
+        for el in elements.values():
+            Ke = K[el]
+            Pe = np.zeros(el.nDof)
+
+            el.computeYourself(Ke, Pe, U_np[el], dU[el], time, dT)
+
+            P[el] += Pe
+            F[el] += abs(Pe)
+
+        return P, K, F
+
+    @performancetiming.timeit("assemble constraints")
+    def assembleConstraints(
+        self,
+        constraints: list[ConstraintBase],
+        U_np: DofVector,
+        dU: DofVector,
+        PExt: DofVector,
+        K: VIJSystemMatrix,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix]:
+        """Loop over all elements, and evaluate them.
+        Is is called by solveStep() in each iteration.
+
+        Parameters
+        ----------
+        constraints
+            The list of constraints.
+        U_np
+            The current solution vector.
+        dU
+            The current solution increment vector.
+        PExt
+            The external load vector.
+        K
+            The system matrix.
+        dT
+            The time increment.
+        time
+            The step and total time.
+
+        Returns
+        -------
+        tuple[DofVector,VIJSystemMatrix,DofVector]
+            - The modified external load vector.
+            - The modified system matrix.
+        """
+
+        for constraint in constraints.values():
+            Kc = K[constraint].reshape(constraint.nDof, constraint.nDof, order="F")
+            Pc = np.zeros(constraint.nDof)
+
+            constraint.applyConstraint(U_np[constraint], dU[constraint], Pc, Kc, timeStep)
+
+            # instead of PExt[constraint] += Pe, np.add.at allows for repeated indices
+            np.add.at(PExt, PExt.entitiesInDofVector[constraint], Pc)
+
+        return PExt, K
+
+    @performancetiming.timeit("assemble loads")
+    def assembleLoads(
+        self,
+        nodeForces: list[StepActionBase],
+        distributedLoads: list[StepActionBase],
+        bodyForces: list[StepActionBase],
+        U_np: DofVector,
+        PExt: DofVector,
+        K: VIJSystemMatrix,
+        timeStep: TimeStep,
+    ) -> tuple[DofVector, VIJSystemMatrix]:
+        """Assemble all loads into a right hand side vector.
+
+        Parameters
+        ----------
+        nodeForces
+            The list of concentrated (nodal) loads.
+        distributedLoads
+            The list of distributed (surface) loads.
+        bodyForces
+            The list of body (volumetric) loads.
+        U_np
+            The current solution vector.
+        PExt
+            The external load vector.
+        K
+            The system matrix.
+        timeStep
+            The current time step.
+
+        Returns
+        -------
+        tuple[DofVector,VIJSystemMatrix]
+            - The augmented external load vector.
+            - The augmented system matrix.
+        """
+        for cLoad in nodeForces:
+            PExt[
+                self.theDofManager.idcsOfFieldsOnNodeSetsInDofVector[cLoad.field][cLoad.nodeSet]
+            ] += cLoad.getCurrentLoad(timeStep).flatten()
+        PExt, K = self.computeDistributedLoads(distributedLoads, U_np, PExt, K, timeStep)
+        PExt, K = self.computeBodyForces(bodyForces, U_np, PExt, K, timeStep)
+
+        return PExt, K

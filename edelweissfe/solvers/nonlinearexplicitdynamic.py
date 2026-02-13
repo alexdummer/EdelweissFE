@@ -32,7 +32,6 @@ import numpy as np
 
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.timing import createTimingDict
-from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
@@ -144,8 +143,6 @@ class NED(NonlinearSolverBase):
             presentVariableNames += [
                 "scalar variables",
             ]
-
-        # nVariables = len(presentVariableNames)
 
         self.computationTimes = createTimingDict()
 
@@ -343,12 +340,11 @@ class NED(NonlinearSolverBase):
         """
 
         elements = model.elements
-        # constraints = model.constraints
         R = self.theDofManager.constructDofVector()
         U_np = self.theDofManager.constructDofVector()
         dU = self.theDofManager.constructDofVector()  # initialize displacement increment vector
         dirichlets = stepActions["dirichlet"].values()
-        # nodeforces = stepActions["nodeforces"].values()
+        nodeforces = stepActions["nodeforces"].values()
         distributedLoads = stepActions["distributedload"].values()
         bodyForces = stepActions["bodyforce"].values()
 
@@ -365,12 +361,6 @@ class NED(NonlinearSolverBase):
                 timeStep.stepTime,
                 timeStep.totalTime - timeStep.timeIncrement,
             )
-
-        # ts
-        # P[:] = PExt[:] = 0.0
-        # P = self.computeElements(elements, U_np, dU, P, prevTimeStep)
-        # PExt = self.computeDistributedLoads(distributedLoads, U_np, PExt, prevTimeStep)
-        # PExt = self.computeBodyForces(bodyForces, U_np, PExt, prevTimeStep)
 
         R[:] = P
 
@@ -392,9 +382,6 @@ class NED(NonlinearSolverBase):
         # update displacement increment vector
         inc = V * timeStep.timeIncrement
         dU[:] = inc
-        # # enforce dirichlet boundary conditions
-        # for dirichlet in dirichlets:
-        #     dU[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten()
 
         # update displacement vector
         U_np[:] = U_n + dU
@@ -406,8 +393,7 @@ class NED(NonlinearSolverBase):
 
         P[:] = 0.0
         P = self.computeElements(elements, U_np, dU, P, timeStep)
-        P = self.computeDistributedLoads(distributedLoads, U_np, P, timeStep)
-        P = self.computeBodyForces(bodyForces, U_np, P, timeStep)
+        P = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_np, P, timeStep)
 
         return U_np, V, P
 
@@ -541,53 +527,6 @@ class NED(NonlinearSolverBase):
 
         return P
 
-    @performancetiming.timeit("assemble constraints")
-    def assembleConstraints(
-        self,
-        constraints: list[ConstraintBase],
-        U_np: DofVector,
-        dU: DofVector,
-        PExt: DofVector,
-        timeStep: TimeStep,
-    ) -> tuple[DofVector, VIJSystemMatrix]:
-        """Loop over all elements, and evaluate them.
-        Is is called by solveStep() in each iteration.
-
-        Parameters
-        ----------
-        constraints
-            The list of constraints.
-        U_np
-            The current solution vector.
-        dU
-            The current solution increment vector.
-        PExt
-            The external load vector.
-        K
-            The system matrix.
-        dT
-            The time increment.
-        time
-            The step and total time.
-
-        Returns
-        -------
-        tuple[DofVector,VIJSystemMatrix,DofVector]
-            - The modified external load vector.
-            - The modified system matrix.
-        """
-
-        for constraint in constraints.values():
-            # Kc = K[constraint].reshape(constraint.nDof, constraint.nDof, order="F")
-            Pc = np.zeros(constraint.nDof)
-
-            constraint.applyConstraint(U_np[constraint], dU[constraint], Pc, timeStep)
-
-            # instead of PExt[constraint] += Pe, np.add.at allows for repeated indices
-            np.add.at(PExt, PExt.entitiesInDofVector[constraint], Pc)
-
-        return PExt
-
     def assembleLoads(
         self,
         nodeForces: list[StepActionBase],
@@ -595,7 +534,6 @@ class NED(NonlinearSolverBase):
         bodyForces: list[StepActionBase],
         U_np: DofVector,
         PExt: DofVector,
-        K: VIJSystemMatrix,
         timeStep: TimeStep,
     ) -> tuple[DofVector, VIJSystemMatrix]:
         """Assemble all loads into a right hand side vector.
@@ -631,61 +569,3 @@ class NED(NonlinearSolverBase):
         PExt = self.computeBodyForces(bodyForces, U_np, PExt, timeStep)
 
         return PExt
-
-    def applyStepActionsAtStepStart(self, model: FEModel, stepActions: dict[str, StepActionBase]):
-        """Called when all step actions should be appliet at the start a step.
-
-        Parameters
-        ----------
-        model
-            The model tree.
-        stepActions
-            The dictionary of active step actions.
-        """
-
-        for stepActionType in stepActions.values():
-            for action in stepActionType.values():
-                action.applyAtStepStart(model)
-
-    def applyStepActionsAtStepEnd(self, model: FEModel, stepActions: dict[str, StepActionBase]):
-        """Called when all step actions should finish a step.
-
-        Parameters
-        ----------
-        model
-            The model tree.
-        stepActions
-            The dictionary of active step actions.
-        """
-
-        for stepActionType in stepActions.values():
-            for action in stepActionType.values():
-                action.applyAtStepEnd(model)
-
-    def applyStepActionsAtIncrementStart(
-        self, model: FEModel, timeStep: TimeStep, stepActions: dict[str, StepActionBase]
-    ):
-        """Called when all step actions should be applied at the start of a step.
-
-        Parameters
-        ----------
-        model
-            The model tree.
-        increment
-            The time increment.
-        stepActions
-            The dictionary of active step actions.
-        """
-
-        for stepActionType in stepActions.values():
-            for action in stepActionType.values():
-                action.applyAtIncrementStart(model, timeStep)
-
-    def findDirichletIndices(self, dirichlet):
-        nSet = dirichlet.nSet
-        field = dirichlet.field
-        components = dirichlet.components
-
-        fieldIndices = self.theDofManager.idcsOfFieldsOnNodeSetsInDofVector[field][nSet]
-
-        return fieldIndices.reshape((len(nSet), -1))[:, components].flatten()

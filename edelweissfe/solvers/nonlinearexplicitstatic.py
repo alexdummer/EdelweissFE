@@ -32,13 +32,13 @@ import json
 import numpy as np
 
 import edelweissfe.utils.performancetiming as performancetiming
-from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
+from edelweissfe.config.linsolve import getLinSolverByName
 from edelweissfe.config.timing import createTimingDict
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.csrgenerator import CSRGenerator
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
-from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
+from edelweissfe.solvers.nonlinearimplicitstatic import NIST
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import (
     ConditionalStop,
@@ -150,7 +150,7 @@ def getRungeKuttaParameters(rungeKuttaStages: int) -> tuple[dict, dict, dict]:
     return _alpha, _omega, _lambda
 
 
-class NEST(NonlinearSolverBase):
+class NEST(NIST):
     """This is the Nonlinear Explicit STatic -- solver.
 
     Parameters
@@ -235,18 +235,18 @@ class NEST(NonlinearSolverBase):
 
         self.computationTimes = createTimingDict()
 
-        try:
-            self._updateOptions(step.actions["options"]["NESTSolver"].options, self.journal)
-        except KeyError:
-            pass
+        _optionsUpdate = step.actions["options"].get("NESTSolver", {})
+        self._updateOptions(_optionsUpdate, self.journal)
+
+        # get parameters for runge kutta scheme
+        self.rkAlpha, self.rkOmega, self.rkLambda = getRungeKuttaParameters(self.options.get("runge-kutta-stages", 2))
+        self.rkStages = self.options.get("runge-kutta-stages", 2)
+
+        self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)
 
         linsolverOptions = self.options["linsolverConfigFile"]
         linsolverOptionDict = json.load(open(linsolverOptions, "r")) if linsolverOptions else ""
-        self.linSolver = (
-            getLinSolverByName(self.options["linsolver"], linsolverOptionDict)
-            if "linsolver" in self.options
-            else getDefaultLinSolver()
-        )
+        self.linSolver = getLinSolverByName(self.options.get("linsolver", "default"), linsolverOptionDict)
 
         # get parameters for runge kutta scheme
         self.rkAlpha, self.rkOmega, self.rkLambda = getRungeKuttaParameters(self.options.get("runge-kutta-stages", 2))

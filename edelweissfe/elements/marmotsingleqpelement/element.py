@@ -200,6 +200,20 @@ class MarmotMaterialWrappingElement(BaseElement):
 
         Pe *= -1
 
+    def computeYourselfExplicit(
+        self,
+        Pe,
+        U,
+        dU,
+        time,
+        dTime,
+    ):
+        self._initializeStateVarsTemp()
+
+        self._marmotMaterialWrapper.computeYourselfExplicit(Pe, U, dU, time, dTime)
+
+        Pe *= -1
+
     def computeDistributedLoad(self, loadType, P, K, faceID, load, U, time, dTime):
         """Not implemented for this wrapper."""
 
