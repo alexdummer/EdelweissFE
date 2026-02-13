@@ -227,11 +227,10 @@ class NIST(NonlinearSolverBase):
                     statusInfoDict["iters"] = np.inf
                     statusInfoDict["notes"] = str(e)
 
-                    # for man in outputmanagers:
-                    #     man.finalizeFailedIncrement(
-                    #         statusInfoDict=statusInfoDict,
-                    #         currentComputingTimes=self.computationTimes,
-                    #     )
+                    for man in outputmanagers:
+                        man.finalizeFailedIncrement(
+                            statusInfoDict=statusInfoDict,
+                        )
 
                 except (ReachedMaxIterations, DivergingSolution) as e:
                     self.journal.message(str(e), self.identification, 1)
@@ -244,7 +243,6 @@ class NIST(NonlinearSolverBase):
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
-                            # currentComputingTimes=self.computationTimes,
                         )
 
                 else:
@@ -276,7 +274,6 @@ class NIST(NonlinearSolverBase):
                     fieldOutputController.finalizeIncrement()
                     for man in outputmanagers:
                         man.finalizeIncrement(
-                            # currentComputingTimes=self.computationTimes,
                             statusInfoDict=statusInfoDict,
                         )
 

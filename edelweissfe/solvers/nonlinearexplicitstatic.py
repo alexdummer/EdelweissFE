@@ -13,7 +13,6 @@
 #  University of Innsbruck,
 #  2017 - today
 #
-#  Matthias Neuner matthias.neuner@uibk.ac.at
 #  Alexander Dummer alexander.dummer@uibk.ac.at
 #
 #  This file is part of EdelweissFE.
@@ -247,10 +246,6 @@ class NEST(NIST):
         linsolverOptions = self.options["linsolverConfigFile"]
         linsolverOptionDict = json.load(open(linsolverOptions, "r")) if linsolverOptions else ""
         self.linSolver = getLinSolverByName(self.options.get("linsolver", "default"), linsolverOptionDict)
-
-        # get parameters for runge kutta scheme
-        self.rkAlpha, self.rkOmega, self.rkLambda = getRungeKuttaParameters(self.options.get("runge-kutta-stages", 2))
-        self.rkStages = self.options.get("runge-kutta-stages", 2)
 
         self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)
 

@@ -31,7 +31,6 @@
 import numpy as np
 
 import edelweissfe.utils.performancetiming as performancetiming
-from edelweissfe.config.timing import createTimingDict
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
@@ -144,12 +143,8 @@ class NED(NonlinearSolverBase):
                 "scalar variables",
             ]
 
-        self.computationTimes = createTimingDict()
-
-        try:
+        if step.actions["options"]["NEDSolver"]:
             self._updateOptions(step.actions["options"]["NEDSolver"].options, self.journal)
-        except KeyError:
-            pass
 
         # initialize mass and damping matrices
         M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
@@ -293,6 +288,7 @@ class NED(NonlinearSolverBase):
             prettyTable = performancetiming.makePrettyTable()
             self.journal.printPrettyTable(prettyTable, self.identification)
             performancetiming.times.clear()
+            performancetiming.extractIncrementTimes._last_snapshot = None
 
     def solveIncrement(
         self,
@@ -550,8 +546,6 @@ class NED(NonlinearSolverBase):
             The current solution vector.
         PExt
             The external load vector.
-        K
-            The system matrix.
         timeStep
             The current time step.
 

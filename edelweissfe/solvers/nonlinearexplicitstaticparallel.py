@@ -13,7 +13,7 @@
 #  University of Innsbruck,
 #  2017 - today
 #
-#  Matthias Neuner matthias.neuner@uibk.ac.at
+#  Alexander Dummer alexander.dummer@uibk.ac.at
 #
 #  This file is part of EdelweissFE.
 #
@@ -43,7 +43,7 @@ class NESTParallel(NEST):
 
     def solveStep(self, step, model, fieldOutputController, outputmanagers):
 
-        self.journal.message("Using {:} threads".format(getNumberOfThreads), self.identification)
+        self.journal.message("Using {:} threads".format(getNumberOfThreads()), self.identification)
         return super().solveStep(step, model, fieldOutputController, outputmanagers)
 
     @performancetiming.timeit("elements")

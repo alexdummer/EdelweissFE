@@ -28,7 +28,7 @@
 
 
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
-from edelweissfe.utils.performancetiming import extract_increment_times
+from edelweissfe.utils.performancetiming import extractIncrementTimes
 
 """
 Prints the compute times per increment to the screen and writes them into a file (optional).
@@ -61,11 +61,11 @@ class OutputManager(OutputManagerBase):
     def initializeStep(self, step):
         self.stepcounter += 1
 
-    def finalizeIncrement(self, **kwargs):
-        self.journal.printPrettyTable(extract_increment_times(), self.identification)
+    def finalizeIncrement(self, timeStep, **kwargs):
+        self.journal.printPrettyTable(extractIncrementTimes(), self.identification)
 
     def finalizeFailedIncrement(self, **kwargs):
-        self.journal.printPrettyTable(extract_increment_times(), self.identification)
+        self.journal.printPrettyTable(extractIncrementTimes(), self.identification)
 
     def finalizeStep(
         self,

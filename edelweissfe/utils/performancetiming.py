@@ -160,18 +160,16 @@ def makePrettyTable(maxLevels: int = 4) -> PrettyTable:
     return prettytable
 
 
-def extract_increment_times(maxLevels: int = 4) -> PrettyTable:
+def extractIncrementTimes(maxLevels: int = 4) -> PrettyTable:
     """
     Returns a PrettyTable of the time elapsed since the last time
     this function was called, while keeping global 'times' intact.
     """
-    # Initialize the static-like storage for the previous snapshot
-    if not hasattr(extract_increment_times, "_last_snapshot"):
-        extract_increment_times._last_snapshot = None
+    if not hasattr(extractIncrementTimes, "_last_snapshot"):
+        extractIncrementTimes._last_snapshot = None
 
     current_state = times.get_snapshot()
 
-    # Calculate the delta
     def compute_delta(curr, last):
         last_t = last["time"] if last else 0.0
         last_c = last["calls"] if last else 0
@@ -186,10 +184,9 @@ def extract_increment_times(maxLevels: int = 4) -> PrettyTable:
 
         return {"time": delta_t, "calls": delta_c, "children": children_deltas}
 
-    delta_tree = compute_delta(current_state, extract_increment_times._last_snapshot)
-    extract_increment_times._last_snapshot = current_state
+    delta_tree = compute_delta(current_state, extractIncrementTimes._last_snapshot)
+    extractIncrementTimes._last_snapshot = current_state
 
-    # Flatten delta_tree for PrettyTable (mimicking your _makeTable logic)
     def flatten_delta(node, level):
         rows = []
         for name, data in node["children"]:
@@ -200,7 +197,6 @@ def extract_increment_times(maxLevels: int = 4) -> PrettyTable:
 
     delta_rows = flatten_delta(delta_tree, 0)
 
-    # Format into PrettyTable
     prettytable = PrettyTable()
     prettytable.field_names = ["function", "inc. runtime", "calls"]
     prettytable.align = "l"
