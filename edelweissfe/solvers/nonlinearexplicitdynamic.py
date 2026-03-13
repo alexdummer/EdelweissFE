@@ -143,9 +143,10 @@ class NED(NonlinearSolverBase):
                 "scalar variables",
             ]
 
-        if step.actions["options"]["NEDSolver"]:
+        try:
             self._updateOptions(step.actions["options"]["NEDSolver"].options, self.journal)
-
+        except KeyError:
+            pass
         # initialize mass and damping matrices
         M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
         Minv = self.theDofManager.constructDofVector()  # initialize inverse lumped mass matrix
@@ -234,7 +235,6 @@ class NED(NonlinearSolverBase):
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
-                            currentComputingTimes=self.computationTimes,
                         )
 
                 except (ReachedMaxIterations, DivergingSolution) as e:
@@ -248,7 +248,6 @@ class NED(NonlinearSolverBase):
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
-                            currentComputingTimes=self.computationTimes,
                         )
 
                 else:
@@ -269,7 +268,6 @@ class NED(NonlinearSolverBase):
                     fieldOutputController.finalizeIncrement()
                     for man in outputmanagers:
                         man.finalizeIncrement(
-                            currentComputingTimes=self.computationTimes,
                             statusInfoDict=statusInfoDict,
                         )
 

@@ -59,6 +59,9 @@ def applyDirichletK(nls, K: VIJSystemMatrix, dirichlets: Iterable) -> VIJSystemM
     VIJSystemMatrix
         The modified system matrix.
     """
+    if len(dirichlets) == 0:
+        return K
+
     # precompute the dirichlet indices for all dirichlet bcs
     all_indices = []
     for d in dirichlets:

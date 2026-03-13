@@ -61,7 +61,7 @@ class OutputManager(OutputManagerBase):
     def initializeStep(self, step):
         self.stepcounter += 1
 
-    def finalizeIncrement(self, timeStep, **kwargs):
+    def finalizeIncrement(self, **kwargs):
         self.journal.printPrettyTable(extractIncrementTimes(), self.identification)
 
     def finalizeFailedIncrement(self, **kwargs):
