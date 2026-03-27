@@ -887,8 +887,17 @@ class NIST:
         tic = getCurrentTime()
 
         for constraint in constraints.values():
-            Kc = K[constraint].reshape(constraint.nDof, constraint.nDof, order="F")
+            K_flat = K[constraint]
             Pc = np.zeros(constraint.nDof)
+
+            # For dense constraints the flat VIJ slice is reshaped to a square matrix
+            # (backward-compatible behaviour).  Sparse constraints (e.g. rigidbody with
+            # many slaves) declare getVIJContributionSize() < nDof**2 and expect to
+            # receive the raw 1-D slice so they can address individual entries directly.
+            if constraint.getVIJContributionSize() == constraint.nDof**2:
+                Kc = K_flat.reshape(constraint.nDof, constraint.nDof, order="F")
+            else:
+                Kc = K_flat
 
             constraint.applyConstraint(U_np[constraint], dU[constraint], Pc, Kc, timeStep)
 

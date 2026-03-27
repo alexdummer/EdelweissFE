@@ -77,7 +77,11 @@ class VIJSystemMatrix(np.ndarray):
     def __getitem__(self, key):
         try:
             idxInVIJ = self.entitiesInVIJ[key]
-            return super().__getitem__(slice(idxInVIJ, idxInVIJ + key.nDof**2))
+            if hasattr(key, "getVIJContributionSize"):
+                size = key.getVIJContributionSize()
+            else:
+                size = key.nDof**2
+            return super().__getitem__(slice(idxInVIJ, idxInVIJ + size))
         except Exception:
             return super().__getitem__(key)
 
@@ -555,7 +559,29 @@ class DofManager:
                 - largest occuring number of dofs on any element.
         """
 
-        return self._gatherElementsInformation(entities)
+        accumulatedEntityNDof = 0
+        accumulatedEntityVIJSize = 0
+        largestNumberOfAnyEntitityDof = 0
+
+        nAccumulatedFluxesFieldwise = dict.fromkeys(phenomena.keys(), 0)
+
+        for e in entities:
+            accumulatedEntityNDof += e.nDof
+            # Use the constraint-declared VIJ size (may be sparse, i.e. < nDof**2).
+            accumulatedEntityVIJSize += e.getVIJContributionSize()
+
+            for node in e.nodes:
+                for field, fv in node.fields.items():
+                    nAccumulatedFluxesFieldwise[field] += len(self.idcsOfFieldVariablesInDofVector[fv])
+
+            largestNumberOfAnyEntitityDof = max(e.nDof, largestNumberOfAnyEntitityDof)
+
+        return (
+            accumulatedEntityNDof,
+            accumulatedEntityVIJSize,
+            nAccumulatedFluxesFieldwise,
+            largestNumberOfAnyEntitityDof,
+        )
 
     # def _analyzeVIJPattern(self,):
 
@@ -665,11 +691,19 @@ class DofManager:
 
             nDofEntity = len(entityIdcsInDofVector)
 
-            # looks like black magic, but it's an efficient way to generate all indices of Ke in K:
-            VIJLocations = np.tile(entityIdcsInDofVector, (nDofEntity, 1))
-            I[idxInVIJ : idxInVIJ + nDofEntity**2] = VIJLocations.flatten()
-            J[idxInVIJ : idxInVIJ + nDofEntity**2] = VIJLocations.flatten("F")
-            idxInVIJ += nDofEntity**2
+            if hasattr(entity, "initializeVIJContribution"):
+                # Constraint with a custom (potentially sparse) VIJ pattern.
+                entity.initializeVIJContribution(entityIdcsInDofVector, I, J, idxInVIJ)
+                nVIJEntity = entity.getVIJContributionSize()
+            else:
+                # Default dense block for finite elements.
+                # looks like black magic, but it's an efficient way to generate all indices of Ke in K:
+                VIJLocations = np.tile(entityIdcsInDofVector, (nDofEntity, 1))
+                I[idxInVIJ : idxInVIJ + nDofEntity**2] = VIJLocations.flatten()
+                J[idxInVIJ : idxInVIJ + nDofEntity**2] = VIJLocations.flatten("F")
+                nVIJEntity = nDofEntity**2
+
+            idxInVIJ += nVIJEntity
 
         return I, J, entitiesInVIJ
 

@@ -1,0 +1,35 @@
+Metadata-Version: 2.4
+Name: EdelweissFE
+Version: 25.8
+Summary: EdelweissFE: A light-weight, platform-independent, parallel finite element framework.
+Author-email: Matthias Neuner <matthias.neuner@uibk.ac.at>
+License: LGPL-2.1
+Project-URL: Homepage, https://github.com/EdelweissFE/EdelweissFE
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+License-File: LICENSE.md
+Dynamic: license-file
+
+[![documentation](https://github.com/EdelweissFE/EdelweissFE/actions/workflows/sphinx.yml/badge.svg)](https://edelweiss-numerics.github.io/EdelweissFE)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![DOI](https://zenodo.org/badge/1095513352.svg)](https://doi.org/10.5281/zenodo.17603044)
+
+# EdelweissFE: A light-weight, platform-independent, parallel finite element framework.
+
+<p align="center">
+  <img width="512" height="512" src="./doc/source/borehole_damage_lowdilation.gif">
+</p>
+
+See the [documentation](https://edelweiss-numerics.github.io/EdelweissFE).
+
+EdelweissFE aims at an easy to understand, yet efficient implementation of the finite element method.
+Some features are:
+
+ * Python for non performance-critical routines
+ * Cython for performance-critical routines
+ * Parallelization
+ * Modular system, which is easy to extend
+ * Output to Paraview, Ensight, CSV, matplotlib
+ * Interfaces to powerful direct and iterative linear solvers
+
+EdelweissFE makes use of the [Marmot](https://github.com/MAteRialMOdelingToolbox/Marmot/) library for finite element and constitutive model formulations.
