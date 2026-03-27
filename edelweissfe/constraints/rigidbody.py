@@ -144,7 +144,7 @@ class Constraint(ConstraintBase):
         """
         return self.nRot**2 + len(self.slaveNodes) * 2 * self._nUCoupledPerSlave * self.nDim
 
-    def initializeVIJContribution(self, idcs: np.ndarray, I: np.ndarray, J: np.ndarray, offset: int) -> None:
+    def initializeVIJContribution(self, idcs: np.ndarray, I_: np.ndarray, J_: np.ndarray, offset: int) -> None:
         """Fill the VIJ index arrays with the sparse pattern of this constraint.
 
         Layout (starting at ``offset``):
@@ -170,8 +170,8 @@ class Constraint(ConstraintBase):
         # K_UU: rotation-rotation block of the reference point
         for ri in range(nRot):
             for rj in range(nRot):
-                I[k] = idcs[nU - nRot + ri]
-                J[k] = idcs[nU - nRot + rj]
+                I_[k] = idcs[nU - nRot + ri]
+                J_[k] = idcs[nU - nRot + rj]
                 k += 1
 
         # Per-slave K_UL and K_LU blocks
@@ -182,17 +182,16 @@ class Constraint(ConstraintBase):
             # K_UL: nUc × nDim
             for iu in range(nUc):
                 for il in range(nDim):
-                    I[k] = idcs[indcsU_s[iu]]
-                    J[k] = idcs[L0_local + il]
+                    I_[k] = idcs[indcsU_s[iu]]
+                    J_[k] = idcs[L0_local + il]
                     k += 1
 
             # K_LU: nDim × nUc (transpose of K_UL)
             for il in range(nDim):
                 for iu in range(nUc):
-                    I[k] = idcs[L0_local + il]
-                    J[k] = idcs[indcsU_s[iu]]
+                    I_[k] = idcs[L0_local + il]
+                    J_[k] = idcs[indcsU_s[iu]]
                     k += 1
-
 
     def Rz_2D(self, phi, derivative):
         phi = phi + np.pi / 2 * derivative

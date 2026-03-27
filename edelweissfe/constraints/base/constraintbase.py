@@ -106,7 +106,7 @@ class ConstraintBase(ABC):
 
         return self.nDof**2
 
-    def initializeVIJContribution(self, idcs: np.ndarray, I: np.ndarray, J: np.ndarray, offset: int) -> None:
+    def initializeVIJContribution(self, idcs: np.ndarray, I_: np.ndarray, J_: np.ndarray, offset: int) -> None:
         """Fill the global ``I`` and ``J`` index arrays for this constraint's VIJ contribution.
 
         The default implementation writes a full dense ``nDof × nDof`` block, identical to
@@ -129,8 +129,8 @@ class ConstraintBase(ABC):
 
         n = len(idcs)
         VIJLocations = np.tile(idcs, (n, 1))
-        I[offset : offset + n**2] = VIJLocations.flatten()
-        J[offset : offset + n**2] = VIJLocations.flatten("F")
+        I_[offset : offset + n**2] = VIJLocations.flatten()
+        J_[offset : offset + n**2] = VIJLocations.flatten("F")
 
     def getNumberOfAdditionalNeededScalarVariables(
         self,
