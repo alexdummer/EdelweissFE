@@ -1,3 +1,0 @@
-[console_scripts]
-edelweissfe = edelweissfe._cli._edelweissfe:main
-run_tests_edelweissfe = edelweissfe._cli._run_tests_edelweissfe:main
