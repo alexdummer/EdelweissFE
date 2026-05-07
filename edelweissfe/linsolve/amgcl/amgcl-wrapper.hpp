@@ -66,8 +66,7 @@ public:
       cached_ptr_.assign( ptr, ptr + n + 1 );
       cached_col_.assign( col, col + nnz );
     }
-    else if ( n != cached_n || nnz != cached_nnz ||
-              !std::equal( ptr, ptr + n + 1, cached_ptr_.begin() ) ||
+    else if ( n != cached_n || nnz != cached_nnz || !std::equal( ptr, ptr + n + 1, cached_ptr_.begin() ) ||
               !std::equal( col, col + nnz, cached_col_.begin() ) ) {
       // Matrix structure changed: rebuild solver to preserve behavior
       solver_.reset( new Solver( A, prm ) );
