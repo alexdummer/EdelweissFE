@@ -151,29 +151,21 @@ class NED(NonlinearSolverBase):
         M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
         Minv = self.theDofManager.constructDofVector()  # initialize inverse lumped mass matrix
 
-        D = self.theDofManager.constructDofVector()  # initialize damping matrix
-        Dinv = self.theDofManager.constructDofVector()  # initialize inverse damping matrix
-
         U = self.theDofManager.constructDofVector()  # initialize displacement vector
         V = self.theDofManager.constructDofVector()  # initilize velocity vector
         P = self.theDofManager.constructDofVector()  # initialize reaction vector
 
-        M[:] = D[:] = 0.0
+        M[:] = 0.0
         for el in model.elements.values():
             Me = np.zeros(el.nDof)
             el.computeLumpedInertia(Me)
             M[el] += Me
-            De = np.zeros(el.nDof)
-            el.computeLumpedDamping(De)
-            D[el] += De
 
         # compute inverses
         Minv[M != 0.0] = 1.0 / M[M != 0.0]
-        Dinv[D != 0.0] = 1.0 / D[D != 0.0]
 
-        # delete M and D to save memory
+        # delete M to save memory
         del M
-        del D
 
         for fieldName, field in model.nodeFields.items():
             U = self.theDofManager.writeNodeFieldToDofVector(U, field, "U")
@@ -217,7 +209,6 @@ class NED(NonlinearSolverBase):
                         V,
                         P,
                         Minv,
-                        Dinv,
                         step.actions,
                         model,
                         timeStep,
@@ -294,7 +285,6 @@ class NED(NonlinearSolverBase):
         V: DofVector,
         P: DofVector,
         Minv: DofVector,
-        Dinv: DofVector,
         stepActions: list,
         model: FEModel,
         timeStep: TimeStep,
@@ -367,7 +357,7 @@ class NED(NonlinearSolverBase):
         for fieldName in self.theDofManager.fields:
             ids = self.theDofManager.idcsOfFieldsInDofVector[fieldName]
             if fieldName in self.options["first-order-fields"]:
-                V[ids] += Dinv[ids].T * R[ids]
+                V[ids] += Minv[ids].T * R[ids]
             elif fieldName in self.options["second-order-fields"]:
                 V[ids] += Minv[ids].T * R[ids] * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
             else:

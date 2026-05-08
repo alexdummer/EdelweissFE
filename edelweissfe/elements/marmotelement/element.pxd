@@ -126,8 +126,6 @@ cdef extern from "Marmot/MarmotElement.h":
 
         void computeLumpedInertia(double* M)
 
-        void computeLumpedDamping(double* C)
-
         StateView getStateView(const string& stateName, int gaussPt)
 
         vector[vector[string]] getNodeFields()
