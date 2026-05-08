@@ -244,7 +244,10 @@ class NEST(NIST):
         self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)
 
         linsolverOptions = self.options["linsolverConfigFile"]
-        linsolverOptionDict = json.load(open(linsolverOptions, "r")) if linsolverOptions else ""
+        linsolverOptionDict = {}
+        if linsolverOptions:
+            with open(linsolverOptions, "r") as f:
+                linsolverOptionDict = json.load(f)
         self.linSolver = getLinSolverByName(self.options.get("linsolver", "default"), linsolverOptionDict)
 
         self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)

@@ -44,7 +44,7 @@ class NISTParallel(NIST):
 
     def solveStep(self, step, model, fieldOutputController, outputmanagers):
 
-        self.journal.message("Using {:} threads".format(getNumberOfThreads), self.identification)
+        self.journal.message("Using {:} threads".format(getNumberOfThreads()), self.identification)
         return super().solveStep(step, model, fieldOutputController, outputmanagers)
 
     def computeElements(self, elements, Un1, dU, P, K, F, timeStep):

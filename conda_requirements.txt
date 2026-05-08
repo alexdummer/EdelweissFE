@@ -1,6 +1,7 @@
 anaconda::mkl
 anaconda::mkl-include
 anaconda::intel-openmp
+boost-cpp
 cmake
 compilers
 cython
