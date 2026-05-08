@@ -7,11 +7,12 @@
 *.vtk
 *.html
 *.cpp
-*.cpython-38-x86_64-linux-gnu.so
+*.so
 CMakeCache.txt
 Makefile
 CMakeFiles
 __pycache__
 esExport
 ensightExport
-EdelweissFE.egg-info/
+build
+EdelweissFE.egg-info
