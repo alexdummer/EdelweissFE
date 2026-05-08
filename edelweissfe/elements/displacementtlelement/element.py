@@ -520,6 +520,42 @@ class DisplacementTLElement(BaseElement):
         for i in range(self._nInt):
             P += np.outer(N[i], load).flatten() * lin.det(self.J[i]) * self._t * self._weight[i]
 
+    def computeConsistentMassMatrix(self, M: np.ndarray):
+        """Compute the consistent mass matrix.
+
+        Parameters
+        ----------
+        M
+            The mass matrix to be defined.
+        """
+        N = computeNOperator(self._xi, self._eta, self._zeta, self._nInt, self.nNodes, self.nSpatialDimensions)
+        nDoFPerNode = int(self._nDof / self.nNodes)
+        for i in range(self._nInt):
+            # compute element volume
+            detJ = lin.det(self.J[i])
+            # compute mass matrix for element j in point i
+            N_ = np.zeros((self.nSpatialDimensions, self._nDof))
+            for j in range(self.nNodes):
+                for k in range(nDoFPerNode):
+                    N_[k, nDoFPerNode * j + k] = N[i][j]
+
+            M += self.material.getDensity() * N_.T @ N_ * detJ * self._weight[i] * self._t
+
+    def computeLumpedInertia(self, M: np.ndarray):
+        """Compute the lumped mass matrix with simple row summing of the consistent mass matrix.
+
+        Parameters
+        ----------
+        M
+            The mass matrix to be defined.
+        """
+        # compute element volume
+        cmm = np.zeros((self._nDof, self._nDof))
+        self.computeConsistentMassMatrix(cmm)
+
+        # compute lumped mass matrix by summing up the rows
+        M[:] = np.sum(cmm, axis=1)
+
     def acceptLastState(
         self,
     ):

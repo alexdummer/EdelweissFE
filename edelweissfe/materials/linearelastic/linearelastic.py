@@ -243,6 +243,8 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         -------
         float
             The density of the material."""
+        if not hasattr(self, "_density"):
+            raise Exception("Density is not defined for this material.")
         return self._density
 
     def getResult(self, result: str) -> float:

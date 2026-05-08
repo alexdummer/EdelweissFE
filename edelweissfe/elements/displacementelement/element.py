@@ -438,7 +438,7 @@ class DisplacementElement(BaseElement):
             M += self.material.getDensity() * N_.T @ N_ * detJ * self._weight[i] * self._t
 
     def computeLumpedInertia(self, M: np.ndarray):
-        """Compute the lumped mass matrix.
+        """Compute the lumped mass matrix with simple row summing of the consistent mass matrix.
 
         Parameters
         ----------
@@ -449,23 +449,8 @@ class DisplacementElement(BaseElement):
         cmm = np.zeros((self._nDof, self._nDof))
         self.computeConsistentMassMatrix(cmm)
 
-        # print("consistent mass matrix:", cmm)
         # compute lumped mass matrix by summing up the rows
         M[:] = np.sum(cmm, axis=1)
-
-        # compute lumped mass matrix by scaling the diagonal of the consistent mass matrix
-        # M[:] = np.diagonal(cmm) * np.sum(cmm) / np.sum(np.diagonal(cmm))
-
-    def computeLumpedDamping(self, M: np.ndarray):
-        """Compute the lumped damping matrix.
-
-        Parameters
-        ----------
-        M
-            The mass matrix to be defined.
-        """
-
-        return np.zeros_like(M)
 
     def acceptLastState(
         self,

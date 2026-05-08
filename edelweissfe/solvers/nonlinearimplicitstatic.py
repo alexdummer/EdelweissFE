@@ -32,6 +32,7 @@
 import json
 
 import numpy as np
+from scipy.sparse import csr_matrix
 
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
@@ -291,7 +292,7 @@ class NIST(NonlinearSolverBase):
         finally:
             prettyTable = performancetiming.makePrettyTable()
             self.journal.printPrettyTable(prettyTable, self.identification)
-            performancetiming.times.clear()
+            performancetiming.reset()
 
     def solveIncrement(
         self,
@@ -512,7 +513,7 @@ class NIST(NonlinearSolverBase):
         return PExt, K
 
     @performancetiming.timeit("dirichlet K on CSR")
-    def applyDirichletK(self, K: VIJSystemMatrix, dirichlets: list[StepActionBase]) -> VIJSystemMatrix:
+    def applyDirichletK(self, K: csr_matrix, dirichlets: list[StepActionBase]) -> csr_matrix:
         return applyDirichletK(self, K, dirichlets)
 
     @performancetiming.timeit("elements")

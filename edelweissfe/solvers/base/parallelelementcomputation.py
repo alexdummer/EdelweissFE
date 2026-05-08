@@ -90,7 +90,7 @@ def computeElementsInParallel(
     numThreads = getNumberOfThreads() if isFreeThreadingSupported() else 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=numThreads) as executor:
-        results = list(executor.map(computeElementsWorker, elements.values()))  # noqa: F841
+        list(executor.map(computeElementsWorker, elements.values()))  # noqa: F841
 
     scatter_P.assembleInto(P)
     scatter_P.assembleInto(F, absolute=True)
@@ -139,7 +139,7 @@ def computeElementsInParallelForExplicit(
     numThreads = getNumberOfThreads() if isFreeThreadingSupported() else 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=numThreads) as executor:
-        resulst = list(executor.map(computeElementsWorker, elements.values()))  # noqa: F841
+        list(executor.map(computeElementsWorker, elements.values()))  # noqa: F841
 
     scatter_P.assembleInto(P)
 

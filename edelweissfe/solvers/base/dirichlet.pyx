@@ -29,16 +29,16 @@
 
 import numpy as np
 
-from edelweissfe.numerics.dofmanager import VIJSystemMatrix
-
 cimport cython
 
 from collections.abc import Iterable
 
+from scipy.sparse import csr_matrix
+
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def applyDirichletK(nls, K: VIJSystemMatrix, dirichlets: Iterable) -> VIJSystemMatrix:
+def applyDirichletK(nls, K: csr_matrix, dirichlets: Iterable) -> csr_matrix:
     """Apply the dirichlet bcs on the global stiffnes matrix
     Is called by solveStep() before solving the global sys.
     http://stackoverflux.com/questions/12129948/scipy-sparse-set-row-to-zeros
@@ -49,14 +49,14 @@ def applyDirichletK(nls, K: VIJSystemMatrix, dirichlets: Iterable) -> VIJSystemM
     ----------
     nls: NonLinearSolverBase
         The nonlinear solver.
-    K: VIJSystemMatrix
+    K: scipy.sparse.csr_matrix
         The system matrix.
     dirichlets: list
         The list of dirichlet boundary conditions.
 
     Returns
     -------
-    VIJSystemMatrix
+    scipy.sparse.csr_matrix
         The modified system matrix.
     """
     if len(dirichlets) == 0:

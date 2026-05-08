@@ -219,6 +219,19 @@ class BaseElement(BaseNodeCouplingEntity):
         """
 
     @abstractmethod
+    def computeLumpedInertia(
+        self,
+        M: np.ndarray,
+    ):
+        """Evaluate the internal forces for given time, field, and field increment.
+
+        Parameters
+        ----------
+        M
+            The diagonal of the lumped mass matrix to be defined.
+        """
+
+    @abstractmethod
     def computeBodyForce(
         self,
         P: np.ndarray,

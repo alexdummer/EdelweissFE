@@ -165,7 +165,8 @@ def extractIncrementTimes(maxLevels: int = 4) -> PrettyTable:
     Returns a PrettyTable of the time elapsed since the last time
     this function was called, while keeping global 'times' intact.
     """
-    if not hasattr(extractIncrementTimes, "_last_snapshot"):
+
+    if not hasattr(extractIncrementTimes, "_last_snapshot") or extractIncrementTimes._last_snapshot is None:
         extractIncrementTimes._last_snapshot = None
 
     current_state = times.get_snapshot()
@@ -204,3 +205,10 @@ def extractIncrementTimes(maxLevels: int = 4) -> PrettyTable:
         prettytable.add_row([" " * level + cat, "{:}{:10.4E}s".format(" " * level, t), calls])
 
     return prettytable
+
+
+def reset():
+    """Reset all measured times."""
+    global times
+    times.clear()
+    extractIncrementTimes._last_snapshot = None

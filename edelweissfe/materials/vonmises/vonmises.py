@@ -111,9 +111,8 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         self.HLin = materialProperties[3]
         self.deltaYieldStress = materialProperties[4]
         self.delta = materialProperties[5]
-        self.density = -1
         if len(materialProperties) > 6:
-            self.density = materialProperties[6]
+            self._density = materialProperties[6]
         # isotropic hardening
         self._fy = (
             lambda kappa_: self.yieldStress
@@ -288,7 +287,9 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         -------
         float
             The density of the material."""
-        return self.density
+        if not hasattr(self, "_density"):
+            raise Exception("Density is not defined for this material.")
+        return self._density
 
     def getResult(self, result: str) -> float:
         """Get the result, as a persistent view which is continiously

@@ -353,7 +353,7 @@ class NEST(NIST):
         finally:
             prettyTable = performancetiming.makePrettyTable()
             self.journal.printPrettyTable(prettyTable, self.identification)
-            performancetiming.times.clear()
+            performancetiming.reset()
 
     def solveIncrement(
         self,
