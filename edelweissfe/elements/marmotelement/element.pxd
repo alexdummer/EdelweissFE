@@ -166,7 +166,7 @@ cdef class MarmotElementWrapper:
 
     # nogil methods are already declared here:
 
-    cpdef void _initializeStateVarsTemp(self, ) nogil
+    cpdef void _initializeStateVarsTemp(self, ) noexcept  nogil
 
     cpdef void computeYourself(self,
                                double[::1] Ke,
@@ -174,11 +174,11 @@ cdef class MarmotElementWrapper:
                                const double[::1] U,
                                const double[::1] dU,
                                const double[::1] time,
-                               double dTime) nogil except *
+                               double dTime) except * nogil
 
     cpdef void computeYourselfExplicit(self,
                                        double[::1] Pe,
                                        const double[::1] U,
                                        const double[::1] dU,
                                        const double[::1] time,
-                                       double dTime) nogil except *
+                                       double dTime) except * nogil

@@ -198,7 +198,7 @@ cdef class MarmotElementWrapper:
 
         self._hasMaterial = True
 
-    cpdef void _initializeStateVarsTemp(self, ) nogil:
+    cpdef void _initializeStateVarsTemp(self, ) noexcept nogil:
         self._stateVarsTemp[:] = self._stateVars
 
     def setInitialCondition(self,
@@ -219,7 +219,7 @@ cdef class MarmotElementWrapper:
                                const double[::1] U,
                                const double[::1] dU,
                                const double[::1] time,
-                               double dTime) nogil except *:
+                               double dTime) except * nogil:
         """Evaluate residual and stiffness for given time, field, and field increment."""
 
         if not self._hasMaterial:
@@ -246,7 +246,7 @@ cdef class MarmotElementWrapper:
                                        const double[::1] U,
                                        const double[::1] dU,
                                        const double[::1] time,
-                                       double dTime) nogil except *:
+                                       double dTime) except * nogil:
         """Evaluate residual and stiffness for given time, field, and field increment."""
 
         if not self._hasMaterial:
