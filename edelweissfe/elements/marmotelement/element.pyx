@@ -39,11 +39,6 @@ cimport edelweissfe.elements.marmotelement.element
 
 from edelweissfe.utils.exceptions import CutbackRequest
 
-from libc.stdlib cimport free, malloc
-from libcpp.memory cimport allocator, make_unique, unique_ptr
-
-from edelweissfe.elements.base.baseelement import BaseElement
-
 mapLoadTypes={
         "pressure" : DistributedLoadTypes.Pressure,
         "surface torsion" : DistributedLoadTypes.SurfaceTorsion,
