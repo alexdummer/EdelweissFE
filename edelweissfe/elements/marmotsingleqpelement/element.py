@@ -73,9 +73,7 @@ class MarmotMaterialWrappingElement(BaseElement):
         self._hasMaterial = False
 
         self._marmotMaterialWrapper = marmotMaterialWrappers[self._materialType]()
-        self._fields = [
-            self._marmotMaterialWrapper.fields,
-        ]
+        self._fields = (self._marmotMaterialWrapper.fields,)
         self._nDof = self._marmotMaterialWrapper.nU
         self._dofIndicesPermutation = np.arange(0, self._nDof, 1, dtype=int)
 
