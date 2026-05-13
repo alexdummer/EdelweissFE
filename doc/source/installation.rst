@@ -105,7 +105,7 @@ Select the Marmot branch with the same logic used in the workflow:
 
 .. code-block:: console
 
-    TARGET_BRANCH=<target EdelweissFE branch>
+    TARGET_BRANCH=<your EdelweissFE branch, for example master>
     echo "Pull Request Target/Current Branch is: $TARGET_BRANCH"
     if git show-ref --verify --quiet refs/remotes/origin/$TARGET_BRANCH; then
         echo "Matching branch found. Checking out $TARGET_BRANCH..."
