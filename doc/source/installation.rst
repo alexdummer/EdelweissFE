@@ -1,7 +1,7 @@
 Installation
 ============
 
-The currently maintained installation recipes are the ones exercised by the project workflows.
+The currently maintained installation recipes reflect the supported installation paths for EdelweissFE.
 They assume that you are in the EdelweissFE repository root and that a conda environment is active,
 so that ``$CONDA_PREFIX`` points to the installation prefix used by the build steps.
 
@@ -18,7 +18,7 @@ Both supported installation paths start with the same package installation steps
 Working installation without Marmot
 **********************************
 
-The workflow ``run_tests_without_marmot.yml`` builds a working EdelweissFE installation without Marmot support as follows:
+Build a working EdelweissFE installation without Marmot support as follows:
 
 .. code-block:: console
 
@@ -38,7 +38,7 @@ require the additional dependencies described below.
 Working installation with Marmot
 ********************************
 
-The workflow ``run_tests_with_marmot.yml`` extends the base setup with the external libraries needed for Marmot-enabled builds.
+Extend the base setup with the external libraries needed for Marmot-enabled builds.
 
 Install Eigen:
 
@@ -98,21 +98,8 @@ Install Marmot:
 
 .. code-block:: console
 
-    git clone --recurse-submodules https://github.com/MAteRialMOdelingToolbox/Marmot/
+    git clone --branch master --recurse-submodules https://github.com/MAteRialMOdelingToolbox/Marmot/
     cd Marmot
-
-Select the Marmot branch with the same logic used in the workflow:
-
-.. code-block:: console
-
-    TARGET_BRANCH=master # Replace with your EdelweissFE branch if needed.
-    echo "Pull Request Target/Current Branch is: $TARGET_BRANCH"
-    if git show-ref --verify --quiet refs/remotes/origin/$TARGET_BRANCH; then
-        echo "Matching branch found. Checking out $TARGET_BRANCH..."
-        git checkout $TARGET_BRANCH
-    else
-        echo "Branch $TARGET_BRANCH not found in Marmot, staying on default branch."
-    fi
 
 Then build and install Marmot:
 
@@ -137,20 +124,160 @@ Validate that installation with the same CI commands:
     run_tests_edelweissfe ./testfiles/marmot/
     run_tests_edelweissfe ./testfiles/edelweiss-only/
 
-Alternative local build
-***********************
+TLDR
+****
 
-If you want to compile the extensions in place instead of installing the package with pip, you can still use:
+Assuming that you are in an empty directory,
+you can quickly get a working version of EdelweissFE in a Linux based
+environment:
+
+Installation steps without Marmot
+_________________________________
+
+If necessary, get `Anaconda <https://www.anaconda.com/>`_
 
 .. code-block:: console
+   :caption: Step 1
 
-    python setup.py build_ext -i
+    curl -L -O \
+        https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-aarch64.sh
+    bash Miniforge3-Linux-aarch64.sh -b -p ./miniforge3
 
-Force a recompilation with:
+Add mamba to your environment:
 
 .. code-block:: console
+   :caption: Step 2
 
-    python setup.py build_ext -i --force
+    export EWROOT=$PWD
+    export PATH=$EWROOT/mambaforge3/bin:$PATH
+    conda init --all
+    exit
+
+Restart shell and activate mamba
+
+.. code-block:: console
+   :caption: Step 3
+
+    export EWROOT=$PWD
+    conda activate
+
+Get EdelweissFE:
+
+.. code-block:: console
+   :caption: Step 4
+
+    git clone https://github.com/EdelweissFE/EdelweissFE.git
+
+Install the required conda packages:
+
+.. code-block:: console
+   :caption: Step 5
+
+    mamba install --file EdelweissFE/conda_requirements.txt
+
+Install the additional pip packages:
+
+.. code-block:: console
+   :caption: Step 6
+
+    pip install -r EdelweissFE/pip_requirements.txt
+
+Build and test EdelweissFE without Marmot:
+
+.. code-block:: console
+   :caption: Step 7
+
+    cd $EWROOT/EdelweissFE
+    pip install .
+    run_tests_edelweissfe ./testfiles/edelweiss-only/
+
+Installation steps with Marmot
+______________________________
+
+Install Eigen:
+
+.. code-block:: console
+   :caption: Step 8
+
+    cd $EWROOT
+    git clone --branch 3.4.0 https://gitlab.com/libeigen/eigen.git
+    cd eigen
+    mkdir build
+    cd build
+    cmake \
+        -DBUILD_TESTING=OFF \
+        -DINCLUDE_INSTALL_DIR=$CONDA_PREFIX/include \
+        -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX \
+        ..
+    make install
+
+Install autodiff:
+
+.. code-block:: console
+   :caption: Step 9
+
+    cd $EWROOT
+    git clone --branch v1.1.0 https://github.com/autodiff/autodiff.git
+    cd autodiff
+    mkdir build
+    cd build
+    cmake \
+        -DAUTODIFF_BUILD_TESTS=OFF \
+        -DAUTODIFF_BUILD_PYTHON=OFF \
+        -DAUTODIFF_BUILD_EXAMPLES=OFF \
+        -DAUTODIFF_BUILD_DOCS=OFF \
+        -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX \
+        ..
+    make install
+
+Install Fastor:
+
+.. code-block:: console
+   :caption: Step 10
+
+    cd $EWROOT
+    git clone https://github.com/romeric/Fastor.git
+    cd Fastor
+    mkdir build
+    cd build
+    cmake -DBUILD_TESTING=OFF -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX ..
+    make install
+
+Install AMGCL:
+
+.. code-block:: console
+   :caption: Step 11
+
+    cd $EWROOT
+    git clone --branch 1.4.7 --depth 1 https://github.com/ddemidov/amgcl.git
+    cd amgcl
+    mkdir build
+    cd build
+    cmake -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX ..
+    make install
+
+Install Marmot from the master branch:
+
+.. code-block:: console
+   :caption: Step 12
+
+    cd $EWROOT
+    git clone --branch master --recurse-submodules https://github.com/MAteRialMOdelingToolbox/Marmot/
+    cd Marmot
+    mkdir build
+    cd build
+    cmake -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX ..
+    make install
+
+Build and test EdelweissFE with Marmot:
+
+.. code-block:: console
+   :caption: Step 13
+
+    cd $EWROOT/EdelweissFE
+    pip install -v .
+    run_tests_edelweissfe ./testfiles/marmot/
+    run_tests_edelweissfe ./testfiles/edelweiss-only/
 
 Build the documentation
 ***********************
