@@ -154,7 +154,7 @@ class ImmutableOrderedSet(OrderedSet):
             else:
                 raise TypeError(
                     f"You tried to add an item with wrong type: {item} of type {type(item)}"
-                    + "Allowed types are: "
+                    + "Allowed types are:\n"
                     + ", ".join([t.__name__ for t in self.allowedObjectTypes])
                 )
 
