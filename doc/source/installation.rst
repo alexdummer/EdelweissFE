@@ -101,13 +101,17 @@ Install Marmot:
     git clone --recurse-submodules https://github.com/MAteRialMOdelingToolbox/Marmot/
     cd Marmot
 
-If you want to match the Marmot branch to the EdelweissFE target branch, use the same branch selection logic as the workflow before configuring Marmot:
+Select the Marmot branch with the same logic used in the workflow:
 
 .. code-block:: console
 
     TARGET_BRANCH=<target EdelweissFE branch>
+    echo "Pull Request Target/Current Branch is: $TARGET_BRANCH"
     if git show-ref --verify --quiet refs/remotes/origin/$TARGET_BRANCH; then
+        echo "Matching branch found. Checking out $TARGET_BRANCH..."
         git checkout $TARGET_BRANCH
+    else
+        echo "Branch $TARGET_BRANCH not found in Marmot, staying on default branch."
     fi
 
 Then build and install Marmot:

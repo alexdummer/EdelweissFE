@@ -80,6 +80,14 @@ cd ../..
 
 git clone --recurse-submodules https://github.com/MAteRialMOdelingToolbox/Marmot/
 cd Marmot
+TARGET_BRANCH=<target EdelweissFE branch>
+echo "Pull Request Target/Current Branch is: $TARGET_BRANCH"
+if git show-ref --verify --quiet refs/remotes/origin/$TARGET_BRANCH; then
+    echo "Matching branch found. Checking out $TARGET_BRANCH..."
+    git checkout $TARGET_BRANCH
+else
+    echo "Branch $TARGET_BRANCH not found in Marmot, staying on default branch."
+fi
 mkdir build
 cd build
 cmake -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX ..
@@ -89,15 +97,6 @@ cd ../../EdelweissFE
 pip install -v .
 run_tests_edelweissfe ./testfiles/marmot/
 run_tests_edelweissfe ./testfiles/edelweiss-only/
-```
-
-When you need Marmot and EdelweissFE branches to match, use the same Marmot branch-selection logic as the workflow before configuring Marmot:
-
-```console
-TARGET_BRANCH=<target EdelweissFE branch>
-if git show-ref --verify --quiet refs/remotes/origin/$TARGET_BRANCH; then
-    git checkout $TARGET_BRANCH
-fi
 ```
 
 The full installation recipe in the documentation mirrors these workflow steps in more detail.
