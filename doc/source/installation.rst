@@ -136,6 +136,9 @@ _________________________________
 
 If necessary, get `Anaconda <https://www.anaconda.com/>`_
 
+The example below uses the Linux ``aarch64`` Miniforge installer. If you are on a different platform,
+choose the matching installer from the Miniforge releases page.
+
 .. code-block:: console
    :caption: Step 1
 
@@ -149,7 +152,7 @@ Add mamba to your environment:
    :caption: Step 2
 
     export EWROOT=$PWD
-    export PATH=$EWROOT/mambaforge3/bin:$PATH
+    export PATH=$EWROOT/miniforge3/bin:$PATH
     conda init --all
     exit
 
