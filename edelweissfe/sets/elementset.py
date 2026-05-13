@@ -66,7 +66,7 @@ class ElementSet(ImmutableOrderedSet):
     ):
         self.allowedObjectTypes = [
             MarmotElementWrapper,
-            # MarmotMaterialWrappingElement,
+            MarmotMaterialWrappingElement,
             DisplacementElement,
             DisplacementTLElement,
         ]
