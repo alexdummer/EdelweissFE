@@ -80,7 +80,7 @@ cd ../..
 
 git clone --recurse-submodules https://github.com/MAteRialMOdelingToolbox/Marmot/
 cd Marmot
-TARGET_BRANCH=<your EdelweissFE branch, for example master>
+TARGET_BRANCH=master # Replace with your EdelweissFE branch if needed.
 echo "Pull Request Target/Current Branch is: $TARGET_BRANCH"
 if git show-ref --verify --quiet refs/remotes/origin/$TARGET_BRANCH; then
     echo "Matching branch found. Checking out $TARGET_BRANCH..."
