@@ -227,11 +227,6 @@ class NEST(NIST):
         self.iterationHeader2 = (" {:<10}  {:<10}  ").format("||R||∞", "||ddU||∞") * nVariables
         self.iterationMessageTemplate = "{:11.2e}{:1}{:11.2e}{:1} "
 
-        U = self.theDofManager.constructDofVector()
-        K = self.theDofManager.constructVIJSystemMatrix()
-
-        self.csrGenerator = CSRGenerator(K)
-
         self.computationTimes = createTimingDict()
 
         _optionsUpdate = step.actions["options"].get("NESTSolver", {})
@@ -250,11 +245,11 @@ class NEST(NIST):
                 linsolverOptionDict = json.load(f)
         self.linSolver = getLinSolverByName(self.options.get("linsolver", "default"), linsolverOptionDict)
 
-        self.tol = self.options.get("runge-kutta-error-tolerance", 1e-3)
-
         U = self.theDofManager.constructDofVector()
         P = self.theDofManager.constructDofVector()
         dU = self.theDofManager.constructDofVector()
+        K = self.theDofManager.constructVIJSystemMatrix()
+        self.csrGenerator = CSRGenerator(K)
 
         for fieldName, field in model.nodeFields.items():
             U = self.theDofManager.writeNodeFieldToDofVector(U, field, "U")

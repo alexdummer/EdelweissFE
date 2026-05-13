@@ -90,7 +90,7 @@ def computeElementsInParallel(
     numThreads = getNumberOfThreads() if isFreeThreadingSupported() else 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=numThreads) as executor:
-        list(executor.map(computeElementsWorker, elements.values()))  # noqa: F841
+        list(executor.map(computeElementsWorker, elements.values()))
 
     scatter_P.assembleInto(P)
     scatter_P.assembleInto(F, absolute=True)
@@ -100,7 +100,7 @@ def computeElementsInParallel(
 
 def computeElementsInParallelForExplicit(
     elements: dict, Un1: DofVector, dU: DofVector, P: DofVector, timeStep: TimeStep
-) -> tuple[DofVector, VIJSystemMatrix, DofVector]:
+) -> DofVector:
     """
     Compute the elements in parallel for explicit analysis.
 
@@ -139,7 +139,7 @@ def computeElementsInParallelForExplicit(
     numThreads = getNumberOfThreads() if isFreeThreadingSupported() else 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=numThreads) as executor:
-        list(executor.map(computeElementsWorker, elements.values()))  # noqa: F841
+        list(executor.map(computeElementsWorker, elements.values()))
 
     scatter_P.assembleInto(P)
 

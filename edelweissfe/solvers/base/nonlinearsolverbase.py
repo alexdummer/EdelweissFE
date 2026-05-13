@@ -247,7 +247,7 @@ class NonlinearSolverBase(ABC):
         KCsr = self.csrGenerator.updateCSR(K)
         return KCsr
 
-    def computeSpatialAveragedFluxes(self, F: DofVector) -> float:
+    def computeSpatialAveragedFluxes(self, F: DofVector) -> dict[str,float]:
         """Compute the spatial averaged flux for every field
         Is usually called by checkConvergence().
 
