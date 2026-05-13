@@ -9,6 +9,7 @@ docutils=0.16
 gstools
 make
 matplotlib
+meshio
 numpy
 numpydoc
 # petsc4py
