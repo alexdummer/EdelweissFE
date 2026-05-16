@@ -895,8 +895,8 @@ class NIST:
                         getattr(constraint, "name", None) or getattr(constraint, "id", None) or repr(constraint)
                     )
                     raise ValueError(
-                        "VIJ slice for constraint "
-                        f"{constraint.__class__.__name__} ({constraint_identifier}) is too small "
+                        f"VIJ slice for constraint {constraint.__class__.__name__} "
+                        f"({constraint_identifier}) is too small "
                         f"({K_flat.size} < {expected_vij_size})."
                     )
                 K_flat = K_flat[:expected_vij_size]
