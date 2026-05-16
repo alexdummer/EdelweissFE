@@ -398,7 +398,9 @@ class DofManager:
 
             for node in e.nodes:
                 for field, fv in node.fields.items():
-                    nAccumulatedFluxesFieldwise[field] += len(self.idcsOfFieldVariablesInDofVector[fv])
+                    indices = self.idcsOfFieldVariablesInDofVector.get(fv)
+                    if indices is not None:
+                        nAccumulatedFluxesFieldwise[field] += len(indices)
 
             largestNumberOfAnyEntitityDof = max(e.nDof, largestNumberOfAnyEntitityDof)
 

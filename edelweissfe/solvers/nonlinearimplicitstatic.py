@@ -890,6 +890,15 @@ class NIST:
             expected_vij_size = constraint.getVIJContributionSize()
             K_flat = K[constraint]
             if K_flat.size != expected_vij_size:
+                if K_flat.size < expected_vij_size:
+                    constraint_identifier = (
+                        getattr(constraint, "name", None) or getattr(constraint, "id", None) or repr(constraint)
+                    )
+                    raise ValueError(
+                        f"VIJ slice for constraint {constraint.__class__.__name__} "
+                        f"({constraint_identifier}) is too small "
+                        f"({K_flat.size} < {expected_vij_size})."
+                    )
                 K_flat = K_flat[:expected_vij_size]
             Pc = np.zeros(constraint.nDof)
 
