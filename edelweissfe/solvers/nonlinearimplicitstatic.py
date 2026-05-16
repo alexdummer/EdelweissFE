@@ -891,9 +891,12 @@ class NIST:
             K_flat = K[constraint]
             if K_flat.size != expected_vij_size:
                 if K_flat.size < expected_vij_size:
+                    constraint_identifier = (
+                        getattr(constraint, "name", None) or getattr(constraint, "id", None) or repr(constraint)
+                    )
                     raise ValueError(
                         "VIJ slice for constraint "
-                        f"{constraint.__class__.__name__} is too small "
+                        f"{constraint.__class__.__name__} ({constraint_identifier}) is too small "
                         f"({K_flat.size} < {expected_vij_size})."
                     )
                 K_flat = K_flat[:expected_vij_size]
