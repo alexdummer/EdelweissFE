@@ -31,11 +31,12 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from edelweissfe.models.femodel import FEModel
+from edelweissfe.numerics.vijentitybase import VIJEntityBase
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.variables.scalarvariable import ScalarVariable
 
 
-class ConstraintBase(ABC):
+class ConstraintBase(ABC, VIJEntityBase):
     @abstractmethod
     def __init__(self, name: str, model: FEModel, *args, **kwargs):
         """The constraint base class.
@@ -89,48 +90,6 @@ class ConstraintBase(ABC):
     @abstractmethod
     def nDof(self) -> int:
         """The total number of degrees of freedom this constraint is associated with."""
-
-    def getVIJContributionSize(self) -> int:
-        """Return the number of entries this constraint contributes to the VIJ (COO) system matrix.
-
-        By default this is ``nDof**2``, which corresponds to a full dense block.
-        Constraints whose nonzero pattern is much sparser than a full block should override
-        this method (together with :meth:`initializeVIJContribution`) to avoid allocating
-        O(N²) entries when only O(N) entries are actually nonzero.
-
-        Returns
-        -------
-        int
-            Number of VIJ entries for this constraint.
-        """
-
-        return self.nDof**2
-
-    def initializeVIJContribution(self, idcs: np.ndarray, I_: np.ndarray, J_: np.ndarray, offset: int) -> None:
-        """Fill the global ``I`` and ``J`` index arrays for this constraint's VIJ contribution.
-
-        The default implementation writes a full dense ``nDof × nDof`` block, identical to
-        the behaviour used for finite elements.  Constraints that override
-        :meth:`getVIJContributionSize` to return a smaller value **must** also override
-        this method so that exactly ``getVIJContributionSize()`` ``(I, J)`` pairs are
-        written starting at ``offset``.
-
-        Parameters
-        ----------
-        idcs
-            Global DOF indices for this constraint (length = ``nDof``).
-        I
-            The global row-index array of the VIJ triple (written in-place).
-        J
-            The global column-index array of the VIJ triple (written in-place).
-        offset
-            First position in ``I`` / ``J`` that belongs to this constraint.
-        """
-
-        n = len(idcs)
-        VIJLocations = np.tile(idcs, (n, 1))
-        I_[offset : offset + n**2] = VIJLocations.flatten()
-        J_[offset : offset + n**2] = VIJLocations.flatten("F")
 
     def getNumberOfAdditionalNeededScalarVariables(
         self,

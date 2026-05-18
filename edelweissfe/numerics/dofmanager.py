@@ -591,19 +591,8 @@ class DofManager:
         ) in self.idcsOfHigherOrderEntitiesInDofVector.items():
             entitiesInVIJ[entity] = idxInVIJ
 
-            nDofEntity = len(entityIdcsInDofVector)
-
-            if hasattr(entity, "initializeVIJContribution"):
-                # Constraint with a custom (potentially sparse) VIJ pattern.
-                entity.initializeVIJContribution(entityIdcsInDofVector, I, J, idxInVIJ)
-                nVIJEntity = entity.getVIJContributionSize()
-            else:
-                # Default dense block for finite elements.
-                # looks like black magic, but it's an efficient way to generate all indices of Ke in K:
-                VIJLocations = np.tile(entityIdcsInDofVector, (nDofEntity, 1))
-                I[idxInVIJ : idxInVIJ + nDofEntity**2] = VIJLocations.flatten()
-                J[idxInVIJ : idxInVIJ + nDofEntity**2] = VIJLocations.flatten("F")
-                nVIJEntity = nDofEntity**2
+            entity.initializeVIJContribution(entityIdcsInDofVector, I, J, idxInVIJ)
+            nVIJEntity = entity.getVIJContributionSize()
 
             idxInVIJ += nVIJEntity
 

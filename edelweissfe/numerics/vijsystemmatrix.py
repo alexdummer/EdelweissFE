@@ -74,11 +74,7 @@ class VIJSystemMatrix(np.ndarray):
         try:
             # Entity Lookup
             idxInVIJ = self.entitiesInVIJ[key]
-            get_vij_contribution_size = getattr(key, "getVIJContributionSize", None)
-            if callable(get_vij_contribution_size):
-                size = get_vij_contribution_size()
-            else:
-                size = key.nDof**2
+            size = key.getVIJContributionSize()
             return super().__getitem__(slice(idxInVIJ, idxInVIJ + size))
         except (KeyError, TypeError, AttributeError):
             # Fallback for any other weird key types
