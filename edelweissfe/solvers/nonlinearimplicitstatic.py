@@ -44,6 +44,7 @@ from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
 from edelweissfe.solvers.base.dirichlet import applyDirichletK
 from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
 from edelweissfe.stepactions.base.stepactionbase import StepActionBase
+from edelweissfe.stepactions.options import inputLanguage
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import (
     ConditionalStop,
@@ -55,6 +56,14 @@ from edelweissfe.utils.exceptions import (
     StepFailed,
 )
 from edelweissfe.utils.fieldoutput import FieldOutputController
+
+kw = inputLanguage["step"].getModule("adaptive").getKeyword("options")
+kw.addOptionalArg("defaultMaxIter", "", int, 10)
+kw.addOptionalArg("defaultCriticalIter", "", int, 5)
+kw.addOptionalArg("defaultMaxGrowingIter", "", int, 10)
+kw.addOptionalArg("extrapolation", "", str, "linear")
+kw.addOptionalArg("linsolver", "", str, "pardiso")
+kw.addOptionalArg("linsolverConfigFile", "", str, "")
 
 
 class NIST(NonlinearSolverBase):
@@ -607,8 +616,13 @@ class NIST(NonlinearSolverBase):
         """
 
         for constraint in constraints.values():
-            Kc = K[constraint].reshape(constraint.nDof, constraint.nDof, order="F")
+            K_flat = K[constraint]
             Pc = np.zeros(constraint.nDof)
+
+            if constraint.getVIJContributionSize() == constraint.nDof**2:
+                Kc = K_flat.reshape(constraint.nDof, constraint.nDof, order="F")
+            else:
+                Kc = K_flat
 
             constraint.applyConstraint(U_np[constraint], dU[constraint], Pc, Kc, timeStep)
 
