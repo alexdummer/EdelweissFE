@@ -304,6 +304,18 @@ cdef class MarmotElementWrapper:
 
         self.marmotElement.computeLumpedInertia(&M[0])
 
+    def computeCriticalTimeStepForExplicitDynamics(self):
+        """Compute the critical time step for explicit dynamics of the underlying MarmotElement"""
+        criticalTimeStep = 1e36
+        self.marmotElement.computeCriticalTimeStepForExplicitDynamics(criticalTimeStep)
+        return criticalTimeStep
+
+    def computeInternalEnergy(self):
+        """Compute the internal energy of the underlying MarmotElement"""
+        internalEnergy = 0.0
+        self.marmotElement.computeInternalEnergy(internalEnergy)
+        return internalEnergy
+
     def acceptLastState(self, ):
         """Accept the computed state (in nonlinear iteration schemes)."""
 

@@ -81,7 +81,7 @@ class SimpleTimeStepper:
         self.dT = 0.0
         self.journal = journal
 
-    def generateTimeStep(self) -> TimeStep:
+    def generateTimeStep(self, enforcedTimeIncrement=None) -> TimeStep:
         """
         Generate the next increment.
 
@@ -94,32 +94,61 @@ class SimpleTimeStepper:
         # zero increment; return value for first function call
         yield TimeStep(0, 0.0, 0.0, 0.0, 0.0, self.currentTime)
 
-        while self.finishedStepProgress < (1.0 - 1e-15):
-            if self.totalIncrements >= self.maxNumberIncrements:
-                self.journal.errorMessage("Reached maximum number of increments", self.identification)
-                raise ReachedMaxIncrements()
-            if self.increment > self.maxIncrement:
-                self.increment = self.maxIncrement
+        if enforcedTimeIncrement is None:
+            while self.finishedStepProgress < (1.0 - 1e-15):
+                if self.totalIncrements >= self.maxNumberIncrements:
+                    self.journal.errorMessage("Reached maximum number of increments", self.identification)
+                    raise ReachedMaxIncrements()
+                if self.increment > self.maxIncrement:
+                    self.increment = self.maxIncrement
 
-            remainder = 1.0 - self.finishedStepProgress
-            if remainder < self.increment:
-                self.increment = remainder
+                remainder = 1.0 - self.finishedStepProgress
+                if remainder < self.increment:
+                    self.increment = remainder
 
-            dT = self.stepLength * self.increment
-            self.finishedStepProgress += self.increment
-            endTimeOfIncrementInStep = self.stepLength * self.finishedStepProgress
-            endTimeOfIncrementInTotal = self.currentTime + endTimeOfIncrementInStep
+                dT = self.stepLength * self.increment
+                self.finishedStepProgress += self.increment
+                endTimeOfIncrementInStep = self.stepLength * self.finishedStepProgress
+                endTimeOfIncrementInTotal = self.currentTime + endTimeOfIncrementInStep
 
-            self.totalIncrements += 1
+                self.totalIncrements += 1
 
-            yield TimeStep(
-                self.totalIncrements,
-                self.increment,
-                self.finishedStepProgress,
-                dT,
-                endTimeOfIncrementInStep,
-                endTimeOfIncrementInTotal,
-            )
+                yield TimeStep(
+                    self.totalIncrements,
+                    self.increment,
+                    self.finishedStepProgress,
+                    dT,
+                    endTimeOfIncrementInStep,
+                    endTimeOfIncrementInTotal,
+                )
+        else:
+            while self.finishedStepProgress < (1.0 - 1e-15):
+                if self.totalIncrements >= self.maxNumberIncrements:
+                    self.journal.errorMessage("Reached maximum number of increments", self.identification)
+                    raise ReachedMaxIncrements()
+                if self.increment > self.maxIncrement:
+                    self.increment = self.maxIncrement
+
+                dT = enforcedTimeIncrement
+                self.increment = dT / self.stepLength
+                remainder = 1.0 - self.finishedStepProgress
+                if remainder < self.increment:
+                    self.increment = remainder
+
+                self.finishedStepProgress += self.increment
+                endTimeOfIncrementInStep = self.stepLength * self.finishedStepProgress
+                endTimeOfIncrementInTotal = self.currentTime + endTimeOfIncrementInStep
+
+                self.totalIncrements += 1
+
+                yield TimeStep(
+                    self.totalIncrements,
+                    self.increment,
+                    self.finishedStepProgress,
+                    dT,
+                    endTimeOfIncrementInStep,
+                    endTimeOfIncrementInTotal,
+                )
 
     def changeIncrementSize(self, scaleFactor: float):
         """Change increment size between minIncrement and

@@ -126,6 +126,10 @@ cdef extern from "Marmot/MarmotElement.h":
 
         void computeLumpedInertia(double* M)
 
+        void computeCriticalTimeStepForExplicitDynamics(double& criticalTimeStep)
+
+        void computeInternalEnergy(double& internalEnergy)
+
         StateView getStateView(const string& stateName, int gaussPt)
 
         vector[vector[string]] getNodeFields()

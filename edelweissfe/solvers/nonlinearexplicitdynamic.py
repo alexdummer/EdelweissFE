@@ -40,9 +40,7 @@ from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.exceptions import (
     ConditionalStop,
     CutbackRequest,
-    DivergingSolution,
     ReachedMaxIncrements,
-    ReachedMaxIterations,
     ReachedMinIncrementSize,
     StepFailed,
 )
@@ -67,6 +65,8 @@ class NED(NonlinearSolverBase):
         "second-order-fields": list(),
         "first-order-scheme": "forward-euler",
         "second-order-scheme": "central-difference",
+        "courant-number": 0.8,
+        "output-frequency": 1000,
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
@@ -74,6 +74,8 @@ class NED(NonlinearSolverBase):
 
         self.options = self.NEDOptions.copy()
         self._updateOptions(kwargs, journal)
+        self.ids_1st = None
+        self.ids_2nd = None
 
     def _updateOptions(self, updatedOptions: dict, journal):
         """Update options of the solver using a string dict
@@ -103,7 +105,7 @@ class NED(NonlinearSolverBase):
         model: FEModel,
         fieldOutputController: FieldOutputController,
         outputmanagers: dict[str, OutputManagerBase],
-    ) -> tuple[bool, FEModel]:
+    ):
         """Public interface to solve for a step.
 
         Parameters
@@ -143,17 +145,21 @@ class NED(NonlinearSolverBase):
                 "scalar variables",
             ]
 
-        try:
+        if "NEDSolver" in step.actions["options"].keys():
             self._updateOptions(step.actions["options"]["NEDSolver"].options, self.journal)
-        except KeyError:
-            pass
+
         # initialize mass and damping matrices
         M = self.theDofManager.constructDofVector()  # initialize lumped mass matrix
         Minv = self.theDofManager.constructDofVector()  # initialize inverse lumped mass matrix
 
         U = self.theDofManager.constructDofVector()  # initialize displacement vector
+        dU = self.theDofManager.constructDofVector()  # initialize displacement vector
         V = self.theDofManager.constructDofVector()  # initilize velocity vector
         P = self.theDofManager.constructDofVector()  # initialize reaction vector
+
+        U_old = self.theDofManager.constructDofVector()  # initialize old displacement vector
+        V_old = self.theDofManager.constructDofVector()  # initilize old velocity vector
+        P_old = self.theDofManager.constructDofVector()  # initialize old reaction vector
 
         M[:] = 0.0
         for el in model.elements.values():
@@ -178,8 +184,41 @@ class NED(NonlinearSolverBase):
 
         self.applyStepActionsAtStepStart(model, step.actions)
 
+        criticalTimeStep = self.options.get("courant-number") * self.getCriticalTimeStepForExplicitDynamics(model)
+        self.journal.message(
+            "Critical time step for explicit dynamics: {:e}".format(criticalTimeStep), self.identification, 1
+        )
+
+        # pre compute ids for 1st and 2nd order fields for faster access in the increment loop
+        for fieldName in self.options["first-order-fields"]:
+            if fieldName not in presentVariableNames:
+                raise ValueError(
+                    "Field {:} specified in first-order-fields, but not present in model".format(fieldName)
+                )
+            if self.ids_1st is None:
+                self.ids_1st = self.theDofManager.idcsOfFieldsInDofVector[
+                    fieldName
+                ]  # just access to check existence and pre compute
+            else:
+                self.ids_1st = np.r_[
+                    self.ids_1st, self.theDofManager.idcsOfFieldsInDofVector[fieldName]
+                ]  # just access to check existence and pre compute
+        for fieldName in self.options["second-order-fields"]:
+            if fieldName not in presentVariableNames:
+                raise ValueError(
+                    "Field {:} specified in second-order-fields, but not present in model".format(fieldName)
+                )
+            if self.ids_2nd is None:
+                self.ids_2nd = self.theDofManager.idcsOfFieldsInDofVector[
+                    fieldName
+                ]  # just access to check existence and pre compute
+            else:
+                self.ids_2nd = np.r_[
+                    self.ids_2nd, self.theDofManager.idcsOfFieldsInDofVector[fieldName]
+                ]  # just access to check existence and pre compute
+
         try:
-            for timeStep in step.getTimeStep():
+            for timeStep in step.getTimeStep(enforcedTimeIncrement=criticalTimeStep):
                 statusInfoDict = {
                     "step": step.number,
                     "inc": timeStep.number,
@@ -190,22 +229,28 @@ class NED(NonlinearSolverBase):
                     "notes": "",
                 }
 
-                self.journal.printSeperationLine()
-                self.journal.message(
-                    "increment {:}: {:8f}, {:8f}; time {:10f} to {:10f}".format(
-                        timeStep.number,
-                        timeStep.stepProgressIncrement,
-                        timeStep.stepProgress,
-                        timeStep.totalTime - timeStep.timeIncrement,
-                        timeStep.totalTime,
-                    ),
-                    self.identification,
-                    level=1,
-                )
-
+                # only print for every 100 increments
+                if timeStep.number % self.options["output-frequency"] == 0:
+                    self.journal.printSeperationLine()
+                    self.journal.message(
+                        "increment {:}: {:8e}, {:8e}; time {:10e} to {:10e}".format(
+                            timeStep.number,
+                            timeStep.stepProgressIncrement,
+                            timeStep.stepProgress,
+                            timeStep.totalTime - timeStep.timeIncrement,
+                            timeStep.totalTime,
+                        ),
+                        self.identification,
+                        level=1,
+                    )
+                U_old[:] = U
+                V_old[:] = V
+                P_old[:] = P
+                dU[:] = 0.0
                 try:
                     U, V, P = self.solveIncrement(
                         U,
+                        dU,
                         V,
                         P,
                         Minv,
@@ -227,40 +272,32 @@ class NED(NonlinearSolverBase):
                         man.finalizeFailedIncrement(
                             statusInfoDict=statusInfoDict,
                         )
-
-                except (ReachedMaxIterations, DivergingSolution) as e:
-                    self.journal.message(str(e), self.identification, 1)
-                    step.discardAndChangeIncrement(0.25)
-                    prevTimeStep = None
-
-                    statusInfoDict["iters"] = np.inf
-                    statusInfoDict["notes"] = str(e)
-
-                    for man in outputmanagers:
-                        man.finalizeFailedIncrement(
-                            statusInfoDict=statusInfoDict,
-                        )
-
+                    # reset to old state
+                    U[:] = U_old
+                    V[:] = V_old
+                    P[:] = P_old
                 else:
                     prevTimeStep = timeStep
 
                     # write results to nodes:
-                    for fieldName, field in model.nodeFields.items():
-                        self.theDofManager.writeDofVectorToNodeField(U, field, "U")
-                        self.theDofManager.writeDofVectorToNodeField(P, field, "P")
+                    if timeStep.number % self.options["output-frequency"] == 0:
+                        for fieldName, field in model.nodeFields.items():
+                            self.theDofManager.writeDofVectorToNodeField(U, field, "U")
+                            self.theDofManager.writeDofVectorToNodeField(P, field, "P")
 
-                    for variable in model.scalarVariables.values():
-                        variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
+                        for variable in model.scalarVariables.values():
+                            variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
 
                     model.advanceToTime(timeStep.totalTime)
 
                     statusInfoDict["converged"] = True
 
-                    fieldOutputController.finalizeIncrement()
-                    for man in outputmanagers:
-                        man.finalizeIncrement(
-                            statusInfoDict=statusInfoDict,
-                        )
+                    if timeStep.number % self.options["output-frequency"] == 0:
+                        fieldOutputController.finalizeIncrement()
+                        for man in outputmanagers:
+                            man.finalizeIncrement(
+                                statusInfoDict=statusInfoDict,
+                            )
 
         except (ReachedMaxIncrements, ReachedMinIncrementSize):
             self.journal.errorMessage("Incrementation failed", self.identification)
@@ -279,9 +316,11 @@ class NED(NonlinearSolverBase):
             performancetiming.times.clear()
             performancetiming.extractIncrementTimes._last_snapshot = None
 
+    @performancetiming.timeit("increment")
     def solveIncrement(
         self,
         U_n: DofVector,
+        dU: DofVector,
         V: DofVector,
         P: DofVector,
         Minv: DofVector,
@@ -289,7 +328,7 @@ class NED(NonlinearSolverBase):
         model: FEModel,
         timeStep: TimeStep,
         prevTimeStep: TimeStep,
-    ) -> tuple[DofVector, DofVector, DofVector, DofVector]:
+    ) -> tuple[DofVector, DofVector, DofVector]:
         """Standard explicit update scheme to solve for an increment.
 
         Parameters
@@ -324,9 +363,6 @@ class NED(NonlinearSolverBase):
         """
 
         elements = model.elements
-        R = self.theDofManager.constructDofVector()
-        U_np = self.theDofManager.constructDofVector()
-        dU = self.theDofManager.constructDofVector()  # initialize displacement increment vector
         dirichlets = stepActions["dirichlet"].values()
         nodeforces = stepActions["nodeforces"].values()
         distributedLoads = stepActions["distributedload"].values()
@@ -346,29 +382,21 @@ class NED(NonlinearSolverBase):
                 timeStep.totalTime - timeStep.timeIncrement,
             )
 
-        R[:] = P
-
         # enforce dirichlet boundary conditions
         for dirichlet in dirichlets:
-            R[self.findDirichletIndices(dirichlet)] = 0.0
+            P[self.findDirichletIndices(dirichlet)] = 0.0
             V[self.findDirichletIndices(dirichlet)] = dirichlet.getDelta(timeStep).flatten() / timeStep.timeIncrement
 
-        # loop over fields for velocity update
-        for fieldName in self.theDofManager.fields:
-            ids = self.theDofManager.idcsOfFieldsInDofVector[fieldName]
-            if fieldName in self.options["first-order-fields"]:
-                V[ids] += Minv[ids].T * R[ids]
-            elif fieldName in self.options["second-order-fields"]:
-                V[ids] += Minv[ids].T * R[ids] * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
-            else:
-                raise ValueError("Field {:} not assigned to first- or second-order update scheme".format(fieldName))
+        if self.ids_1st is not None:
+            V[self.ids_1st] = Minv[self.ids_1st] * P[self.ids_1st]
+        if self.ids_2nd is not None:
+            V[self.ids_2nd] += (
+                Minv[self.ids_2nd] * P[self.ids_2nd] * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
+            )
 
         # update displacement increment vector
-        inc = V * timeStep.timeIncrement
-        dU[:] = inc
-
-        # update displacement vector
-        U_np[:] = U_n + dU
+        np.multiply(V, timeStep.timeIncrement, out=dU)
+        np.add(U_n, dU, out=U_n)
 
         self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
 
@@ -376,10 +404,21 @@ class NED(NonlinearSolverBase):
             geostatic.applyAtIterationStart()
 
         P[:] = 0.0
-        P = self.computeElements(elements, U_np, dU, P, timeStep)
-        P = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_np, P, timeStep)
+        P, psi = self.computeElements(elements, U_n, dU, P, timeStep)
+        P = self.assembleLoads(nodeforces, distributedLoads, bodyForces, U_n, P, timeStep)
 
-        return U_np, V, P
+        if timeStep.number % self.options["output-frequency"] == 0:
+            Wint = psi
+            Wkin = 0.5 * np.sum(1 / Minv * V**2)
+            W = Wint + Wkin
+            self.journal.message(
+                "Internal energy: {:e} ({:.2f} %)".format(Wint, Wint / W * 100), self.identification, 2
+            )
+            self.journal.message(
+                "Kinetic energy:  {:e} ({:.2f} %)".format(Wkin, Wkin / W * 100), self.identification, 2
+            )
+
+        return U_n, V, P
 
     @performancetiming.timeit("distributed loads")
     def computeDistributedLoads(
@@ -503,13 +542,14 @@ class NED(NonlinearSolverBase):
         time = np.array([timeStep.stepTime, timeStep.totalTime])
         dT = timeStep.timeIncrement
         P[:] = 0.0
+        psi = 0.0
         for el in elements.values():
             Pe = np.zeros(el.nDof)
             el.computeYourselfExplicit(Pe, U_np[el], dU[el], time, dT)
-
+            psi += el.computeInternalEnergy()
             P[el] += Pe
 
-        return P
+        return P, psi
 
     def assembleLoads(
         self,
@@ -551,3 +591,26 @@ class NED(NonlinearSolverBase):
         PExt = self.computeBodyForces(bodyForces, U_np, PExt, timeStep)
 
         return PExt
+
+    def getCriticalTimeStepForExplicitDynamics(self, model: FEModel) -> float:
+        """Compute the critical time step for explicit dynamics.
+
+        Parameters
+        ----------
+        model
+            The model tree.
+
+        Returns
+        -------
+        float
+            The critical time step for explicit dynamics.
+        """
+        minTimeStep = np.inf
+
+        for element in model.elements.values():
+            elementTimeStep = np.inf
+            elementTimeStep = element.computeCriticalTimeStepForExplicitDynamics()
+            if elementTimeStep < minTimeStep:
+                minTimeStep = elementTimeStep
+
+        return minTimeStep
