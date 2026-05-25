@@ -80,6 +80,7 @@ class SimpleTimeStepper:
         self.stepLength = stepLength
         self.dT = 0.0
         self.journal = journal
+        self.enforcedTimeIncrement = None
 
     def generateTimeStep(self, enforcedTimeIncrement=None) -> TimeStep:
         """
@@ -93,8 +94,9 @@ class SimpleTimeStepper:
 
         # zero increment; return value for first function call
         yield TimeStep(0, 0.0, 0.0, 0.0, 0.0, self.currentTime)
+        self.enforcedTimeIncrement = enforcedTimeIncrement
 
-        if enforcedTimeIncrement is None:
+        if self.enforcedTimeIncrement is None:
             while self.finishedStepProgress < (1.0 - 1e-15):
                 if self.totalIncrements >= self.maxNumberIncrements:
                     self.journal.errorMessage("Reached maximum number of increments", self.identification)
@@ -129,12 +131,13 @@ class SimpleTimeStepper:
                 if self.increment > self.maxIncrement:
                     self.increment = self.maxIncrement
 
-                dT = enforcedTimeIncrement
-                self.increment = dT / self.stepLength
+                # dT = enforcedTimeIncrement
+                self.increment = enforcedTimeIncrement / self.stepLength
                 remainder = 1.0 - self.finishedStepProgress
                 if remainder < self.increment:
                     self.increment = remainder
 
+                dT = self.stepLength * self.increment
                 self.finishedStepProgress += self.increment
                 endTimeOfIncrementInStep = self.stepLength * self.finishedStepProgress
                 endTimeOfIncrementInTotal = self.currentTime + endTimeOfIncrementInStep
@@ -204,6 +207,10 @@ class SimpleTimeStepper:
             self.increment = self.minIncrement
         else:
             self.increment = newIncrement
+
+        if self.enforcedTimeIncrement is not None:
+            # overwrite the enforced time increment with the new increment size
+            self.enforcedTimeIncrement = self.increment * self.stepLength
 
         self.journal.message(
             "Cutback to increment size {:}".format(self.increment),

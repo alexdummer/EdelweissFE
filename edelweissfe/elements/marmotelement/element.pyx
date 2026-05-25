@@ -304,10 +304,10 @@ cdef class MarmotElementWrapper:
 
         self.marmotElement.computeLumpedInertia(&M[0])
 
-    def computeCriticalTimeStepForExplicitDynamics(self):
+    def computeCriticalTimeStepForExplicitDynamics(self, double[::1] Q):
         """Compute the critical time step for explicit dynamics of the underlying MarmotElement"""
         criticalTimeStep = 1e36
-        self.marmotElement.computeCriticalTimeStepForExplicitDynamics(criticalTimeStep)
+        self.marmotElement.computeCriticalTimeStepForExplicitDynamics(criticalTimeStep, &Q[0])
         return criticalTimeStep
 
     def computeInternalEnergy(self):

@@ -168,6 +168,10 @@ class NED(NonlinearSolverBase):
             M[el] += Me
 
         # compute inverses
+        if np.any(M == 0.0):
+            raise ValueError(
+                "Zero mass found in mass vector. This can be caused by elements with zero density, or by elements with zero volume. Please check your model. Zero mass entries are not allowed for explicit dynamics, as they would lead to infinite accelerations and thus numerical instability."
+            )
         Minv[M != 0.0] = 1.0 / M[M != 0.0]
 
         # delete M to save memory
@@ -184,7 +188,7 @@ class NED(NonlinearSolverBase):
 
         self.applyStepActionsAtStepStart(model, step.actions)
 
-        criticalTimeStep = self.options.get("courant-number") * self.getCriticalTimeStepForExplicitDynamics(model)
+        criticalTimeStep = self.options.get("courant-number") * self.getCriticalTimeStepForExplicitDynamics(model, U)
         self.journal.message(
             "Critical time step for explicit dynamics: {:e}".format(criticalTimeStep), self.identification, 1
         )
@@ -216,6 +220,27 @@ class NED(NonlinearSolverBase):
                 self.ids_2nd = np.r_[
                     self.ids_2nd, self.theDofManager.idcsOfFieldsInDofVector[fieldName]
                 ]  # just access to check existence and pre compute
+        # check that there is no overlap between 1st and 2nd order fields
+        if self.ids_1st is not None and self.ids_2nd is not None:
+            print(self.ids_1st)
+            print(self.ids_2nd)
+            if np.intersect1d(self.ids_1st, self.ids_2nd).size > 0:
+                raise ValueError(
+                    "Overlap between first-order-fields and second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
+                )
+        # check that there are all ids in either 1st or 2nd order fields, otherwise the update would be inconsistent
+        if self.ids_1st is None:
+            print(self.ids_2nd)
+            if len(U[self.ids_2nd]) != len(U):
+                raise ValueError(
+                    "There are fields in the model that are not specified in either first-order-fields or second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
+                )
+        elif self.ids_2nd is None:
+            print(self.ids_1st)
+            if len(U[self.ids_1st]) != len(U):
+                raise ValueError(
+                    "There are fields in the model that are not specified in either first-order-fields or second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
+                )
 
         try:
             for timeStep in step.getTimeStep(enforcedTimeIncrement=criticalTimeStep):
@@ -377,7 +402,7 @@ class NED(NonlinearSolverBase):
                 timeStep.number,
                 timeStep.stepProgressIncrement,
                 timeStep.stepProgress,
-                timeStep.timeIncrement,
+                0.0,
                 timeStep.stepTime,
                 timeStep.totalTime - timeStep.timeIncrement,
             )
@@ -393,7 +418,6 @@ class NED(NonlinearSolverBase):
             V[self.ids_2nd] += (
                 Minv[self.ids_2nd] * P[self.ids_2nd] * 0.5 * (timeStep.timeIncrement + prevTimeStep.timeIncrement)
             )
-
         # update displacement increment vector
         np.multiply(V, timeStep.timeIncrement, out=dU)
         np.add(U_n, dU, out=U_n)
@@ -592,7 +616,7 @@ class NED(NonlinearSolverBase):
 
         return PExt
 
-    def getCriticalTimeStepForExplicitDynamics(self, model: FEModel) -> float:
+    def getCriticalTimeStepForExplicitDynamics(self, model: FEModel, U: DofVector) -> float:
         """Compute the critical time step for explicit dynamics.
 
         Parameters
@@ -609,7 +633,7 @@ class NED(NonlinearSolverBase):
 
         for element in model.elements.values():
             elementTimeStep = np.inf
-            elementTimeStep = element.computeCriticalTimeStepForExplicitDynamics()
+            elementTimeStep = element.computeCriticalTimeStepForExplicitDynamics(U[element])
             if elementTimeStep < minTimeStep:
                 minTimeStep = elementTimeStep
 

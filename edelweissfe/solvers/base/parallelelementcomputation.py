@@ -99,59 +99,6 @@ def computeElementsInParallel(
     return P, K, F
 
 
-# def computeElementsInParallelForExplicit(
-#         elements: dict, Un1: DofVector, dU: DofVector, P: DofVector, timeStep: TimeStep
-# ) -> DofVector:
-#     """
-#     Compute the elements in parallel for explicit analysis.
-
-#     Parameters
-#     ----------
-#     elements : dict
-#         The elements to compute.
-#     Un1 : DofVector
-#         The displacement vector.
-#     dU : DofVector
-#         The displacement increment vector.
-#     P : DofVector
-#         The internal force vector.
-#     timeStep : TimeStep
-#         The time step.
-
-#     Returns
-#     -------
-#     P : DofVector
-#         The internal force vector.
-#     """
-
-#     scatter_P = (
-#         P.createScatterVector()
-#     )  # make a scatter vector; which gives 1) contiguous memory access and 2) thread safety
-
-#     time = np.array([timeStep.stepTime, timeStep.totalTime])
-#     dT = timeStep.timeIncrement
-
-#     psi = {el: 0.0 for el in elements.values()}  # create a vector to store the internal energy of each element
-
-#     def computeElementsWorker(element: BaseElement):
-#         Pe = scatter_P[element]
-#         Ue = Un1[element]
-#         dUe = dU[element]
-#         element.computeYourselfExplicit(Pe, Ue, dUe, time, dT)
-#         psi[element] = element.computeInternalEnergy()
-
-#     numThreads = getNumberOfThreads() if isFreeThreadingSupported() else 1
-
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=numThreads) as executor:
-#         list(executor.map(computeElementsWorker, elements.values()))
-
-#     scatter_P.assembleInto(P)
-
-#     psi_total = sum(psi.values())  # sum up the internal energy of all elements
-
-#     return P, psi_total
-
-
 def chunked_iterable(iterable, size):
     """Yield successive n-sized chunks from an iterable."""
     it = iter(iterable)
