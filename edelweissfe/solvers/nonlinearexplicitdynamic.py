@@ -222,21 +222,17 @@ class NED(NonlinearSolverBase):
                 ]  # just access to check existence and pre compute
         # check that there is no overlap between 1st and 2nd order fields
         if self.ids_1st is not None and self.ids_2nd is not None:
-            print(self.ids_1st)
-            print(self.ids_2nd)
             if np.intersect1d(self.ids_1st, self.ids_2nd).size > 0:
                 raise ValueError(
                     "Overlap between first-order-fields and second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
                 )
         # check that there are all ids in either 1st or 2nd order fields, otherwise the update would be inconsistent
         if self.ids_1st is None:
-            print(self.ids_2nd)
             if len(U[self.ids_2nd]) != len(U):
                 raise ValueError(
                     "There are fields in the model that are not specified in either first-order-fields or second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
                 )
         elif self.ids_2nd is None:
-            print(self.ids_1st)
             if len(U[self.ids_1st]) != len(U):
                 raise ValueError(
                     "There are fields in the model that are not specified in either first-order-fields or second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
