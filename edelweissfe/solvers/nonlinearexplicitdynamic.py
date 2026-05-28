@@ -28,6 +28,8 @@
 #  ---------------------------------------------------------------------
 
 
+from copy import deepcopy
+
 import numpy as np
 
 import edelweissfe.utils.performancetiming as performancetiming
@@ -61,8 +63,8 @@ class NED(NonlinearSolverBase):
     identification = "NEDSolver"
 
     NEDOptions = {
-        "first-order-fields": list(),
-        "second-order-fields": list(),
+        "first-order-fields": [],
+        "second-order-fields": [],
         "first-order-scheme": "forward-euler",
         "second-order-scheme": "central-difference",
         "courant-number": 0.8,
@@ -72,7 +74,8 @@ class NED(NonlinearSolverBase):
     def __init__(self, jobInfo, journal, **kwargs):
         self.journal = journal
 
-        self.options = self.NEDOptions.copy()
+        # Ensure mutable defaults (field lists) are isolated per solver instance.
+        self.options = deepcopy(self.NEDOptions)
         self._updateOptions(kwargs, journal)
         self.ids_1st = None
         self.ids_2nd = None
@@ -170,7 +173,7 @@ class NED(NonlinearSolverBase):
         # compute inverses
         if np.any(M == 0.0):
             raise ValueError(
-                "Zero mass found in mass vector. This can be caused by elements with zero density, or by elements with zero volume. Please check your model. Zero mass entries are not allowed for explicit dynamics, as they would lead to infinite accelerations and thus numerical instability."
+                "Zero mass found in mass vector. This can be caused by elements with zero density, or by elements with zero volume."
             )
         Minv[M != 0.0] = 1.0 / M[M != 0.0]
 
@@ -185,6 +188,8 @@ class NED(NonlinearSolverBase):
             U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]] = variable.value
 
         prevTimeStep = None
+        self.ids_1st = np.empty(0, dtype=int)
+        self.ids_2nd = np.empty(0, dtype=int)
 
         self.applyStepActionsAtStepStart(model, step.actions)
 
@@ -193,64 +198,30 @@ class NED(NonlinearSolverBase):
             "Critical time step for explicit dynamics: {:e}".format(criticalTimeStep), self.identification, 1
         )
 
-        # pre compute ids for 1st and 2nd order fields for faster access in the increment loop
-        for fieldName in self.options["first-order-fields"]:
+        # check if all fields are specified either in first-order-fields or second-order-fields
+        isSpecified = {presentVariable: False for presentVariable in presentVariableNames}
+        for fieldName in self.options["first-order-fields"] + self.options["second-order-fields"]:
             if fieldName not in presentVariableNames:
                 raise ValueError(
                     "Field {:} specified in first-order-fields, but not present in model".format(fieldName)
                 )
-            if self.ids_1st is None:
-                self.ids_1st = self.theDofManager.idcsOfFieldsInDofVector[
-                    fieldName
-                ]  # just access to check existence and pre compute
-            else:
-                self.ids_1st = np.r_[
-                    self.ids_1st, self.theDofManager.idcsOfFieldsInDofVector[fieldName]
-                ]  # just access to check existence and pre compute
+            if isSpecified[fieldName]:
+                raise ValueError(
+                    "Field {:} specified multiple times in first-order-fields and second-order-fields: {:}, {:}".format(
+                        fieldName, self.options["first-order-fields"], self.options["second-order-fields"]
+                    )
+                )
+            isSpecified[fieldName] = True
+
+        # assign indices of fields to first-order and second-order update schemes
+        for fieldName in self.options["first-order-fields"]:
+            self.ids_1st = np.r_[self.ids_1st, self.theDofManager.idcsOfFieldsInDofVector[fieldName]]
         for fieldName in self.options["second-order-fields"]:
-            if fieldName not in presentVariableNames:
-                raise ValueError(
-                    "Field {:} specified in second-order-fields, but not present in model".format(fieldName)
-                )
-            if self.ids_2nd is None:
-                self.ids_2nd = self.theDofManager.idcsOfFieldsInDofVector[
-                    fieldName
-                ]  # just access to check existence and pre compute
-            else:
-                self.ids_2nd = np.r_[
-                    self.ids_2nd, self.theDofManager.idcsOfFieldsInDofVector[fieldName]
-                ]  # just access to check existence and pre compute
-        # check that there is no overlap between 1st and 2nd order fields
-        if self.ids_1st is not None and self.ids_2nd is not None:
-            if np.intersect1d(self.ids_1st, self.ids_2nd).size > 0:
-                raise ValueError(
-                    "Overlap between first-order-fields and second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
-                )
-        # check that there are all ids in either 1st or 2nd order fields, otherwise the update would be inconsistent
-        if self.ids_1st is None:
-            if len(U[self.ids_2nd]) != len(U):
-                raise ValueError(
-                    "There are fields in the model that are not specified in either first-order-fields or second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
-                )
-        elif self.ids_2nd is None:
-            if len(U[self.ids_1st]) != len(U):
-                raise ValueError(
-                    "There are fields in the model that are not specified in either first-order-fields or second-order-fields. This is not allowed, as it would lead to inconsistent updates. Please check your options."
-                )
+            self.ids_2nd = np.r_[self.ids_2nd, self.theDofManager.idcsOfFieldsInDofVector[fieldName]]
 
         try:
             for timeStep in step.getTimeStep(enforcedTimeIncrement=criticalTimeStep):
-                statusInfoDict = {
-                    "step": step.number,
-                    "inc": timeStep.number,
-                    "iters": None,
-                    "converged": False,
-                    "time inc": timeStep.timeIncrement,
-                    "time end": timeStep.totalTime,
-                    "notes": "",
-                }
-
-                # only print for every 100 increments
+                # only print for every increments configured in output-frequency
                 if timeStep.number % self.options["output-frequency"] == 0:
                     self.journal.printSeperationLine()
                     self.journal.message(
@@ -286,12 +257,9 @@ class NED(NonlinearSolverBase):
                     step.discardAndChangeIncrement(max(e.cutbackSize, 0.25))
                     prevTimeStep = None
 
-                    statusInfoDict["iters"] = np.inf
-                    statusInfoDict["notes"] = str(e)
-
                     for man in outputmanagers:
                         man.finalizeFailedIncrement(
-                            statusInfoDict=statusInfoDict,
+                            statusInfoDict=None,
                         )
                     # reset to old state
                     U[:] = U_old
@@ -300,24 +268,20 @@ class NED(NonlinearSolverBase):
                 else:
                     prevTimeStep = timeStep
 
-                    # write results to nodes:
-                    if timeStep.number % self.options["output-frequency"] == 0:
-                        for fieldName, field in model.nodeFields.items():
-                            self.theDofManager.writeDofVectorToNodeField(U, field, "U")
-                            self.theDofManager.writeDofVectorToNodeField(P, field, "P")
+                    for fieldName, field in model.nodeFields.items():
+                        self.theDofManager.writeDofVectorToNodeField(U, field, "U")
+                        self.theDofManager.writeDofVectorToNodeField(P, field, "P")
 
-                        for variable in model.scalarVariables.values():
-                            variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
+                    for variable in model.scalarVariables.values():
+                        variable.value = U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]]
 
                     model.advanceToTime(timeStep.totalTime)
-
-                    statusInfoDict["converged"] = True
 
                     if timeStep.number % self.options["output-frequency"] == 0:
                         fieldOutputController.finalizeIncrement()
                         for man in outputmanagers:
                             man.finalizeIncrement(
-                                statusInfoDict=statusInfoDict,
+                                statusInfoDict=None,
                             )
 
         except (ReachedMaxIncrements, ReachedMinIncrementSize):

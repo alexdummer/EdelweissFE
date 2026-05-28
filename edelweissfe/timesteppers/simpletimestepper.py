@@ -131,7 +131,6 @@ class SimpleTimeStepper:
                 if self.increment > self.maxIncrement:
                     self.increment = self.maxIncrement
 
-                # dT = enforcedTimeIncrement
                 self.increment = enforcedTimeIncrement / self.stepLength
                 remainder = 1.0 - self.finishedStepProgress
                 if remainder < self.increment:

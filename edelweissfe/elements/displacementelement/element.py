@@ -510,7 +510,7 @@ class DisplacementElement(BaseElement):
         return energy
 
     def getCharacteristicElementLength(self, qp: int = 0):
-        """Compute the characteristic element length for the critical time step calculation in explicit dynamics.
+        """Compute the characteristic element length.
         Parameters
         ----------
         qp
