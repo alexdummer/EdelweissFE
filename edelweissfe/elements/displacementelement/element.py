@@ -497,8 +497,8 @@ class DisplacementElement(BaseElement):
         """
         energy = 0
         for i in range(self._nInt):
-            stress = self._stateVarsRef[i][0:6]
-            strain = self._stateVarsRef[i][6:12]
+            stress = self._stateVarsTemp[i][0:6]
+            strain = self._stateVarsTemp[i][6:12]
             energy += (
                 0.5
                 * np.dot(stress[self._activeVoigtIndices], strain[self._activeVoigtIndices])

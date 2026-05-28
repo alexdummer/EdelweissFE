@@ -564,10 +564,10 @@ class DisplacementTLElement(BaseElement):
         M[:] = np.sum(cmm, axis=1)
 
     def computeCriticalTimeStepForExplicitDynamics(self, Q: np.ndarray):
-
-        dt = np.inf
-
-        return dt
+        raise NotImplementedError(
+            "Critical time step computation for explicit dynamics is not implemented "
+            "for this total-Lagrangian displacement element."
+        )
 
     def getCharacteristicElementLength(self, qp: int = 0):
         """Compute the characteristic element length for the critical time step calculation in explicit dynamics.

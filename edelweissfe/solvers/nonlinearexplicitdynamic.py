@@ -221,7 +221,7 @@ class NED(NonlinearSolverBase):
 
         try:
             for timeStep in step.getTimeStep(enforcedTimeIncrement=criticalTimeStep):
-                # only print for every increments configured in output-frequency
+                # only print for increments matching the configured output-frequency
                 if timeStep.number % self.options["output-frequency"] == 0:
                     self.journal.printSeperationLine()
                     self.journal.message(
