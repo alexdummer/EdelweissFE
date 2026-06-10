@@ -33,6 +33,7 @@ import numpy as np
 import sympy as sp
 
 from edelweissfe.config.phenomena import getFieldSize
+from edelweissfe.sets.nodeset import NodeSet
 from edelweissfe.stepactions.base.dirichletbase import DirichletBase
 from edelweissfe.steps.adaptivestep import InputLanguage
 from edelweissfe.timesteppers.timestep import TimeStep
@@ -109,6 +110,11 @@ class StepAction(DirichletBase):
 
         self.action = action
         self.nSet = model.nodeSets[action["nSet"]]
+        # filter set to only contain nodes with dofs in the field for which the dirichlet is defined
+        self.nSet = NodeSet(
+            action["nSet"] + "_dirichlet_" + name, [node for node in self.nSet if self.field in node.fields]
+        )
+        model.nodeSets[action["nSet"] + "_dirichlet_" + name] = self.nSet
         self.fieldSize = getFieldSize(self.field, model.domainSize)
         self.possibleComponents = [str(i + 1) for i in range(self.fieldSize)]
 

@@ -79,6 +79,9 @@ from edelweissfe.sections.plane import inputLanguage  # noqa: F811
 
 
 class AbqModelConstructor:
+
+    identification = "abqModelConstructor"
+
     def __init__(self, journal):
         self.journal = journal
 
@@ -129,6 +132,8 @@ class AbqModelConstructor:
             elementProvider = elDefs.get("provider")
             ElementClass = getElementClass(elementType, elementProvider)
 
+            matchExpectedNodes = True
+
             currElDefs = {}
             for line in elDefs["datalines"]:
                 defLine = [int(i) for i in splitLineAtCommas(line)]
@@ -137,7 +142,10 @@ class AbqModelConstructor:
                 # store nodeObjects in elNodes list
                 elNodes = [nodeDefinitions[n] for n in defLine[1:]]
                 newEl = ElementClass(elementType, label)
-                newEl.setNodes(elNodes)
+                nNodesExpected = newEl.nNodes
+                if len(elNodes) != nNodesExpected:
+                    matchExpectedNodes = False
+                newEl.setNodes(elNodes[:nNodesExpected])
                 currElDefs[label] = newEl
             elements.update(currElDefs)
 
@@ -145,6 +153,11 @@ class AbqModelConstructor:
                 setName = elDefs["elset"]
                 model.elementSets[setName] = ElementSet(setName, currElDefs.values())
 
+            if not matchExpectedNodes:
+                self.journal.message(
+                    "Warning: The number of nodes provided for at least one element does not match the expected value!",
+                    self.identification,
+                )
         # generate dictionary of elementObjects belonging to a specified elementset
         # or generate elementset by generate definition in inputfile
         elementSets = model.elementSets
@@ -241,6 +254,18 @@ class AbqModelConstructor:
                     surface[faceNumber] = model.elementSets[elSet]
 
             model.surfaces[name] = surface
+
+        usedNodes = set()
+        for el in model.elements.values():
+            usedNodes.update(el.nodes)
+        if len(usedNodes) < len(model.nodes):
+            self.journal.message(
+                f"Removing {len(model.nodes) - len(usedNodes)} unused nodes.",
+                self.identification,
+            )
+            model.nodes = {n.label: n for n in model.nodes.values() if n in usedNodes}
+            for nSet in model.nodeSets.values():
+                model.nodeSets[nSet.name] = NodeSet(nSet.name, [n for n in nSet.nodes if n in usedNodes])
 
         return model
 

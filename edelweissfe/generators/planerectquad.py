@@ -113,11 +113,12 @@ def generateModelData(generatorDefinition, model, journal, *args, **kwargs):
     elType = getElementClass(elTypeName, elProvider)
 
     testEl = elType(elTypeName, 0)
+
     if testEl.nNodes == 4:
         nNodesX = nX + 1
         nNodesY = nY + 1
 
-    if testEl.nNodes == 8:
+    if testEl.nNodes in (8, 9):
         nNodesX = 2 * nX + 1
         nNodesY = 2 * nY + 1
 
@@ -147,23 +148,25 @@ def generateModelData(generatorDefinition, model, journal, *args, **kwargs):
                 newEl = elType(elTypeName, currentElementLabel)
                 newEl.setNodes([nG[x, y], nG[x + 1, y], nG[x + 1, y + 1], nG[x, y + 1]])
 
-            elif testEl.nNodes == 8:
+            elif testEl.nNodes in (8, 9):
                 newEl = elType(
                     elTypeName,
                     currentElementLabel,
                 )
-                newEl.setNodes(
-                    [
-                        nG[2 * x, 2 * y],
-                        nG[2 * x + 2, 2 * y],
-                        nG[2 * x + 2, 2 * y + 2],
-                        nG[2 * x, 2 * y + 2],
-                        nG[2 * x + 1, 2 * y],
-                        nG[2 * x + 2, 2 * y + 1],
-                        nG[2 * x + 1, 2 * y + 2],
-                        nG[2 * x, 2 * y + 1],
-                    ]
-                )
+                nodeList = [
+                    nG[2 * x, 2 * y],
+                    nG[2 * x + 2, 2 * y],
+                    nG[2 * x + 2, 2 * y + 2],
+                    nG[2 * x, 2 * y + 2],
+                    nG[2 * x + 1, 2 * y],
+                    nG[2 * x + 2, 2 * y + 1],
+                    nG[2 * x + 1, 2 * y + 2],
+                    nG[2 * x, 2 * y + 1],
+                ]
+                if testEl.nNodes == 9:
+                    nodeList.append(nG[2 * x + 1, 2 * y + 1])
+
+                newEl.setNodes(nodeList)
             elements.append(newEl)
             model.elements[currentElementLabel] = newEl
 

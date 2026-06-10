@@ -48,7 +48,6 @@ from edelweissfe.utils.fieldoutput import (
     _FieldOutputBase,
 )
 from edelweissfe.utils.inputlanguage import InputLanguage, Module
-from edelweissfe.utils.meshtools import disassembleElsetToEnsightShapes
 from edelweissfe.utils.misc import caseInsensitiveKwargsChecker, strtobool
 
 """
@@ -126,6 +125,36 @@ ensightPerElementVariableTypes = {
     6: "tensor symm per element",
     9: "tensor asym per element",
 }
+
+
+_REDUCED_ENSIGHT_EXPORTS = {
+    "g_quad9": ("quad8", tuple(range(8))),
+    "quad9": ("quad8", tuple(range(8))),
+}
+
+
+def _getEnsightExportShapeAndNodes(element):
+    elShape = element.ensightType
+    visNodes = list(element.visualizationNodes)
+
+    if elShape in _REDUCED_ENSIGHT_EXPORTS:
+        mappedShape, mappedNodeIndices = _REDUCED_ENSIGHT_EXPORTS[elShape]
+        if len(visNodes) > max(mappedNodeIndices):
+            return mappedShape, [visNodes[i] for i in mappedNodeIndices]
+
+    return elShape, visNodes
+
+
+def disassembleElsetToEnsightShapesForExport(elementSet):
+    """
+    elset -> {shape : [element-index in elset, ... ], }
+    respecting shape remapping for Ensight export.
+    """
+    elements = defaultdict(list)
+    for i, el in enumerate(elementSet):
+        exportShape, _ = _getEnsightExportShapeAndNodes(el)
+        elements[exportShape].append(i)
+    return elements
 
 
 class EnsightUnstructuredPart:
@@ -658,11 +687,11 @@ def createUnstructuredPartFromElementSet(setName, elementSet: list, partID: int)
     partNodes = dict()
     elementDict = dict()
     for element in elementSet:
-        elShape = element.ensightType
+        elShape, exportNodes = _getEnsightExportShapeAndNodes(element)
         if elShape not in elementDict:
             elementDict[elShape] = dict()
         elNodeIndices = []
-        for node in element.visualizationNodes:
+        for node in exportNodes:
             # if the node is already in the dict, get its index,
             # else insert it, and get the current idx = counter. increase the counter
             idx = partNodes.setdefault(node, nodeCounter)
@@ -672,7 +701,7 @@ def createUnstructuredPartFromElementSet(setName, elementSet: list, partID: int)
                 nodeCounter += 1
         elementDict[elShape][element.elNumber] = elNodeIndices
 
-    return EnsightUnstructuredPart(setName, partID, partNodes.keys(), elementDict)
+    return EnsightUnstructuredPart(setName, partID, list(partNodes.keys()), elementDict)
 
 
 def createUnstructuredPartFromNodeSet(setName, nodeSet: list, partID: int):
@@ -895,7 +924,7 @@ class OutputManager(OutputManagerBase):
             varSize = varSizeFp
         variableJob["varSize"] = varSize
 
-        variableJob["elementsOfShape"] = disassembleElsetToEnsightShapes(fieldOutput.associatedSet)
+        variableJob["elementsOfShape"] = disassembleElsetToEnsightShapesForExport(fieldOutput.associatedSet)
 
         if transient:
             self._transientPerElementVariableJobs[variableJob["name"]].append(variableJob)
@@ -944,10 +973,12 @@ class OutputManager(OutputManagerBase):
             part = self._getTargetPartForFieldOutput(fieldOutput)
         variableJob["part"] = part
 
-        if nEntries != len(variableJob["part"].nodes):
+        reducedResult = self._mapPerNodeResultToPart(fieldOutput, variableJob["part"], fieldOutput.getLastResult())
+
+        if reducedResult.shape[0] != len(variableJob["part"].nodes):
             raise Exception(
                 "Variable {:} result size ({:}) does not match the number of nodes ({:})".format(
-                    variableJob["name"], nEntries, len(variableJob["part"].nodes)
+                    variableJob["name"], reducedResult.shape[0], len(variableJob["part"].nodes)
                 )
             )
 
@@ -996,7 +1027,11 @@ class OutputManager(OutputManagerBase):
         ) in self._transientPerNodeVariableJobs.items():
             resultsByParts = {}
             for perNodeVariableJob in perNodeVariableJobs:
-                result = self._ensureArrayIs2D(perNodeVariableJob["fieldOutput"].getLastResult())
+                result = self._mapPerNodeResultToPart(
+                    perNodeVariableJob["fieldOutput"],
+                    perNodeVariableJob["part"],
+                    perNodeVariableJob["fieldOutput"].getLastResult(),
+                )
 
                 if self.model.domainSize == 2 and result.shape[1] == 2:
                     result = self._make2DVector3D(result)
@@ -1141,3 +1176,32 @@ class OutputManager(OutputManagerBase):
             result,
             ((0, 0), (0, 1)),
         )
+
+    def _getNodesOfAssociatedSet(self, associatedSet) -> list[Node] | None:
+        if isinstance(associatedSet, NodeSet):
+            return list(associatedSet)
+        if isinstance(associatedSet, ElementSet):
+            return list(associatedSet.extractNodeSet())
+        return None
+
+    def _mapPerNodeResultToPart(
+        self,
+        fieldOutput: NodeFieldOutput,
+        part: EnsightUnstructuredPart,
+        result: np.ndarray,
+    ) -> np.ndarray:
+        result2D = self._ensureArrayIs2D(result)
+
+        if result2D.shape[0] == len(part.nodes):
+            return result2D
+
+        associatedNodes = self._getNodesOfAssociatedSet(fieldOutput.associatedSet)
+        if associatedNodes is None or result2D.shape[0] != len(associatedNodes):
+            return result2D
+
+        indicesByNode = {node: i for i, node in enumerate(associatedNodes)}
+        if not all(node in indicesByNode for node in part.nodes):
+            return result2D
+
+        exportIndices = [indicesByNode[node] for node in part.nodes]
+        return result2D[exportIndices]
