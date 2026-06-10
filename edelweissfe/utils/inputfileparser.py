@@ -395,6 +395,7 @@ from edelweissfe.generators.executepythoncode import inputLanguage  # noqa: F811
 from edelweissfe.generators.findclosestnode import inputLanguage  # noqa: F811,E402
 from edelweissfe.generators.pipegen import inputLanguage  # noqa: F811,E402
 from edelweissfe.generators.planerectquad import inputLanguage  # noqa: F811,E402
+from edelweissfe.generators.extrude2dmesh import inputLanguage  # noqa: F811,E402
 from edelweissfe.generators.cuboidlatticegenerator import inputLanguage  # noqa: F811,E402
 
 # isort: on
