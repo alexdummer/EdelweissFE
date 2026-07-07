@@ -78,7 +78,7 @@ cdef extern from "Marmot/MarmotElement.h":
 
         int getNumberOfRequiredStateVars()
 
-        void assignStateVars(double *_stateVars, int nStateVars)
+        int getNumberOfRequiredStateVars()
 
         void assignProperty(const MarmotElementProperty& property)
 
@@ -93,16 +93,19 @@ cdef extern from "Marmot/MarmotElement.h":
                             double* Pe,
                             double* Ke,
                             double time,
-                            double dT) except +
+                            double dT,
+                            double* stateVars) except +
 
         void computeKernelsExplicit(const double* QTotal,
                                     const double* dQ,
                                     double* Pe,
                                     double time,
-                                    double dT) except +
+                                    double dT,
+                                    double* stateVars) except +
 
         void setInitialConditions(StateTypes state,
-                                  const double* values)
+                                  const double* values,
+                                  double* stateVars)
 
         void computeDistributedLoad(
                                 DistributedLoadTypes loadType,
@@ -112,7 +115,8 @@ cdef extern from "Marmot/MarmotElement.h":
                                 const double* load,
                                 const double* QTotal,
                                 double time,
-                                double dT)
+                                double dT,
+                                double* stateVars)
 
         void computeBodyForce(
                         double* P,
@@ -120,15 +124,19 @@ cdef extern from "Marmot/MarmotElement.h":
                         const double* load,
                         const double* QTotal,
                         double time,
-                        double dT)
+                        double dT,
+                        double* stateVars)
 
-        void computeLumpedInertia(double* M)
+        void computeLumpedInertia(double* M, double* stateVars)
 
-        void computeCriticalTimeStepForExplicitDynamics(double& criticalTimeStep, const double* QTotal)
+        void computeCriticalTimeStepForExplicitDynamics(
+                                                    double& criticalTimeStep,
+                                                    const double* QTotal,
+                                                    double* stateVars)
 
-        void computeInternalEnergy(double& internalEnergy)
+        void computeInternalEnergy(double& internalEnergy, double* stateVars)
 
-        StateView getStateView(const string& stateName, int gaussPt)
+        StateView getStateView(const string& stateName, int gaussPt, double* stateVars)
 
         vector[vector[string]] getNodeFields()
 

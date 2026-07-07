@@ -110,7 +110,7 @@ def main():
                 if (np.max(np.abs(residual))) < 1e-6:
                     print("Test {:50} [green]PASSED[/] [{:2.1f}]".format(directory, toc - tic))
                 else:
-                    print("Test {:50} [red]FAILED[/]".format(directory))
+                    print("Test {:50} [red]FAILED[/] error:".format(directory), np.max(np.abs(residual)))
                     failedTests += 1
                 os.chdir("..")
             else:

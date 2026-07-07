@@ -165,7 +165,7 @@ cdef class MarmotElementWrapper:
 
     def initializeElement(self, ):
         """Let the underlying MarmotElement initialize itself"""
-        self.marmotElement.initializeYourself()
+        pass
 
     def setMaterial(self, materialName, materialProperties):
         """Assign a material and material properties to the underlying MarmotElement.
@@ -184,12 +184,12 @@ cdef class MarmotElementWrapper:
         except ValueError:
             raise NotImplementedError("Marmot material {:} not found in library.".format(materialName.upper()))
 
+        self.marmotElement.initializeYourself()
+
         self.nStateVars = self.marmotElement.getNumberOfRequiredStateVars()
 
-        self._stateVars = np.zeros(self.nStateVars)
-        self._stateVarsTemp = np.zeros(self.nStateVars)
-
-        self.marmotElement.assignStateVars(&self._stateVarsTemp[0], self.nStateVars)
+        self._stateVars = np.zeros(max(1, self.nStateVars))
+        self._stateVarsTemp = np.zeros(max(1, self.nStateVars))
 
         self._hasMaterial = True
 
@@ -205,7 +205,7 @@ cdef class MarmotElementWrapper:
             raise Exception("Element {:} has no material assigned!".format(self._elNumber))
 
         self._initializeStateVarsTemp()
-        self.marmotElement.setInitialConditions(mapStateTypes[stateType], &values[0])
+        self.marmotElement.setInitialConditions(mapStateTypes[stateType], &values[0], &self._stateVarsTemp[0])
         self.acceptLastState()
 
     cpdef void computeKernels(self,
@@ -229,7 +229,8 @@ cdef class MarmotElementWrapper:
                                                   &Pe[0],
                                                   &Ke[0],
                                                   time,
-                                                  dTime)
+                                                  dTime,
+                                                  &self._stateVarsTemp[0])
         except (RuntimeError, ValueError) as e:
             raise CutbackRequest(str(e), 0.5)
 
@@ -252,7 +253,8 @@ cdef class MarmotElementWrapper:
                                                           &dU[0],
                                                           &Pe[0],
                                                           time,
-                                                          dTime)
+                                                          dTime,
+                                                          &self._stateVarsTemp[0])
         except (RuntimeError, ValueError) as e:
             raise CutbackRequest(str(e), 0.5)
 
@@ -274,7 +276,8 @@ cdef class MarmotElementWrapper:
                                                   &load[0],
                                                   &U[0],
                                                   time,
-                                                  dTime)
+                                                  dTime,
+                                                  &self._stateVars[0])
 
     def computeBodyForce(self,
                          double[::1] P,
@@ -291,23 +294,24 @@ cdef class MarmotElementWrapper:
                                     &load[0],
                                     &U[0],
                                     time,
-                                    dTime)
+                                    dTime,
+                                    &self._stateVars[0])
 
     def computeLumpedInertia(self, double[::1] M):
         """Compute the lumped mass matrix of the underlying MarmotElement"""
 
-        self.marmotElement.computeLumpedInertia(&M[0])
+        self.marmotElement.computeLumpedInertia(&M[0], &self._stateVars[0])
 
     def computeCriticalTimeStepForExplicitDynamics(self, double[::1] Q):
         """Compute the critical time step for explicit dynamics of the underlying MarmotElement"""
         cdef double criticalTimeStep = 1e36
-        self.marmotElement.computeCriticalTimeStepForExplicitDynamics(criticalTimeStep, &Q[0])
+        self.marmotElement.computeCriticalTimeStepForExplicitDynamics(criticalTimeStep, &Q[0], &self._stateVars[0])
         return criticalTimeStep
 
     def computeInternalEnergy(self):
         """Compute the internal energy of the underlying MarmotElement"""
         cdef double internalEnergy = 0.0
-        self.marmotElement.computeInternalEnergy(internalEnergy)
+        self.marmotElement.computeInternalEnergy(internalEnergy, &self._stateVars[0])
         return internalEnergy
 
     def acceptLastState(self, ):
@@ -334,7 +338,7 @@ cdef class MarmotElementWrapper:
         if not self._hasMaterial:
             raise Exception("Element {:} has no material assigned!".format(self._elNumber))
 
-        cdef StateView res = self.marmotElement.getStateView(result, quadraturePoint)
+        cdef StateView res = self.marmotElement.getStateView(result, quadraturePoint, &self._stateVars[0])
 
         return <double[:res.stateSize]> (res.stateLocation)
 

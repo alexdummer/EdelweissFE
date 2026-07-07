@@ -452,11 +452,11 @@ class ElementFieldOutput(_FieldOutputBase):
         if self.f:
             raise Exception("cannot set field output for modified results (f(x) != None) !")
 
+        qps = self.quadraturePoints if hasattr(self.quadraturePoints, "__iter__") else [self.quadraturePoints]
         for i, el in enumerate(self.associatedSet):
-            for j, g in enumerate(self.quadraturePoints):
+            for j, g in enumerate(qps):
                 theArray = el.getResultArray(self.resultName, g, True)
                 theArray[:] = values[i, j, :]
-                el.acceptLastState()
 
 
 class ExpressionFieldOutput(_FieldOutputBase):
