@@ -26,6 +26,8 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -36,14 +38,11 @@ from edelweissfe.generators.surfaceelementgenerator import buildContactFacets
 from edelweissfe.journal.journal import Journal
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.models.meshdependent import MeshDependent
+from edelweissfe.sets.elementset import ElementSet
 from edelweissfe.utils.caseinsensitivedict import CaseInsensitiveDict
 from edelweissfe.utils.facetcontactgeometry import line2ClosestPoint, tria3ClosestPoint
 from edelweissfe.utils.inputlanguage import InputLanguage, Module
-from edelweissfe.utils.misc import (
-    caseInsensitiveKwargsChecker,
-    castKwargsValuesAndAddDefaults,
-    strtobool,
-)
+from edelweissfe.utils.schema import buildSchemaFromOptions, schemaField
 
 """
 An Abaqus-style surface-to-surface tie constraint, bonding the nodes of a slave surface rigidly to
@@ -117,6 +116,37 @@ module.addOptionalArg(
 documentation = [module]
 
 
+@dataclass(frozen=True)
+class TieSchema:
+    """L2: the options this constraint accepts, owned by this module and never mutated from
+    outside it.
+
+    Mirrors the ``module.addOptionalArg(...)`` declarations above one-for-one. The two
+    declarations coexist while the migration is in progress; the ``Module`` one goes away with the
+    ``InputLanguage`` singleton in P5. ``adjust`` is a real ``bool`` field rather than the
+    hand-``strtobool``-cast ``str`` the legacy grammar declared it as (see
+    :func:`edelweissfe.utils.schema.coerceValue`).
+    """
+
+    positionTolerance: float | None = schemaField(
+        description="If given, slave nodes whose reference-configuration closest-point distance "
+        "to the master surface exceeds this tolerance are left untied (recorded in the "
+        "constraint's untiedSlaveNodes). If not given, every slave node is tied unconditionally.",
+        dtype=float,
+        default=None,
+    )
+    adjust: bool = schemaField(
+        description="Move each tied slave node onto its closest master point at construction "
+        "(Abaqus-like default). If False, any initial geometric gap between the surfaces is "
+        "preserved rigidly (the displacements are tied, not the positions). Note that adjusting "
+        "modifies the nodal coordinates before the element geometry is initialized; avoid "
+        "adjusting nodes that also belong to an already-generated contact surface of another "
+        "constraint.",
+        dtype=bool,
+        default=True,
+    )
+
+
 class Constraint(MultiPointConstraintBase, MeshDependent):
     """
     An Abaqus-style surface-to-surface tie constraint via master-slave DOF elimination.
@@ -144,32 +174,40 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
     facets) and 2D (Line2 facets).
     """
 
-    @caseInsensitiveKwargsChecker([kw.name for kw in module.requiredArgs], [kw.name for kw in module.optionalArgs])
-    @castKwargsValuesAndAddDefaults(module)
-    def __init__(self, name: str, model: FEModel, **kwargs):
-        kwargs = CaseInsensitiveDict(kwargs)
+    #: L2 schema declared for the L3 registry, per OptionSchemaProvider.
+    schema = TieSchema
 
+    def __init__(
+        self,
+        name: str,
+        model: FEModel,
+        slaveSurface: ElementSet,
+        masterSurface: ElementSet,
+        *,
+        configuration: TieSchema = TieSchema(),
+    ):
         self.name = name
         self.nDim = model.domainSize
 
         self._journal = Journal()
-        self._slaveSurfaceSetName = kwargs["slaveSurface"]
-        self._masterSurfaceSetName = kwargs["masterSurface"]
-        self._positionTolerance = kwargs["positionTolerance"]
+        self._slaveSurfaceSetName = slaveSurface.name
+        self._masterSurfaceSetName = masterSurface.name
+        self._positionTolerance = configuration.positionTolerance
 
-        slaveFacetElements = list(model.elementSets[self._slaveSurfaceSetName])
-        masterFacetElements = list(model.elementSets[self._masterSurfaceSetName])
+        slaveFacetElements = list(slaveSurface)
+        masterFacetElements = list(masterSurface)
 
         masterNodes = {node for el in masterFacetElements for node in el.nodes}
         slaveNodesForCheck = {node for el in slaveFacetElements for node in el.nodes}
         if not masterNodes.isdisjoint(slaveNodesForCheck):
             raise ValueError(
-                f"Constraint '{name}': slave surface '{kwargs['slaveSurface']}' and master surface "
-                f"'{kwargs['masterSurface']}' share nodes -- a node cannot be tied to itself."
+                f"Constraint '{name}': slave surface '{self._slaveSurfaceSetName}' and master "
+                f"surface '{self._masterSurfaceSetName}' share nodes -- a node cannot be tied to "
+                "itself."
             )
 
         self.tiedRecords, self.untiedSlaveNodes = self._buildTiedRecords(
-            model, slaveFacetElements, masterFacetElements, adjust=strtobool(kwargs["adjust"])
+            model, slaveFacetElements, masterFacetElements, adjust=configuration.adjust
         )
 
         # A tie has no per-increment tick of its own that runs before the DofManager/VIJSystemMatrix
@@ -179,6 +217,23 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
         # hatch: model.notifyModelChanged() calls onModelChanged() synchronously, from inside the
         # model modifier's own updateModel(), strictly before the rebuild decision is even made.
         model.registerObserver(self)
+
+    @classmethod
+    def fromConstraintDefinition(cls, name: str, definition: dict, model: FEModel) -> "Constraint":
+        """Build this constraint from a parsed ``*constraint`` definition. See
+        :class:`~edelweissfe.constraints.base.multipointconstraintbase.MultiPointConstraintBase`
+        for why this is separate from ``__init__``."""
+        definition = CaseInsensitiveDict(definition)
+        slaveSurfaceName = definition.pop("slaveSurface")
+        masterSurfaceName = definition.pop("masterSurface")
+        configuration = buildSchemaFromOptions(cls.schema, definition)
+        return cls(
+            name,
+            model,
+            model.elementSets[slaveSurfaceName],
+            model.elementSets[masterSurfaceName],
+            configuration=configuration,
+        )
 
     def onModelChanged(self, model: FEModel, changeType, change) -> None:
         if change is not None:
