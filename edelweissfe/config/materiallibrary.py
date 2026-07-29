@@ -26,11 +26,31 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
+from edelweissfe.config import registry
 from edelweissfe.utils.misc import strCaseCmp
 
 
 def getMaterialClass(materialName: str, provider: str = None) -> type:
     """Get the the requested material class.
+
+    The ``provider`` dispatch below is deliberately an explicit table and **not** a registry lookup:
+    a provider selects a *namespace*, not a variant of one lookup. Only ``edelweiss`` addresses
+    anything by name; ``marmotmaterial`` ignores ``materialName`` and returns ``None`` (see below).
+    There is nothing per-name to register for it, so it stays here (``PLAN_INPUT_SYSTEM.md`` §9).
+
+    **Returning ``None`` for the ``marmotmaterial`` provider is deliberate, not a missing case.** A
+    Marmot material has no Python class at all -- it is instantiated inside the C++/Cython element
+    wrapper from its name plus its property array -- so there is nothing for this function to hand
+    back. ``None`` is the caller's signal to keep the material as a ``{"name": ..., "properties":
+    ...}`` record instead of constructing an object -- see
+    ``AbqModelConstructor.createMaterialsFromInputFile``, which branches on exactly that.
+
+    The ``edelweiss`` branch is resolved through the L3 registry (``material`` category), which
+    replaces an eleven-arm ``if/elif`` chain of local imports. Besides being one table instead of
+    eleven branches, that chain could only ever name materials living *inside* this package, so an
+    external package -- EdelweissMeshfree, a plugin -- had no way to contribute one. An unknown name
+    now raises :class:`~edelweissfe.config.registry.RegistryLookupError` naming the available
+    materials, instead of ``Exception("This material type doesn't exist (yet)...")``.
 
     Parameters
     ----------
@@ -42,7 +62,7 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
     Returns
     -------
     type
-        The material provider class type.
+        The material provider class type, or ``None`` for the ``marmotmaterial`` provider.
     """
 
     if provider is None:
@@ -53,71 +73,7 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
         return None
 
     if strCaseCmp(provider, "edelweiss"):
-        if strCaseCmp(materialName, "linearelastic"):
-            from edelweissfe.materials.linearelastic.linearelastic import (
-                LinearElasticMaterial,
-            )
 
-            material = LinearElasticMaterial
-        elif strCaseCmp(materialName, "vonmises"):
-            from edelweissfe.materials.vonmises.vonmises import VonMisesMaterial
+        materialClass, _ = registry.lookup("material", materialName)
 
-            material = VonMisesMaterial
-        elif strCaseCmp(materialName, "neohookewa"):
-            from edelweissfe.materials.neohooke.neohookepencegouformulationa import (
-                NeoHookeanWaMaterial,
-            )
-
-            material = NeoHookeanWaMaterial
-        elif strCaseCmp(materialName, "neohookewb"):
-            from edelweissfe.materials.neohooke.neohookepencegouformulationb import (
-                NeoHookeanWbMaterial,
-            )
-
-            material = NeoHookeanWbMaterial
-        elif strCaseCmp(materialName, "neohookewc"):
-            from edelweissfe.materials.neohooke.neohookepencegouformulationc import (
-                NeoHookeanWcMaterial,
-            )
-
-            material = NeoHookeanWcMaterial
-        elif strCaseCmp(materialName, "hyperelasticadvanced"):
-            from edelweissfe.materials.hyperelasticadvanced.hyperelasticadvanced import (
-                HyperelasticAdvancedMaterial,
-            )
-
-            material = HyperelasticAdvancedMaterial
-        elif strCaseCmp(materialName, "hyperelasticadvancedi2extended"):
-            from edelweissfe.materials.hyperelasticadvanced.hyperelasticadvancedi2extended import (
-                HyperelasticAdvancedI2ExtendedMaterial,
-            )
-
-            material = HyperelasticAdvancedI2ExtendedMaterial
-        elif strCaseCmp(materialName, "neohookewaplastic"):
-            from edelweissfe.materials.neohookeplastic.neohookepencegouformulationaplastic import (
-                NeoHookeanWaPlasticMaterial,
-            )
-
-            material = NeoHookeanWaPlasticMaterial
-        elif strCaseCmp(materialName, "neohookewbplastic"):
-            from edelweissfe.materials.neohookeplastic.neohookepencegouformulationbplastic import (
-                NeoHookeanWbPlasticMaterial,
-            )
-
-            material = NeoHookeanWbPlasticMaterial
-        elif strCaseCmp(materialName, "neohookewcplastic"):
-            from edelweissfe.materials.neohookeplastic.neohookepencegouformulationcplastic import (
-                NeoHookeanWcPlasticMaterial,
-            )
-
-            material = NeoHookeanWcPlasticMaterial
-        elif strCaseCmp(materialName, "hyperplasticadvanced"):
-            from edelweissfe.materials.hyperplasticadvanced.hyperplasticadvanced import (
-                HyperplasticAdvancedMaterial,
-            )
-
-            material = HyperplasticAdvancedMaterial
-        else:
-            raise Exception("This material type doesn't exist (yet). Chosen material was: " + materialName)
-
-        return material
+        return materialClass
