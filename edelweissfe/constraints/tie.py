@@ -40,7 +40,6 @@ from edelweissfe.models.femodel import FEModel
 from edelweissfe.models.meshdependent import MeshDependent
 from edelweissfe.sets.elementset import ElementSet
 from edelweissfe.utils.facetcontactgeometry import line2ClosestPoint, tria3ClosestPoint
-from edelweissfe.utils.inputlanguage import InputLanguage, Module
 from edelweissfe.utils.schema import buildSchemaFromOptions, schemaField
 
 """
@@ -68,63 +67,11 @@ for removing an initial geometric gap, not something to repeat on an already-loa
 node.
 """
 
-module = Module(
-    "tie",
-    "An Abaqus-style tie constraint, bonding a slave surface rigidly to a deformable master "
-    "surface via master-slave DOF elimination.",
-)
-
-inputLanguage = InputLanguage()
-
-keyword = "constraint"
-if keyword in inputLanguage:
-    inputLanguage[keyword].addModule(module)
-
-module.addRequiredArg(
-    "slaveSurface",
-    "The element set of contact facet elements (Tria3ContactFacet/Line2ContactFacet) forming the "
-    "slave surface; its nodes are tied. For quadratic (hexa20/quad8) faces, generate the facets "
-    "with triangulation=midside on BOTH surfaces -- the corner triangulation excludes the midside "
-    "nodes from the facet node list entirely, leaving them untied.",
-    str,
-)
-module.addRequiredArg(
-    "masterSurface",
-    "The element set of contact facet elements (Tria3ContactFacet/Line2ContactFacet) forming the " "master surface.",
-    str,
-)
-module.addOptionalArg(
-    "positionTolerance",
-    "If given, slave nodes whose reference-configuration closest-point distance to the master "
-    "surface exceeds this tolerance are left untied (recorded in the constraint's "
-    "untiedSlaveNodes). If not given, every slave node is tied unconditionally.",
-    float,
-    None,
-)
-module.addOptionalArg(
-    "adjust",
-    "Move each tied slave node onto its closest master point at construction (Abaqus-like "
-    "default). If False, any initial geometric gap between the surfaces is preserved rigidly "
-    "(the displacements are tied, not the positions). Note that adjusting modifies the nodal "
-    "coordinates before the element geometry is initialized; avoid adjusting nodes that also "
-    "belong to an already-generated contact surface of another constraint.",
-    bool,
-    True,
-)
-
-documentation = [module]
-
 
 @dataclass(frozen=True)
 class TieSchema:
     """L2: the options this constraint accepts, owned by this module and never mutated from
     outside it.
-
-    Mirrors the ``module.addOptionalArg(...)`` declarations above one-for-one. The two
-    declarations coexist while the migration is in progress; the ``Module`` one goes away with the
-    ``InputLanguage`` singleton in P5. ``adjust`` is a real ``bool`` field rather than the
-    hand-``strtobool``-cast ``str`` the legacy grammar declared it as (see
-    :func:`edelweissfe.utils.schema.coerceValue`).
     """
 
     slaveSurface: str | None = schemaField(
