@@ -111,49 +111,60 @@ class TieSchema:
         required=True,
     )
     positionTolerance: float | None = schemaField(
-        description="Slave nodes whose reference-configuration closest-point distance to the "
-        "master surface exceeds this tolerance are left untied (recorded in the constraint's "
-        "untiedSlaveNodes), matching Abaqus' *TIE default behavior of silently dropping "
-        "out-of-range slave nodes. If not given and adjust=True (the default combination), a "
-        "tolerance is computed per slave node as positionToleranceFactor times the characteristic "
-        "edge length of that node's closest master facet -- see positionToleranceFactor. If not "
-        "given and adjust=False, every slave node ties unconditionally, however far the closest "
-        "master point is (see adjust). Set this explicitly to an absolute distance to override "
-        "either default.",
+        description="Whether a slave node is tied at all: nodes whose reference-configuration "
+        "closest-point distance to the master surface exceeds this tolerance are left untied "
+        "(recorded in the constraint's untiedSlaveNodes), matching Abaqus' *TIE default behavior "
+        "of silently dropping out-of-range slave nodes. Applies independently of adjust -- whether "
+        "a tied node's coordinates additionally get snapped onto the master is a separate decision, "
+        "see adjust/adjustTolerance. If not given (the default), a single tolerance is computed as "
+        "positionToleranceFactor times the initial master surface's characteristic facet size -- "
+        "see positionToleranceFactor. Set this explicitly to an absolute distance to override that.",
         dtype=float,
         default=None,
     )
     positionToleranceFactor: float = schemaField(
-        description="Used only when positionTolerance is not given and adjust=True: the default "
-        "tolerance for a slave node is this fraction of its closest master facet's own "
-        "characteristic (mean) edge length, so it scales with local mesh density instead of being "
-        "one fixed number for the whole surface. 0.25 comfortably exceeds the sub-percent gaps "
-        "expected between two compatible discretizations of the same surface (mismatched density, "
-        "curvature/interpolation error), while remaining well below the facet-size-or-larger gaps "
-        "that indicate the surfaces don't actually correspond (e.g. a slave surface extending "
-        "beyond the master surface's actual extent -- a partial-bond-length or otherwise "
-        "partially-overlapping pair of surfaces). Each node's computed default is frozen the first "
-        "time that node is evaluated (construction, or first appearance on a later reconcile) and "
-        "reused from then on, so a subsequent AMR refinement of the master surface elsewhere cannot "
-        "retroactively shrink an already-tied node's tolerance and untie it. Not used at all with "
-        "adjust=False -- see positionTolerance and adjust.",
+        description="Used only when positionTolerance is not given: the default tolerance is this "
+        "fraction of the INITIAL (pre-any-AMR) master surface's characteristic (mean, over all its "
+        "facets) edge length, computed once at construction and used unchanged for every slave node "
+        "for the constraint's entire lifetime -- deliberately NOT recomputed per node or per facet, "
+        "and NOT tied to whichever facet ends up closest for a given node: a node that first "
+        "appears later (e.g. a hanging node from AMR-refining the slave surface) could otherwise "
+        "land near an already-refined, artificially small nearby master facet and get an "
+        "unrepresentative tolerance, even though the density the user actually chose (the initial "
+        "one) would have comfortably covered its real gap. 0.25 comfortably exceeds the sub-percent "
+        "gaps expected between two compatible discretizations of the same surface (mismatched "
+        "density, curvature/interpolation error), while remaining well below the facet-size-or-"
+        "larger gaps that indicate the surfaces don't actually correspond (e.g. a slave surface "
+        "extending beyond the master surface's actual extent -- a partial-bond-length or otherwise "
+        "partially-overlapping pair of surfaces).",
         dtype=float,
         default=0.25,
     )
     adjust: bool = schemaField(
-        description="Move each tied slave node onto its closest master point at construction "
-        "(Abaqus-like default). If False, any initial geometric gap between the surfaces is "
-        "preserved rigidly (the displacements are tied, not the positions), AND the computed "
-        "default position tolerance (see positionTolerance/positionToleranceFactor) does not apply: "
-        "every slave node ties unconditionally regardless of distance. adjust=False is itself the "
-        "signal that a real, deliberate gap exists and should be tied across regardless of size -- "
-        "second-guessing that with a mesh-size-derived cutoff would contradict the setting just "
-        "chosen; give an explicit positionTolerance instead if you want a cutoff together with "
-        "adjust=False. Note that adjusting modifies the nodal coordinates before the element "
-        "geometry is initialized; avoid adjusting nodes that also belong to an already-generated "
-        "contact surface of another constraint.",
+        description="Whether a TIED node's coordinates additionally get snapped onto its projected "
+        "master point at construction (Abaqus-like default) -- a separate decision from whether the "
+        "node is tied at all (see positionTolerance). If False, no tied node is ever snapped: any "
+        "initial geometric gap is preserved rigidly (the displacements are tied, not the "
+        "positions), regardless of size. If True, a tied node is snapped only if its distance is "
+        "also within adjustTolerance (default: unconditionally, i.e. every tied node is snapped, "
+        "matching plain Abaqus ADJUST=YES) -- see adjustTolerance to snap away only small, "
+        "effectively-numerical gaps while still tying (without snapping) across larger, deliberate "
+        "ones. Note that adjusting modifies the nodal coordinates before the element geometry is "
+        "initialized; avoid adjusting nodes that also belong to an already-generated contact "
+        "surface of another constraint.",
         dtype=bool,
         default=True,
+    )
+    adjustTolerance: float | None = schemaField(
+        description="Used only when adjust=True: a tied node's coordinates are snapped onto the "
+        "master only if its closest-point distance is also within this tolerance; beyond it, the "
+        "node stays tied (kinematically) but its position is left as found, preserving the gap. "
+        "Independent of positionTolerance -- a node can be tied across a fairly generous distance "
+        "while only genuinely small (e.g. sub-percent, mesh-discretization-scale) gaps within that "
+        "get snapped away. If not given (the default), any tied node is snapped, matching plain "
+        "Abaqus ADJUST=YES and this constraint's behavior before this option existed.",
+        dtype=float,
+        default=None,
     )
 
 
@@ -204,14 +215,7 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
         self._masterSurfaceSetName = masterSurface.name
         self._positionTolerance = configuration.positionTolerance
         self._positionToleranceFactor = configuration.positionToleranceFactor
-        #: The constraint's originally configured adjust setting -- distinct from the local
-        #: ``adjust`` parameter _buildTiedRecords receives on each call, which reconcile() always
-        #: pins to False (never re-snap an already-loaded node) regardless of this. Used to decide
-        #: whether the computed default tolerance applies at all: see _buildTiedRecords.
-        self._adjustConfigured = configuration.adjust
-        #: Per-node computed default tolerance, frozen the first time a node is evaluated (see
-        #: _buildTiedRecords). Only touched when positionTolerance is None and adjust=True.
-        self._defaultToleranceCache = {}
+        self._adjustTolerance = configuration.adjustTolerance
 
         slaveFacetElements = list(slaveSurface)
         masterFacetElements = list(masterSurface)
@@ -224,6 +228,19 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
                 f"surface '{self._masterSurfaceSetName}' share nodes -- a node cannot be tied to "
                 "itself."
             )
+
+        # Frozen once, from the INITIAL (pre-any-AMR) master surface, and reused as every slave
+        # node's default membership tolerance for the constraint's entire lifetime -- regardless of
+        # which facet ends up closest for a given node, and regardless of later refinement anywhere
+        # on the master surface. Computing this per-node from whichever facet is CURRENTLY closest
+        # (at construction, or when a node first appears on a later reconcile) is unsafe: a node
+        # that first appears after a nearby, unrelated refinement event would get an artificially
+        # small tolerance from the now-finer local facets, even though the mesh density the user
+        # actually chose (the initial one) would have comfortably covered its (unchanged) real gap.
+        initialMasterFacetCoords = [np.array([n.coordinates for n in el.nodes]) for el in masterFacetElements]
+        self._defaultMembershipTolerance = self._positionToleranceFactor * np.mean(
+            [_facetCharacteristicSize(coords) for coords in initialMasterFacetCoords]
+        )
 
         self.tiedRecords, self.untiedSlaveNodes = self._buildTiedRecords(
             model, slaveFacetElements, masterFacetElements, adjust=configuration.adjust
@@ -268,19 +285,16 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
         the coarse-trace nodes of that very surface and are themselves tied, so its interpolated
         motion already is the tied motion and the tie equation is redundant.
 
-        When positionTolerance is not given AND the constraint was configured with adjust=True, each
-        node's default tolerance (positionToleranceFactor times its closest master facet's
-        characteristic size) is computed once, the first time that node is evaluated, and cached in
-        self._defaultToleranceCache from then on -- NOT recomputed from the facet size current at
-        reconcile time (refining the master surface (AMR) shrinks nearby facets and thus the
-        tolerance, which would otherwise silently untie an already-tied node purely because unrelated
-        mesh refinement happened nearby). With adjust=False, the default tolerance does not apply at
-        all (every node ties unconditionally, as before this feature was added): adjust=False is
-        itself the user's explicit signal that a real, deliberate gap exists and should be preserved
-        and tied across regardless of size (e.g. AMR_TieRefineShear's persistent 0.05 gap) -- second-
-        guessing that with a mesh-size-derived cutoff would contradict the very setting the user
-        chose. positionTolerance remains available to add an explicit, absolute cutoff on top of
-        adjust=False if that combination is ever wanted."""
+        Tie membership (this method's positionTolerance check) and snapping (the ``adjust`` check
+        further down) are independent decisions -- a node can be tied across a fairly generous
+        distance while only genuinely small gaps within that get snapped away, or tied without ever
+        being snapped at all (adjust=False), or (with an explicit adjustTolerance) tied-but-not-
+        snapped for the larger gaps within an otherwise generous positionTolerance. Membership always
+        applies, regardless of adjust.
+
+        When positionTolerance is not given, self._defaultMembershipTolerance (computed once, in
+        __init__, from the initial master surface -- see there for why) is used for every node,
+        regardless of when it's evaluated or which facet ends up closest for it."""
 
         slaveNodes = list(dict.fromkeys(node for el in slaveFacetElements for node in el.nodes))
 
@@ -291,7 +305,10 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
 
         closestPointFunction = tria3ClosestPoint if self.nDim == 3 else line2ClosestPoint
         masterFacetCoords = [np.array([n.coordinates for n in el.nodes]) for el in masterFacetElements]
-        masterFacetCharacteristicSizes = [_facetCharacteristicSize(coords) for coords in masterFacetCoords]
+
+        membershipTolerance = (
+            self._positionTolerance if self._positionTolerance is not None else self._defaultMembershipTolerance
+        )
 
         # Projecting every slave node onto its closest master facet by brute force is O(nSlave *
         # nMaster) and, on a large tied surface re-projected after every AMR refinement, dominates
@@ -340,28 +357,19 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
 
             # Abaqus' *TIE always enforces some tolerance (an explicit POSITION TOLERANCE, or an
             # internally computed default) and silently drops slave nodes outside it -- it never
-            # ties unconditionally regardless of distance. Mirror that when adjust=True (the case
-            # this is actually meant for: closing small gaps between surfaces that are meant to
-            # coincide). Freeze that computed default the first time this node is evaluated (see the
-            # cache note in this method's docstring) rather than recomputing it from whatever facet
-            # size a later reconcile happens to see. With adjust=False, skip this entirely -- see the
-            # docstring for why.
-            if self._positionTolerance is not None:
-                effectiveTolerance = self._positionTolerance
-            elif self._adjustConfigured:
-                if slaveNode not in self._defaultToleranceCache:
-                    self._defaultToleranceCache[slaveNode] = (
-                        self._positionToleranceFactor * masterFacetCharacteristicSizes[bestFacetIdx]
-                    )
-                effectiveTolerance = self._defaultToleranceCache[slaveNode]
-            else:
-                effectiveTolerance = np.inf
-
-            if bestDistance > effectiveTolerance:
+            # ties unconditionally regardless of distance. This is the tie-MEMBERSHIP decision and
+            # applies unconditionally, independent of adjust (see docstring); membershipTolerance is
+            # fixed for every node for the constraint's whole lifetime (see __init__).
+            if bestDistance > membershipTolerance:
                 untiedSlaveNodes.append(slaveNode)
                 continue
 
-            if adjust and bestDistance > 0.0:
+            # Snapping is the separate, independent decision: a tied node is only snapped if adjust
+            # is requested for this call AND (when given) its distance is also within
+            # adjustTolerance -- a node beyond adjustTolerance stays tied, just not snapped,
+            # preserving its gap exactly.
+            withinAdjustTolerance = self._adjustTolerance is None or bestDistance <= self._adjustTolerance
+            if adjust and withinAdjustTolerance and bestDistance > 0.0:
                 slaveNode.coordinates[:] = bestWeights @ masterFacetCoords[bestFacetIdx]
 
             tiedRecords.append((slaveNode, masterFacetElements[bestFacetIdx].nodes, bestWeights))
