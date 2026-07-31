@@ -418,13 +418,22 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
         (edelweissfe/outputmanagers/ensight.py's _createGeometryParts), no fieldOutput required just
         to see where these nodes are. Mutates in place (replaceMembers) if the sets already exist,
         like every other AMR-mutated set, so a consumer holding a reference (e.g. a fromExpression
-        FieldOutput) sees the post-reconcile membership without re-fetching from the model."""
+        FieldOutput) sees the post-reconcile membership without re-fetching from the model.
+
+        A set with no members is deliberately left unpublished (not created) rather than published
+        empty: Ensight's export is unconditional over every node set in the model, so a tie whose
+        untied side is (as is typical) always empty would otherwise get its own empty, useless part
+        in every export. If the set was already published (had members on an earlier reconcile,
+        e.g. under AMR) and has since become empty, it IS updated to empty in place rather than
+        removed -- removing it from model.nodeSets could silently orphan an existing consumer's
+        reference (e.g. a fromExpression FieldOutput already wired to it), whereas publishing empty
+        is exactly what such a consumer would already have to tolerate."""
 
         tiedNodes = [record[0] for record in self.tiedRecords]
         for setName, nodes in ((f"{self.name}_tied", tiedNodes), (f"{self.name}_untied", self.untiedSlaveNodes)):
             if setName in model.nodeSets:
                 model.nodeSets[setName].replaceMembers(nodes)
-            else:
+            elif nodes:
                 model.nodeSets[setName] = NodeSet(setName, nodes)
 
     def claimedSlaveNodes(self) -> set:
