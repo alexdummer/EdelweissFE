@@ -39,6 +39,7 @@ from edelweissfe.journal.journal import Journal
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.models.meshdependent import MeshDependent
 from edelweissfe.sets.elementset import ElementSet
+from edelweissfe.sets.nodeset import NodeSet
 from edelweissfe.utils.facetcontactgeometry import line2ClosestPoint, tria3ClosestPoint
 from edelweissfe.utils.schema import buildSchemaFromOptions, schemaField
 
@@ -245,6 +246,7 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
         self.tiedRecords, self.untiedSlaveNodes = self._buildTiedRecords(
             model, slaveFacetElements, masterFacetElements, adjust=configuration.adjust
         )
+        self._updateNodeSets(model)
 
         # A tie has no per-increment tick of its own that runs before the DofManager/VIJSystemMatrix
         # rebuild -- getMultiPointConstraints() is only called from inside that rebuild, too late to
@@ -406,7 +408,24 @@ class Constraint(MultiPointConstraintBase, MeshDependent):
         self.tiedRecords, self.untiedSlaveNodes = self._buildTiedRecords(
             model, slaveFacetElements, masterFacetElements, adjust=False
         )
+        self._updateNodeSets(model)
         return True
+
+    def _updateNodeSets(self, model: FEModel) -> None:
+        """(Re)publish the tied/untied slave nodes as ordinary node sets ("<name>_tied" /
+        "<name>_untied"), so the split is directly inspectable -- e.g. via *fieldOutput, or for free
+        in Ensight, which automatically creates a part for every node set in the model
+        (edelweissfe/outputmanagers/ensight.py's _createGeometryParts), no fieldOutput required just
+        to see where these nodes are. Mutates in place (replaceMembers) if the sets already exist,
+        like every other AMR-mutated set, so a consumer holding a reference (e.g. a fromExpression
+        FieldOutput) sees the post-reconcile membership without re-fetching from the model."""
+
+        tiedNodes = [record[0] for record in self.tiedRecords]
+        for setName, nodes in ((f"{self.name}_tied", tiedNodes), (f"{self.name}_untied", self.untiedSlaveNodes)):
+            if setName in model.nodeSets:
+                model.nodeSets[setName].replaceMembers(nodes)
+            else:
+                model.nodeSets[setName] = NodeSet(setName, nodes)
 
     def claimedSlaveNodes(self) -> set:
         """The tied slave nodes of this constraint. Overrides the base implementation, since a tie
