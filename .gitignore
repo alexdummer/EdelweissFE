@@ -3,14 +3,11 @@
 *.pvtu
 *.case
 *.geo
-*.geo_[0-9]*
 *.var
-*.var_[0-9]*
 *.swp
 *.vtk
 *.html
 *.cpp
-*.c
 *.so
 CMakeCache.txt
 Makefile
@@ -18,10 +15,6 @@ CMakeFiles
 __pycache__
 esExport
 ensightExport
-myEnsightOutput
-myEnsightExport
-ensight_tens
-compTime.txt
 build
 EdelweissFE.egg-info
 docs
