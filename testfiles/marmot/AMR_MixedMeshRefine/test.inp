@@ -17,7 +17,7 @@ hexEls
 c3d8Els
 
 *modelModifier, type=hAdaptivity, name=amr
->>marker, type=fieldOutput, fieldOutput=stressForAMR, expression='abs(x) > 0.6'
+>>marker, type=fieldOutput, fieldOutput=stressForAMR, operator='>', threshold=0.6
 maxLevel=1
 
 *job, name=amr, domain=3d
@@ -25,7 +25,7 @@ maxLevel=1
 *fieldOutput
 >>perNode, elSet=hexEls, field=displacement, result=U, name=U
 >>perNode, elSet=hexEls, field=nonlocal damage, result=U, name=D
->>perElement, elSet=hexEls, result=stress, quadraturePoint=0:8, name=stressForAMR
+>>perElement, elSet=hexEls, result=stress, quadraturePoint=0:8, name=stressForAMR, f(x)='np.abs(x)'
 
 *step, solver=S
 maxInc=0.5, minInc=1e-4, maxNumInc=50, maxIter=25,
