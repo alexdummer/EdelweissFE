@@ -141,6 +141,69 @@ def commandPattern(args):
     print("explicitly stored zeros: {:}".format(int(np.count_nonzero(A.data == 0.0))))
 
 
+def unifyPattern(systems: list) -> list:
+    """Re-express every system on the structural union of all their patterns.
+
+    A captured sequence may have a pattern that wobbles from one Newton iteration to the next, in
+    which case PARDISO's reuse check refuses to engage and measuring "reuse on" measures nothing.
+    Projecting the whole sequence onto one common pattern -- keeping the extra entries as explicitly
+    stored zeros, which leaves every matrix mathematically unchanged -- makes reuse engage, and so
+    prices the fix: it is what the solver would see if the assembly stopped pruning zeros per
+    iteration.
+
+    The union over the captured iterations is a proxy for that fixed pattern, and a slightly generous
+    one: it converges to the true unpruned pattern from below as more iterations are included, so any
+    speedup measured here is, if anything, a mild underestimate.
+
+    SciPy's own sparse addition cannot do this -- it prunes explicit zeros, which is exactly the
+    behaviour being worked around -- so the values are scattered into the union's index arrays
+    directly, via a linearized (row, column) key.
+    """
+
+    unionPattern = systems[0][0].copy()
+    unionPattern.data[:] = 1.0
+    for A, _ in systems[1:]:
+        contribution = A.copy()
+        contribution.data[:] = 1.0
+        unionPattern = unionPattern + contribution
+
+    unionPattern.sort_indices()
+    rows, columns = unionPattern.shape
+
+    def linearKeys(indptr, indices):
+        rowOf = np.repeat(np.arange(rows, dtype=np.int64), np.diff(indptr))
+        return rowOf * np.int64(columns) + indices.astype(np.int64)
+
+    unionKeys = linearKeys(unionPattern.indptr, unionPattern.indices)
+
+    unified = []
+    for A, b in systems:
+        A.sort_indices()
+        positions = np.searchsorted(unionKeys, linearKeys(A.indptr, A.indices))
+
+        data = np.zeros(unionPattern.nnz, dtype=float)
+        data[positions] = A.data
+
+        projected = sp.csr_matrix((data, unionPattern.indices.copy(), unionPattern.indptr.copy()), shape=A.shape)
+
+        # The projection must be value-preserving, not merely plausible: a mismatch would mean the
+        # union was not a superset and the scatter silently dropped entries.
+        if abs(projected - A).max() != 0.0:
+            raise ValueError("pattern unification changed the matrix values")
+
+        unified.append((projected, b))
+
+    print(
+        "unified pattern: {:} nnz (per-system nnz ranged {:} .. {:})\n".format(
+            unionPattern.nnz,
+            min(A.nnz for A, _ in systems),
+            max(A.nnz for A, _ in systems),
+        )
+    )
+
+    return unified
+
+
 def commandReuse(args):
     """Time and cross-check PARDISO with symbolic-factorization reuse on versus off.
 
@@ -157,6 +220,9 @@ def commandReuse(args):
     systems = [loadSystem(args.dumpDir, record) for record in records]
 
     print("MKL threads: {:}\n".format(os.environ.get("OMP_NUM_THREADS", "(unset)")))
+
+    if args.unifyPattern:
+        systems = unifyPattern(systems)
 
     referenceSolutions = []
     print("--- reuse OFF (current default) ---")
@@ -303,6 +369,11 @@ def main():
 
     reuseParser = subparsers.add_parser("reuse", help="time and cross-check symbolic-factorization reuse")
     reuseParser.add_argument("dumpDir")
+    reuseParser.add_argument(
+        "--unifyPattern",
+        action="store_true",
+        help="first re-express all systems on their common pattern, so reuse can engage at all",
+    )
     reuseParser.set_defaults(function=commandReuse)
 
     threadsParser = subparsers.add_parser("threads", help="MKL thread scaling of one solve")
