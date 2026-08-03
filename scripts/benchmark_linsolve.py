@@ -303,11 +303,12 @@ def commandLagged(args):
     iteration collapses. If the count instead climbs steeply with staleness j, the whole route is
     dead and the effort belongs on the direct solve.
 
-    SuperLU rather than PARDISO does the factorization here on purpose. It is the slower factorizer,
-    but the iteration count depends only on how well the operator ``A_k^-1 A_(k+j)`` is conditioned,
-    which is a property of the matrices and not of whichever LU implementation inverted the first
-    one. So this measures the decisive quantity without needing a phase-33-only entry point in the
-    PARDISO wrapper -- that is an optimization worth adding only if this result is favourable.
+    Either LU backend gives the same iteration counts, because the count depends on how well
+    ``A_k^-1 A_(k+j)`` is conditioned -- a property of the matrices, not of whichever implementation
+    inverted the first one. They differ enormously in how long the setup takes, though: on a 280k-dof,
+    40M-nnz condensed system PARDISO factorizes in seconds where SuperLU runs for tens of minutes, so
+    ``--backend pardiso`` is the practical choice and is also the code path a production
+    implementation would use.
     """
 
     records = loadManifest(args.dumpDir)
@@ -315,15 +316,24 @@ def commandLagged(args):
 
     baseRecord, (baseMatrix, _) = records[0], systems[0]
     print(
-        "factorizing the base system (instance {:}, ordinal {:}) with SuperLU ...".format(
-            baseRecord["instance"], baseRecord["ordinal"]
+        "factorizing the base system (instance {:}, ordinal {:}) with {:} ...".format(
+            baseRecord["instance"], baseRecord["ordinal"], args.backend
         )
     )
     start = perf_counter()
-    baseFactorization = spla.splu(baseMatrix.tocsc())
+
+    if args.backend == "pardiso":
+        from edelweissfe.linsolve.pardiso.pardiso import PardisoSolver
+
+        baseSolver = PardisoSolver(reuseSymbolicFactorization=True)
+        baseSolver.factorize(baseMatrix)
+        applyInverse = baseSolver.solveFactorized
+    else:
+        applyInverse = spla.splu(baseMatrix.tocsc()).solve
+
     print("  done in {:.1f} s\n".format(perf_counter() - start))
 
-    preconditioner = spla.LinearOperator(baseMatrix.shape, matvec=baseFactorization.solve, dtype=baseMatrix.dtype)
+    preconditioner = spla.LinearOperator(baseMatrix.shape, matvec=applyInverse, dtype=baseMatrix.dtype)
 
     print("GMRES preconditioned by the base factorization, rtol={:}, maxiter={:}".format(args.rtol, args.maxiter))
     print("{:>4} {:>10} {:>8} {:>12} {:>14}".format("ord", "staleness", "iters", "converged", "rel. residual"))
@@ -385,6 +395,12 @@ def main():
 
     laggedParser = subparsers.add_parser("lagged", help="GMRES iterations with a lagged LU preconditioner")
     laggedParser.add_argument("dumpDir")
+    laggedParser.add_argument(
+        "--backend",
+        choices=["pardiso", "superlu"],
+        default="pardiso",
+        help="which LU factorizes the base system; same iteration counts, wildly different setup cost",
+    )
     laggedParser.add_argument("--maxiter", type=int, default=200)
     laggedParser.add_argument("--restart", type=int, default=50)
     laggedParser.add_argument("--rtol", type=float, default=1.0e-8)
