@@ -66,7 +66,11 @@ def createSolver(opts) -> Callable:
         ``skipFirst``
             Solves to pass through undumped when ``dumpAt`` is empty; default ``0``.
         ``maxDumps``
-            Hard ceiling on dumps written; default ``6``.
+            Process-wide hard ceiling on dumps written; default ``6``.
+        ``instances``
+            Which solver instances -- i.e. which analysis steps, since a fresh linear solver is built
+            per step -- are permitted to dump; default ``[]``, meaning all of them. ``[1]`` captures
+            the second step only.
 
         As with the other factories, a non-mapping ``opts`` is tolerated (the implicit-static solver
         passes ``""`` when no configuration file is given), in which case every default applies --
@@ -99,4 +103,5 @@ def createSolver(opts) -> Callable:
         dumpAt=[int(ordinal) for ordinal in optionMap.get("dumpAt", [])],
         skipFirst=int(optionMap.get("skipFirst", 0)),
         maxDumps=int(optionMap.get("maxDumps", _DEFAULT_MAX_DUMPS)),
+        instances=[int(instance) for instance in optionMap.get("instances", [])],
     )

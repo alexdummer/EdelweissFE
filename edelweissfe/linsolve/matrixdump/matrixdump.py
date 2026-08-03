@@ -57,6 +57,14 @@ from scipy.sparse import csr_matrix, save_npz
 class MatrixDumpSolver:
     """Write selected equation systems to disk, then solve them with a delegate solver.
 
+    A note on instances, because it determines what ``dumpAt`` ordinals mean: the nonlinear solvers
+    build a fresh linear solver per analysis step, so one run of a two-step job creates *two* of
+    these, each counting its own solves from zero. Dumps are therefore named by instance as well as
+    by ordinal (otherwise the second step would silently overwrite the first step's dumps at the same
+    ordinals), ``instances`` selects which steps dump at all, and the ``maxDumps`` ceiling is
+    process-wide rather than per instance -- a disk guard is only a guard if a second instance cannot
+    grant itself a fresh budget.
+
     Parameters
     ----------
     directory
@@ -67,17 +75,27 @@ class MatrixDumpSolver:
     dumpAt
         The zero-based ordinals of the solves to dump, counted over the lifetime of this solver
         instance. An explicit list is the useful form for capturing one contiguous Newton sequence
-        (e.g. ``[10, 11, 12, 13, 14, 15]``); when empty, ``skipFirst`` and ``maxDumps`` select a
-        prefix instead.
+        (e.g. ``[10, 11, 12, 13, 14, 15]``); when empty, ``skipFirst`` selects a suffix instead.
     skipFirst
         How many initial solves to pass through undumped when ``dumpAt`` is empty. The first solves
         of an analysis are usually the least representative -- a linear-elastic first increment
         rather than a converging nonlinear one.
     maxDumps
-        A hard ceiling on the number of dumps written, applied even when ``dumpAt`` asks for more.
-        This is a disk-space guard, not a preference: it is the one option that cannot be
+        A process-wide ceiling on the number of dumps written, applied even when ``dumpAt`` asks for
+        more. This is a disk-space guard, not a preference: it is the one option that cannot be
         accidentally overridden by a generous ``dumpAt``.
+    instances
+        The zero-based solver-instance ordinals permitted to dump, i.e. which analysis steps. Empty
+        means every instance may dump.
     """
+
+    #: How many instances have been created in this process, so each can name its dumps distinctly.
+    #: Class-level rather than passed in, because nothing at the construction site knows which step
+    #: it is building a solver for.
+    _instancesCreated = 0
+
+    #: Dumps written across all instances, so ``maxDumps`` is a genuine process-wide ceiling.
+    _totalDumpsWritten = 0
 
     def __init__(
         self,
@@ -86,15 +104,19 @@ class MatrixDumpSolver:
         dumpAt: list[int],
         skipFirst: int,
         maxDumps: int,
+        instances: list[int],
     ):
         self._directory = directory
         self._delegate = delegate
         self._dumpAt = set(dumpAt)
         self._skipFirst = skipFirst
         self._maxDumps = maxDumps
+        self._instances = set(instances)
+
+        self._instanceOrdinal = MatrixDumpSolver._instancesCreated
+        MatrixDumpSolver._instancesCreated += 1
 
         self._solveCounter = 0
-        self._dumpCounter = 0
 
         os.makedirs(self._directory, exist_ok=True)
         self._manifestPath = os.path.join(self._directory, "manifest.jsonl")
@@ -102,7 +124,10 @@ class MatrixDumpSolver:
     def _shouldDump(self, ordinal: int) -> bool:
         """Decide whether the solve with this ordinal gets dumped."""
 
-        if self._dumpCounter >= self._maxDumps:
+        if MatrixDumpSolver._totalDumpsWritten >= self._maxDumps:
+            return False
+
+        if self._instances and self._instanceOrdinal not in self._instances:
             return False
 
         if self._dumpAt:
@@ -113,8 +138,9 @@ class MatrixDumpSolver:
     def _dump(self, ordinal: int, A: csr_matrix, b: np.ndarray):
         """Write one equation system plus a manifest record describing it."""
 
-        matrixPath = os.path.join(self._directory, "A_{:05d}.npz".format(ordinal))
-        rhsPath = os.path.join(self._directory, "b_{:05d}.npy".format(ordinal))
+        stem = "{:02d}_{:05d}".format(self._instanceOrdinal, ordinal)
+        matrixPath = os.path.join(self._directory, "A_{:}.npz".format(stem))
+        rhsPath = os.path.join(self._directory, "b_{:}.npy".format(stem))
 
         # Uncompressed: these matrices are large, and compression would spend more time than the
         # solve being investigated -- distorting the very run whose timings are being measured.
@@ -122,6 +148,7 @@ class MatrixDumpSolver:
         np.save(rhsPath, np.asarray(b))
 
         record = {
+            "instance": self._instanceOrdinal,
             "ordinal": ordinal,
             "rows": int(A.shape[0]),
             "cols": int(A.shape[1]),
@@ -141,16 +168,18 @@ class MatrixDumpSolver:
         with open(self._manifestPath, "a") as manifestFile:
             manifestFile.write(json.dumps(record) + "\n")
 
-        self._dumpCounter += 1
+        MatrixDumpSolver._totalDumpsWritten += 1
 
         print(
-            "matrixdump: wrote solve {:} to {:} ({:} rows, {:} nnz, {:.2f} GB); {:} of {:} dumps used".format(
+            "matrixdump: wrote instance {:} solve {:} to {:} ({:} rows, {:} nnz, {:.2f} GB);"
+            " {:} of {:} dumps used".format(
+                self._instanceOrdinal,
                 ordinal,
                 os.path.basename(matrixPath),
                 A.shape[0],
                 A.nnz,
                 record["matrixBytes"] / 1024**3,
-                self._dumpCounter,
+                MatrixDumpSolver._totalDumpsWritten,
                 self._maxDumps,
             ),
             flush=True,
