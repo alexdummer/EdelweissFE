@@ -36,6 +36,8 @@ This module provides an interface to the PARDISO solver provided by the Intel Ma
 
 import numpy as np
 
+from edelweissfe.utils import performancetiming
+
 cimport numpy as np
 
 
@@ -195,18 +197,24 @@ cdef class PardisoSolver:
 
         self.rows = A.shape[0]
         # pardiso uses fortran 1-based indexing; scipy may use int64 index arrays for
-        # large matrices, so cast explicitly to the 32-bit interface type
-        self.indicesFortran = np.ascontiguousarray(A.indices + 1, dtype=np.intc)
-        self.indptrFortran = np.ascontiguousarray(A.indptr + 1, dtype=np.intc)
+        # large matrices, so cast explicitly to the 32-bit interface type.
+        #
+        # Timed separately from phase 11 itself because this is a pure O(nnz) allocate-and-copy that
+        # is paid on *every* solve whenever symbolic reuse is off -- an avoidable cost that has
+        # nothing to do with the reordering it precedes, and would otherwise hide inside it.
+        with performancetiming.timeit("pardiso index preparation"):
+            self.indicesFortran = np.ascontiguousarray(A.indices + 1, dtype=np.intc)
+            self.indptrFortran = np.ascontiguousarray(A.indptr + 1, dtype=np.intc)
 
         pardisoinit(self.pt, &self.mtype, &self.iparm[0])
         self.ptIsActive = True
 
         cdef double[::1] data = A.data
 
-        pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
-                &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
-                &self.iparm[0], &self.msglvl, &ddum, &ddum, &error)
+        with performancetiming.timeit("pardiso phase 11 (reorder + symbolic factorization)"):
+            pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                    &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                    &self.iparm[0], &self.msglvl, &ddum, &ddum, &error)
 
         if error != 0:
             self._releaseMemory()
@@ -254,16 +262,18 @@ cdef class PardisoSolver:
 
         # numerical factorization
         phase = 22
-        pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
-                &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
-                &self.iparm[0], &self.msglvl, &ddum, &ddum, &error)
+        with performancetiming.timeit("pardiso phase 22 (numeric factorization)"):
+            pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                    &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                    &self.iparm[0], &self.msglvl, &ddum, &ddum, &error)
 
         if error == 0:
             # back substitution and iterative refinement
             phase = 33
-            pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
-                    &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
-                    &self.iparm[0], &self.msglvl, &b_[0, 0], &x[0, 0], &error)
+            with performancetiming.timeit("pardiso phase 33 (back substitution)"):
+                pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                        &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                        &self.iparm[0], &self.msglvl, &b_[0, 0], &x[0, 0], &error)
 
         if error != 0:
             # signal failure via NaNs; the nonlinear solvers translate this into a cutback

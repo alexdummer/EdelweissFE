@@ -74,7 +74,7 @@ for exactly how each list was derived):
 
 ``outputmanager`` (10), ``section`` (3), ``constraint`` (12), ``stepaction`` (13),
 ``generator`` (10), ``analyticalfield`` (3), ``solver`` (7), ``step`` (2), ``modelmodifier`` (1),
-``statetransferstrategy`` (3), ``element`` (42), ``material`` (11), ``linsolver`` (9).
+``statetransferstrategy`` (3), ``element`` (42), ``material`` (11), ``linsolver`` (10).
 
 ``keyword`` is the eventual single source the ``.inp`` parser consults for every top-level keyword
 (``element``, ``node``, ``nSet``, ``elSet``, ``surface``, ``job``, ``section``, ``material``,
@@ -439,6 +439,10 @@ for _linsolverName in [
     "mumps",
     "gmres",
     "amgcl",
+    # not a solver in its own right: it dumps the equation systems it is handed and delegates the
+    # actual solve to one of the above, so linear-solver variants can be compared offline on one
+    # authentic sequence of matrices instead of by rerunning the simulation.
+    "matrixdump",
 ]:
     _BUILTINS[("linsolver", _linsolverName)] = f"edelweissfe.linsolve.{_linsolverName}:createSolver"
 

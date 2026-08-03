@@ -29,6 +29,8 @@
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from edelweissfe.utils import performancetiming
+
 """
 Master-slave condensation (Abaqus-style DOF elimination) of linear multi-point constraints
 
@@ -199,6 +201,7 @@ class MultiPointConstraintTransformation:
                 "Prescribe the masters instead.".format(len(conflicts))
             )
 
+    @performancetiming.timeit("mpc transform system matrix")
     def transformSystemMatrix(self, K: csr_matrix) -> csr_matrix:
         """Condense the system matrix: :math:`\\tilde{K} = T^T K \\, T + C`.
 
@@ -214,10 +217,24 @@ class MultiPointConstraintTransformation:
             rows.
         """
 
-        Kt = (self._T.T @ K @ self._T + self._C).tocsr()
-        Kt.sort_indices()
+        # Broken into its three steps purely to time them separately: the two sparse-sparse products
+        # are SciPy SpGEMMs, single-threaded and pattern-agnostic (they redo the symbolic phase on
+        # every call), which makes them a serial bottleneck that grows as a share of the increment as
+        # the threaded solver gets more cores. Keeping them attributable is the point; the arithmetic
+        # is identical to the single expression this replaces, since `@` associates to the left.
+        with performancetiming.timeit("T^T K"):
+            KT = self._T.T @ K
+
+        with performancetiming.timeit("(T^T K) T"):
+            Kt = KT @ self._T
+
+        with performancetiming.timeit("+ C, tocsr, sort indices"):
+            Kt = (Kt + self._C).tocsr()
+            Kt.sort_indices()
+
         return Kt
 
+    @performancetiming.timeit("mpc transform residual")
     def transformResidual(self, R: np.ndarray, dU: np.ndarray) -> np.ndarray:
         """Condense the residual: :math:`\\tilde{R} = T^T R`, with the slave rows replaced by the
         current constraint violation :math:`-(dU_s - \\sum_a N_a \\, dU_{m_a})` (exactly zero for

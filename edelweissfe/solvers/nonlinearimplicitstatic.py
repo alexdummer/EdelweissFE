@@ -241,6 +241,22 @@ class NIST(NonlinearSolverBase):
                         0,
                     )
 
+                    # The per-field block extents, not just the total. Fields are laid out
+                    # field-major in contiguous slices, so this states the block structure of the
+                    # equation system -- which is what a field-split preconditioner needs, and what
+                    # tells you at a glance how a coupled model's DOFs are actually distributed.
+                    for fieldName, fieldIndices in self.theDofManager.idcsOfFieldsInDofVector.items():
+                        self.journal.message(
+                            "  field '{:}': {:} dofs, [{:}, {:})".format(
+                                fieldName,
+                                fieldIndices.stop - fieldIndices.start,
+                                fieldIndices.start,
+                                fieldIndices.stop,
+                            ),
+                            self.identification,
+                            0,
+                        )
+
                     self.journal.printSeperationLine()
 
                     presentVariableNames = list(self.theDofManager.idcsOfFieldsInDofVector.keys())
