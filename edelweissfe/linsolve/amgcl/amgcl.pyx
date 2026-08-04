@@ -34,6 +34,10 @@ cimport numpy as np
 
 cdef class PyAMGCLSolver:
     cdef LinearSolver* solver
+    cdef readonly int lastIterations
+    """The iteration count AMGCL reported for the most recent solve, -1 before the first."""
+    cdef readonly double lastError
+    """The relative residual AMGCL reported for the most recent solve, NaN before the first."""
 
     def __cinit__(self, dict params=None):
         """
@@ -53,6 +57,9 @@ cdef class PyAMGCLSolver:
                     "relaxation": {"type": "ilu0"}
                 }
             }
+
+        self.lastIterations = -1
+        self.lastError = float("nan")
 
         # Convert dict to JSON string for C++
         cdef bytes json_bytes = json.dumps(params).encode("utf-8")
@@ -127,5 +134,12 @@ cdef class PyAMGCLSolver:
                 iters,
                 error
             )
+
+        # AMGCL reports these by reference and they were being dropped on the floor, which left an
+        # unconverged solve indistinguishable from a converged one: an iterative solver that hits
+        # maxiter still returns a finite x, so the nonlinear solvers' NaN check does not catch it and
+        # the Newton loop silently consumes a wrong correction. Surfaced here so callers can check.
+        self.lastIterations = iters
+        self.lastError = error
 
         return x

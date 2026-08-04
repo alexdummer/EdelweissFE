@@ -452,9 +452,132 @@ def commandLagged(args):
         )
 
 
+#: AMGCL configurations to try, in rough order of how plausible they are for this system. All run on
+#: AMGCL's OpenMP `builtin` backend, so unlike the SciPy path the matvec, the smoother and the
+#: orthogonalization are all threaded.
+#:
+#: The system is a poor fit for classical AMG and it is worth being explicit about why, so that a
+#: failure here is not mistaken for a configuration mistake: it is non-symmetric with 52% of its
+#: entries structurally asymmetric, it couples two fields with no constant nodal block size (nonlocal
+#: damage lives on corner nodes only, so point-block smoothing does not apply), penalty contact and
+#: the MPC/Dirichlet row replacements give it a ~1e8 dynamic range, and rows replaced by constraint
+#: equations are not an elliptic operator at all. Single-level ILU0 is included precisely because it
+#: makes none of AMG's smoothness assumptions.
+_AMGCL_CONFIGURATIONS = [
+    (
+        "bicgstab + AMG(SA, ilu0)  [wrapper default]",
+        {
+            "solver": {"type": "bicgstab", "tol": 1e-8, "maxiter": 500},
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relaxation": {"type": "ilu0"}},
+        },
+    ),
+    (
+        "gmres(100) + AMG(SA, ilu0)",
+        {
+            "solver": {"type": "gmres", "M": 100, "tol": 1e-8, "maxiter": 500},
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relaxation": {"type": "ilu0"}},
+        },
+    ),
+    (
+        "gmres(100) + ILU0 only (no AMG)",
+        {
+            "solver": {"type": "gmres", "M": 100, "tol": 1e-8, "maxiter": 500},
+            "precond": {"class": "relaxation", "type": "ilu0"},
+        },
+    ),
+    (
+        "fgmres(100) + AMG(SA, spai0)",
+        {
+            "solver": {"type": "fgmres", "M": 100, "tol": 1e-8, "maxiter": 500},
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relaxation": {"type": "spai0"}},
+        },
+    ),
+    (
+        "idrs(4) + ILU0 only",
+        {
+            "solver": {"type": "idrs", "s": 4, "tol": 1e-8, "maxiter": 500},
+            "precond": {"class": "relaxation", "type": "ilu0"},
+        },
+    ),
+]
+
+
+def commandAmgcl(args):
+    """Try AMGCL's own OpenMP-parallel Krylov solvers on the captured systems.
+
+    AMGCL is the one option here that is threaded end to end -- its matvec, smoother and
+    orthogonalization all run on the builtin OpenMP backend -- so it is the fair test of "would a
+    properly parallel iterative solver win?", which the SciPy-based `lagged` benchmark cannot answer
+    (SciPy's matvec is serial, though it turns out to be only ~7% of that scheme's cost).
+
+    Reported per configuration: AMGCL's own iteration count and error estimate, the *true* relative
+    residual recomputed independently, and wall time -- against the direct solve it has to beat.
+    Recomputing the residual matters: AMGCL's error estimate is what its stopping rule looked at, and
+    a solver that stops early on a misleading estimate would otherwise look like a winner.
+
+    Note the wrapper rebuilds the AMG hierarchy on every call, so these times include setup. That is
+    the production-relevant number rather than a handicap: the sparsity pattern changes every Newton
+    iteration on this model (see the `pattern` subcommand), so a cached hierarchy could never be
+    reused anyway.
+    """
+
+    from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLSolver
+    from edelweissfe.linsolve.pardiso.pardiso import PardisoSolver
+
+    records = loadManifest(args.dumpDir)
+    A, b = loadSystem(args.dumpDir, records[0])
+
+    print(
+        "MKL/OMP threads: {:}   system: {:} dof, {:} nnz\n".format(
+            os.environ.get("OMP_NUM_THREADS", "(unset)"), A.shape[0], A.nnz
+        )
+    )
+
+    referenceSolver = PardisoSolver(reuseSymbolicFactorization=True)
+    reference = referenceSolver(A, b)
+    start = perf_counter()
+    referenceSolver(A, b)
+    directTime = perf_counter() - start
+    print(
+        "PARDISO direct solve with reused symbolic factorization: {:.2f} s  (the target to beat)\n".format(directTime)
+    )
+
+    bNorm = max(np.linalg.norm(b), 1.0e-300)
+
+    print("{:<44} {:>8} {:>12} {:>13} {:>11}".format("configuration", "iters", "amgcl err", "true rel.res", "wall"))
+
+    for description, parameters in _AMGCL_CONFIGURATIONS:
+        try:
+            solver = PyAMGCLSolver(parameters)
+            start = perf_counter()
+            x = solver.solve(A, b)
+            elapsed = perf_counter() - start
+        except Exception as failure:  # noqa: BLE001 - a config that AMGCL rejects should not abort the sweep
+            print("{:<44} {:>8}   {:}".format(description, "ERROR", failure))
+            continue
+
+        trueResidual = np.linalg.norm(A @ x - b) / bNorm
+        deviation = np.linalg.norm(x - reference) / max(np.linalg.norm(reference), 1.0e-300)
+
+        print(
+            "{:<44} {:>8} {:>12.2e} {:>13.2e} {:>9.2f} s   (dev from direct {:.2e})".format(
+                description,
+                solver.lastIterations,
+                solver.lastError,
+                trueResidual,
+                elapsed,
+                deviation,
+            )
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    amgclParser = subparsers.add_parser("amgcl", help="AMGCL's OpenMP-parallel Krylov solvers")
+    amgclParser.add_argument("dumpDir")
+    amgclParser.set_defaults(function=commandAmgcl)
 
     patternParser = subparsers.add_parser("pattern", help="report sparsity-pattern evolution")
     patternParser.add_argument("dumpDir")
