@@ -439,6 +439,11 @@ for _linsolverName in [
     "mumps",
     "gmres",
     "amgcl",
+    # not a direct solver in its own right: it preconditions GMRES with a lagged exact LU (from one
+    # of the direct solvers above), reused across several Newton iterations under an Eisenstat--Walker
+    # forcing sequence -- a modified-Newton-Krylov scheme that turns most direct solves into a handful
+    # of back-substitutions on the large coupled fracture models where the factorization dominates.
+    "inexactnewton",
     # not a solver in its own right: it dumps the equation systems it is handed and delegates the
     # actual solve to one of the above, so linear-solver variants can be compared offline on one
     # authentic sequence of matrices instead of by rerunning the simulation.
