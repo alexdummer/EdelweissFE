@@ -1314,6 +1314,50 @@ would eat the 23% win. Confirm before building on it:
   `blockamg.py`) and proceed with the plan anyway — 19.2 and 19.3 are independent of which smoother
   wins.
 
+**GATE RESULT: PASS.** The run was already sitting on xeon as `blockamg_live_retuned.log` (produced
+just before this hand-off, same command as above, against the `degree=5, npre=npost=1` default that
+is live in the rsynced `blockamg.py`) — verified rather than re-run, since re-running would only
+reproduce it:
+
+- **Newton path: identical.** 15, 8, 5, 5 iterations per increment, same three cutback points
+  (`0.0025`, `0.00125`, `0.000625`), same termination (`Reached maximum number of increments`, the
+  deliberate `maxNumInc` test cap, not a real failure) — all byte-for-byte the same sequence of
+  journal messages as `baseline_omp16.log` (PARDISO). Zero risk of the looser-residual trade-off
+  costing an iteration materialized.
+- **Outer GMRES counts:** min 27, max 53, mean 35.0 over all 44 solves — matches the offline 20–46
+  range closely enough (top tail 7 iters over) to not be alarming, exactly as anticipated.
+- **No NaN/Inf, no "unknown parameter" AMGCL warnings** anywhere in the log (checked stdout+stderr,
+  both redirected to the same file per §8).
+- **Wall-clock — with a caveat.** The per-call `linear solve` entry in the run's own
+  `acc. runtime` table (907.7 s / 44 calls = 20.6 s/call) is **not trustworthy as wall-clock**: it
+  exceeds the run's total `Job computation time` (82.4 s) by >10×, which is only possible if the
+  category's accumulator is being corrupted rather than genuinely summing 44 non-overlapping
+  intervals. Traced to `edelweissfe/utils/performancetiming.py`'s `timeit` decorator: `_currentStackLevel`
+  is a **class attribute**, mutated by every decorated call with no lock
+  (`self._parentStackLevel = timeit._currentStackLevel; timeit._currentStackLevel = timer`) — a
+  classic race under `PYTHON_GIL=0` if any other decorated call runs concurrently. The *same*
+  pathology (`linear solve` acc. runtime 695.3 s / 44 calls, vs `Job computation time` 83.9 s) is
+  present in `baseline_omp16.log` too, i.e. **this is pre-existing and unrelated to blockamg or this
+  session's changes** — not something to fix under this plan, but worth flagging as a new gotcha
+  (below) since 19.4 explicitly asks for wall-clock judgement and this table is the wrong place to
+  read it from on a live run.
+  - The one number in this log immune to that bug is `Job computation time` itself (measured once,
+    start-to-finish, not through the decorator): **82.4 s** for the retuned-blockamg run vs **83.9 s**
+    for the PARDISO baseline — i.e. the full job (AMR + assembly + 44 solves + overhead) is already
+    at parity with PARDISO, not just "improved." This is consistent with, and stronger than, what the
+    §18 offline projection implied.
+  - The authoritative *offline* wall-clock numbers (§18's 125.2 s / 9-ord total) come from
+    `scripts/benchmark_linsolve.py` timing calls directly with its own `perf_counter()`, not through
+    this decorator, so they are unaffected and remain the reference figures for 19.2–19.4.
+
+**New gotcha (addition to §8/§17):** `performancetiming.timeit`'s global `_currentStackLevel` is not
+thread-safe; under `PYTHON_GIL=0` its per-category `acc. runtime` figures on a live run can be
+inflated by an order of magnitude and must not be used for wall-clock comparisons — use `Job
+computation time` (whole-job) or a script-level `perf_counter()` (offline benchmarks) instead.
+
+Log: `blockamg_live_retuned.log` (xeon, `Pryout_profile_investigation/`), cross-checked against
+`baseline_omp16.log`. Reproduce with the command above if re-verification is ever needed.
+
 ### 19.2 D3 — Eisenstat–Walker forcing + lagged hierarchy (highest expected value, ~1 day, pure Python)
 
 Iteration count multiplies the dominant 68% cost, so this is the biggest lever. Two independent
