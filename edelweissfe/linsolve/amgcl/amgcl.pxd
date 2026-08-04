@@ -36,3 +36,5 @@ cdef extern from "amgcl-wrapper.hpp":
                    int& iters,
                    double& error) except +
         void set_nullspace(const double* B, int rows, int cols) except +
+        void build(int n, const int* ptr, const int* col, const double* val) except +
+        void applyPreconditioner(int n, const double* rhs, double* x) except +

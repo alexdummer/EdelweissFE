@@ -97,6 +97,42 @@ cdef class PyAMGCLSolver:
         cdef double[:, ::1] B_view = B_arr
         self.solver.set_nullspace(&B_view[0, 0], rows, cols)
 
+    def build(self, object A):
+        """
+        Build the AMG hierarchy for A once, for repeated preconditioner application via
+        :meth:`applyPreconditioner` -- the build-once / apply-many split :meth:`solve` fuses.
+
+        A: scipy.sparse.csr_matrix
+        """
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+
+        cdef int n = A.shape[0]
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
+
+        cdef int[::1] indptr_ = indptr
+        cdef int[::1] indices_ = indices
+        cdef double[::1] data_ = data
+
+        self.solver.build(n, &indptr_[0], &indices_[0], &data_[0])
+
+    def applyPreconditioner(self, object rhs):
+        """
+        Apply one AMG cycle of the hierarchy built by :meth:`build` to rhs: returns M^-1 rhs.
+
+        rhs: array-like, converted to 1D float64 (C-contiguous).
+        """
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+        cdef int n = rhs_arr.shape[0]
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(n, dtype=np.float64)
+
+        cdef double[::1] rhs_ = rhs_arr
+        cdef double[::1] x_ = x
+        self.solver.applyPreconditioner(n, &rhs_[0], &x_[0])
+        return x
+
     def solve(self, object A, object rhs):
         """
         A: scipy.sparse.csr_matrix

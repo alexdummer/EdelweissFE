@@ -64,6 +64,36 @@ public:
     prm.put( "precond.coarsening.nullspace.B", nullspace_.data() );
   }
 
+  // Build the solver (and thus the AMG hierarchy) once for A, so it can be applied repeatedly as a
+  // preconditioner without rebuilding. This is the build-once / apply-many split that :meth:`solve`
+  // fuses: :meth:`solve` reconstructs the hierarchy on every call, which is fine for a one-shot solve
+  // but ruinous for an inner block preconditioner applied on every outer Krylov iteration. Uses the
+  // current property tree (including any near null-space set via set_nullspace).
+  void build( int n, const int* ptr, const int* col, const double* val )
+  {
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    solver_.reset( new Solver( A, prm ) );
+    cached_n   = n;
+    cached_nnz = nnz;
+    cached_ptr_.assign( ptr, ptr + n + 1 );
+    cached_col_.assign( col, col + nnz );
+  }
+
+  // Apply one preconditioner (AMG) cycle to rhs: x <- M^-1 rhs, where M is the hierarchy built by
+  // :meth:`build`. This is the operation a block Gauss-Seidel / field-split preconditioner performs on
+  // each field per outer iteration. Cheap relative to the build.
+  void applyPreconditioner( int n, const double* rhs, double* x )
+  {
+    std::fill( x, x + n, 0.0 );
+    auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
+    auto x_rng   = amgcl::make_iterator_range( x, x + n );
+    solver_->precond().apply( rhs_rng, x_rng );
+  }
+
   void solve( int           n,
               const int*    ptr,
               const int*    col,
