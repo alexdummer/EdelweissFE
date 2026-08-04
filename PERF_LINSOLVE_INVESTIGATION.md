@@ -2180,6 +2180,42 @@ and change its `directory` to `linsolveDumpsNoPrune`. Run per §6. Then:
    cutbacks). If it differs, the dumps remain valid specimens for A2 (the replay question is about
    the solver, not the trajectory), but say so here — it is also a free §7 data point either way.
 
+**A1 — executed. The pattern still churns every iteration; Part A stops here, exactly as
+anticipated.** `capture_noprune.inp`/`linsolveDumpConfig_noprune.json` created and run
+(`capture_noprune.log`, `linsolveDumpsNoPrune/`).
+
+- **§7 caveat, resolved cleanly first: no drift.** Newton path **15/8/5/5**, identical cutbacks
+  (`0.0025`/`0.00125`/`0.000625`), same termination, matching `baseline_omp16.log` exactly — PARDISO
+  solving the unpruned system over this 5-increment window shows no measurable trajectory
+  sensitivity here. A genuine, free §7 data point: this particular drift channel is not observable
+  at this window size, though that is not the same as "settled" (§7 already says as much for the
+  general question).
+- **nnz growth: +8.4% to +8.7%, not the speculated ~+50% ceiling.** No-prune nnz ranges
+  44.09M–44.42M vs the pruned dumps' 40.58M–40.91M (`manifest.jsonl`, both dirs) — real but modest,
+  and (surprisingly) the *absolute* nnz swing between consecutive ords is comparable in both sets
+  (~337k here vs ~334k pruned) — pruning is not the dominant source of nnz variation at all; see
+  next point.
+- **The pattern gate itself fails.** `python $B pattern linsolveDumpsNoPrune`
+  (`pattern_noprune.log`) — **every single consecutive pair is `CHANGED`** (a genuine
+  `np.array_equal` check on `indices`/`indptr`, not an nnz proxy — confirmed by reading
+  `commandPattern`'s implementation before trusting its verdict). The nnz delta per step
+  (+103087, −217330, +26727, +5808, −2086, −7574, +6254 …) shrinks in magnitude as the increment
+  converges but never reaches zero — consistent with the churn being driven by **contact/tie
+  connectivity updates** (the candidate set shifting with the solution each Newton step,
+  independent of `pruneCondensedMatrixZeros`), not by the zero-pruning mechanism the hypothesis
+  chain blamed. `nonlinearimplicitstatic.py`'s own rebuild trigger,
+  `modelHasChanged or connectivityHasChanged or self.theDofManager is None`, already names
+  `connectivityHasChanged` as a distinct, always-live rebuild path — pruning was never the only
+  source of instability, just the one previously measured (§3.1).
+- **Per the plan's own stop condition, Part A ends here.** A2 (offline replay), A3 (live gate), A4
+  (ship/record), and A5 (equilibration caching) are **not attempted** — their entire premise (a
+  stable pattern once pruning is off) does not hold, so there is nothing left for them to measure
+  that A1 has not already answered. This carries directly into Part B: B1's cache-invalidation
+  design already assumes identity-based invalidation per solve (not "stable across solves"), so it
+  is unaffected by this finding — if anything, this strengthens the case that Part B's assembly-side
+  fix is the one worth pursuing, since a stable pattern was never available to exploit at the
+  `blockamg` layer regardless of the pruning setting.
+
 **A2 — offline replay, three-way, same probe run.** New probe modeled on
 `probe_192_sequence.py` (xeon, investigation dir, ad hoc, not checked in). Three arms, interleaved
 in one script invocation, all with the shipped default config (EW forcing `etaMax=3e-4`,
