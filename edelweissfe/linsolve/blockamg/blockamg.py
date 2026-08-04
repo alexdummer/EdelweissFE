@@ -40,38 +40,44 @@ at once (measured -- it stalls at a 0.2 residual, see PERF_LINSOLVE_INVESTIGATIO
 
 The remedy, following Alkmim et al. (IJNME 2026), is a *block* preconditioner: an AMG hierarchy per
 field, combined by a block Gauss-Seidel sweep, used to precondition an outer GMRES over the full
-coupled system. Each field's operator (elasticity for displacement, a Helmholtz-like operator for
-damage) is individually AMG-friendly even though their monolithic coupling is not.
+coupled system. Each field's operator (elasticity for a displacement field, a Helmholtz-like operator
+for a damage field) is individually AMG-friendly even though their monolithic coupling is not.
+
+The field structure -- which DOFs belong to which field, and each field's nodal dimension -- is not
+carried by the matrix; it is pushed in from the DofManager by the nonlinear solver (via
+:class:`~edelweissfe.linsolve.base.FieldStructureAwareLinearSolver`), so nothing about the block layout
+has to be specified by hand.
 
 What it does per solve
 ----------------------
 
 #. **Equilibrate.** Symmetric diagonal (Jacobi) scaling :math:`\\hat A = D^{-1/2} A D^{-1/2}` removes
-   the ~1e8 dynamic range (Dirichlet penalties + stiffness) that otherwise wrecks AMG's
+   the large dynamic range (Dirichlet penalties + stiffness) that otherwise wrecks AMG's
    strength-of-connection. The solve is done on :math:`\\hat A` and unscaled at the end.
-#. **Split** :math:`\\hat A` into the field diagonal blocks and their couplings, from the field sizes
-   (which are contiguous, field-major, in the DOF vector).
+#. **Split** :math:`\\hat A` into the field diagonal blocks and their couplings, from the field ranges.
 #. **Build one AMG hierarchy per field** (AMGCL, built once per solve via ``build`` and applied many
    times via ``applyPreconditioner`` -- the pattern churns between Newton iterations, so the hierarchy
    cannot be reused *across* solves, but it is reused across the outer GMRES iterations *within* a
-   solve). An elasticity field is given its rigid-body *translations* as the near null-space,
-   constructible from the DOF layout alone (node-major, ``components`` per node); a scalar field takes
-   the default constant.
+   solve). A vector field (nodal dimension > 1, e.g. displacement) is given its rigid-body
+   *translations* as the near null-space -- one per component, from the DOF layout alone; a scalar
+   field takes the default constant.
 #. **Precondition GMRES** with a block Gauss-Seidel sweep over the fields, each field's correction
    coming from one AMG V-cycle on its block, the couplings folded in between fields.
 
 This is a *feasibility-grade* solver: on the reference model AMGCL's smoothed aggregation converges
 but not tightly on the (non-symmetric, contact + tie condensed) displacement block, so the outer
 GMRES needs O(100) iterations. That is acceptable where the point is to fit in memory at sizes a
-direct solver cannot reach; the iteration count would come down with a stronger elasticity AMG
-(rotations, a nonsymmetric-aware library such as MueLu). See the handoff document, section 13.
+direct solver cannot reach; the iteration count would come down with a stronger vector-field AMG
+(a nonsymmetric-aware library such as MueLu). See the handoff document, section 13.
 """
 
 import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator, gmres
 
-_DEFAULT_ELASTICITY_PRECOND = {
+from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
+
+_DEFAULT_VECTOR_PRECOND = {
     "coarsening": {"type": "smoothed_aggregation"},
     "relax": {"type": "gauss_seidel"},
     "npre": 2,
@@ -83,62 +89,82 @@ _DEFAULT_SCALAR_PRECOND = {
 }
 
 
-class BlockAMGSolver:
+class BlockAMGSolver(FieldStructureAwareLinearSolver):
     """Field-split block-AMG preconditioned GMRES. Callable as ``(A, b) -> x``.
+
+    The block structure is not configured here -- it is supplied by the nonlinear solver through
+    :meth:`~edelweissfe.linsolve.base.FieldStructureAwareLinearSolver.setFieldStructure`. A field's
+    near null-space is decided from its nodal dimension: a vector field (dimension > 1) gets its
+    per-component rigid-body translations, a scalar field the default constant.
 
     Parameters
     ----------
-    fields
-        The ordered list of field blocks, one dict per field, each with:
-
-        ``size``
-            The number of DOFs in the block (they are contiguous and field-major in the DOF vector).
-        ``elasticity``
-            If True, the block gets its rigid-body translations as the AMG near null-space; else the
-            default constant. Default False.
-        ``components``
-            For an elasticity block, the number of displacement components per node (node-major).
-            Default 3.
-        ``precond``
-            An optional AMGCL preconditioner parameter tree overriding the default for this block.
     outerTol, outerRestart, outerMaxiter
         The outer GMRES relative tolerance, restart length, and maximum restart cycles.
     sweeps
         Block Gauss-Seidel sweeps per preconditioner application.
     symmetric
         If True, each sweep is followed by a reverse-order sweep (symmetric block Gauss-Seidel).
+    fieldPreconds
+        Optional mapping of field name to an AMGCL preconditioner parameter tree, overriding the
+        dimension-based default for that field.
     verbose
         If True, print the outer iteration count and residual per solve.
     """
 
     def __init__(
         self,
-        fields: list,
         *,
-        outerTol: float = 1.0e-4,
+        outerTol: float = 1.0e-6,
         outerRestart: int = 100,
-        outerMaxiter: int = 500,
+        outerMaxiter: int = 8,
         sweeps: int = 1,
-        symmetric: bool = False,
+        symmetric: bool = True,
+        fieldPreconds: dict = None,
         verbose: bool = False,
     ):
-        if not fields:
-            raise ValueError("blockamg: 'fields' must list at least one field block")
-        self._fields = fields
         self._outerTol = outerTol
         self._outerRestart = outerRestart
         self._outerMaxiter = outerMaxiter
         self._sweeps = sweeps
         self._symmetric = symmetric
+        self._fieldPreconds = fieldPreconds or {}
         self._verbose = verbose
 
-    def _translationNullspace(self, size: int, components: int, blockDinv: np.ndarray) -> np.ndarray:
-        """The rigid-body translations of an elasticity block, transformed for the scaled operator.
+    def _resolveBlocks(self, n: int) -> list:
+        """The field blocks tiling ``[0, n)``, in DOF order, with any trailing DOFs not covered by a
+        node field (e.g. scalar variables) folded into a final scalar block."""
 
-        Translations are 1 on each component (node-major). The near null-space of the scaled block
-        :math:`D^{-1/2} A D^{-1/2}` is :math:`D^{1/2}` times that of :math:`A`, i.e. the raw
-        translations divided by ``blockDinv`` (``= sqrt(|diag A|)`` times them).
+        if self._fieldStructure is None:
+            raise RuntimeError(
+                "blockamg: field structure not set. It is pushed in by the nonlinear solver via "
+                "setFieldStructure(); this solver must be driven by one that does so."
+            )
+        blocks = sorted(self._fieldStructure, key=lambda field: field.start)
+        cursor = 0
+        for block in blocks:
+            if block.start != cursor:
+                raise ValueError(
+                    "blockamg: field '{:}' starts at {:}, expected {:} -- fields must tile the DOF "
+                    "vector contiguously".format(block.name, block.start, cursor)
+                )
+            cursor = block.stop
+        if cursor < n:
+            # DOFs past the last node field: scalar variables. One scalar block.
+            blocks = blocks + [FieldBlock("scalar variables", cursor, n, 1)]
+        elif cursor != n:
+            raise ValueError("blockamg: field blocks cover {:} dofs, but the matrix is {:}x{:}".format(cursor, n, n))
+        return blocks
+
+    def _translationNullspace(self, block: FieldBlock, blockDinv: np.ndarray) -> np.ndarray:
+        """The rigid-body translations of a vector field, transformed for the scaled operator.
+
+        Translations are 1 on each of the ``dimension`` components (node-major). The near null-space of
+        the scaled block :math:`D^{-1/2} A D^{-1/2}` is :math:`D^{1/2}` times that of :math:`A`, i.e.
+        the raw translations divided by ``blockDinv``.
         """
+        size = block.stop - block.start
+        components = block.dimension
         B = np.zeros((size, components))
         rows = np.arange(size)
         B[rows, rows % components] = 1.0
@@ -149,13 +175,8 @@ class BlockAMGSolver:
 
         A = A.tocsr()
         n = A.shape[0]
-        sizes = [int(field["size"]) for field in self._fields]
-        if sum(sizes) != n:
-            raise ValueError(
-                "blockamg: field sizes {:} sum to {:}, but the matrix is {:}x{:}".format(sizes, sum(sizes), n, n)
-            )
-        bounds = np.concatenate([[0], np.cumsum(sizes)])
-        slices = [slice(int(bounds[i]), int(bounds[i + 1])) for i in range(len(sizes))]
+        blocks = self._resolveBlocks(n)
+        slices = [slice(block.start, block.stop) for block in blocks]
 
         # Symmetric diagonal equilibration. Solve A x = b as (D A D)(D^-1 x) = D b, i.e. As z = bs
         # with x = D z; D = diag(dinv), dinv = 1/sqrt(|diag A|).
@@ -172,21 +193,22 @@ class BlockAMGSolver:
                 if i != j:
                     offBlocks[(i, j)] = rowBlock[:, slices[j]].tocsr()
 
-        # One AMG hierarchy per field, built once for this solve.
+        # One AMG hierarchy per field, built once for this solve. A vector field gets its translations
+        # as the near null-space; a scalar field the default constant.
         preconditioners = []
-        for i, field in enumerate(self._fields):
-            precondParams = field.get(
-                "precond",
-                _DEFAULT_ELASTICITY_PRECOND if field.get("elasticity", False) else _DEFAULT_SCALAR_PRECOND,
+        for i, block in enumerate(blocks):
+            isVectorField = block.dimension > 1
+            precondParams = self._fieldPreconds.get(
+                block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
             )
             solver = PyAMGCLSolver({"precond": precondParams})
-            if field.get("elasticity", False):
-                nullspace = self._translationNullspace(sizes[i], int(field.get("components", 3)), dinv[slices[i]])
-                solver.set_nullspace(nullspace)
+            if isVectorField:
+                solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
             solver.build(diagBlocks[i])
             preconditioners.append(solver)
 
         nFields = len(slices)
+        sizes = [block.stop - block.start for block in blocks]
 
         def sweepOnce(order, residual, x):
             for i in order:
@@ -223,8 +245,8 @@ class BlockAMGSolver:
         if self._verbose:
             trueResidual = np.linalg.norm(A @ x - np.asarray(b).reshape(n)) / max(np.linalg.norm(b), 1e-300)
             print(
-                "blockamg: {:} outer GMRES iters, info={:}, true rel.res={:.2e}".format(
-                    len(history), info, trueResidual
+                "blockamg: fields {:} | {:} outer GMRES iters, info={:}, true rel.res={:.2e}".format(
+                    [block.name for block in blocks], len(history), info, trueResidual
                 ),
                 flush=True,
             )

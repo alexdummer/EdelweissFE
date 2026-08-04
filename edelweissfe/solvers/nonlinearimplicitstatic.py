@@ -39,6 +39,7 @@ from scipy.sparse import csr_matrix
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
+from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.csrgeneratorv2 import CSRGenerator
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
@@ -276,6 +277,23 @@ class NIST(NonlinearSolverBase):
                         )
 
                     self.journal.printSeperationLine()
+
+                    # Hand a field-split linear solver the block structure it needs but the (A, b)
+                    # interface cannot carry: each field's DOF range and its nodal dimension (from
+                    # which the solver decides the near null-space -- translations for a vector field,
+                    # a constant for a scalar one). Dispatched on the mixin so ordinary solvers are
+                    # never asked; re-pushed here on every (re)build so it tracks the mesh across AMR.
+                    if isinstance(self.linSolver, FieldStructureAwareLinearSolver):
+                        fieldBlocks = [
+                            FieldBlock(
+                                fieldName,
+                                fieldIndices.start,
+                                fieldIndices.stop,
+                                model.nodeFields[fieldName].dimension,
+                            )
+                            for fieldName, fieldIndices in self.theDofManager.idcsOfFieldsInDofVector.items()
+                        ]
+                        self.linSolver.setFieldStructure(fieldBlocks)
 
                     # Optional one-time dump of nodal coordinates aligned with the DOF vector, for
                     # offline preconditioner experiments that need geometry (e.g. the rigid body modes

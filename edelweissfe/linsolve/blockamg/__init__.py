@@ -37,43 +37,34 @@ from collections.abc import Callable, Mapping
 def createSolver(opts) -> Callable:
     """Create a field-split block-AMG linear solver.
 
-    The factory the ``linsolver`` registry category resolves for the name ``blockamg``.
+    The factory the ``linsolver`` registry category resolves for the name ``blockamg``. No field
+    structure is configured here: it is discovered from the model and pushed in by the nonlinear
+    solver (see :class:`~edelweissfe.linsolve.base.FieldStructureAwareLinearSolver`).
 
     Parameters
     ----------
     opts
-        The linear-solver options parsed from the solver's ``linsolverConfigFile``. Because the block
-        structure cannot be inferred from ``(A, b)`` alone, a configuration file is **required** and
-        must contain ``fields``:
+        The linear-solver options parsed from the solver's ``linsolverConfigFile``. All optional (see
+        :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`):
 
-        ``fields``
-            The ordered list of field blocks, contiguous and field-major in the DOF vector. Each entry
-            is a mapping with ``size`` (int, required), and optionally ``elasticity`` (bool),
-            ``components`` (int, for an elasticity block), and ``precond`` (an AMGCL parameter tree
-            overriding the default for that block). The field extents are logged by the nonlinear
-            solver at equation-system build ("field '...': N dofs, [a, b)").
         ``outerTol``, ``outerRestart``, ``outerMaxiter``, ``sweeps``, ``symmetric``, ``verbose``
-            Optional; forwarded to
-            :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`.
+            The outer GMRES and block Gauss-Seidel knobs.
+        ``fieldPreconds``
+            Optional mapping of field name (e.g. ``"displacement"``) to an AMGCL preconditioner
+            parameter tree, overriding the dimension-based default for that field.
+
+        As with the other factories, a non-mapping ``opts`` is tolerated (the implicit-static solver
+        passes ``""`` when no configuration file is given), in which case every default applies.
 
     Returns
     -------
     Callable
         A :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`, callable as ``(A, b) -> x``.
-
-    Raises
-    ------
-    ValueError
-        If no ``fields`` list is supplied -- the block structure has no safe default.
     """
 
     from edelweissfe.linsolve.blockamg.blockamg import BlockAMGSolver
 
-    if not isinstance(opts, Mapping) or "fields" not in opts:
-        raise ValueError(
-            "blockamg requires a linsolverConfigFile with a 'fields' list describing the block "
-            "structure (e.g. the displacement and damage field sizes); none was given"
-        )
+    optionMap = opts if isinstance(opts, Mapping) else {}
 
     kwargs = {}
     for key, cast in (
@@ -84,7 +75,9 @@ def createSolver(opts) -> Callable:
         ("symmetric", bool),
         ("verbose", bool),
     ):
-        if key in opts:
-            kwargs[key] = cast(opts[key])
+        if key in optionMap:
+            kwargs[key] = cast(optionMap[key])
+    if "fieldPreconds" in optionMap:
+        kwargs["fieldPreconds"] = dict(optionMap["fieldPreconds"])
 
-    return BlockAMGSolver(list(opts["fields"]), **kwargs)
+    return BlockAMGSolver(**kwargs)

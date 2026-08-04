@@ -759,7 +759,14 @@ block. The count would drop with a nonsymmetric-aware elasticity AMG (Trilinos/M
 smoother; the field-split machinery, the equilibration, and the DOF-layout null-space are all reusable
 if that backend is ever swapped in.
 
-**Not done (future):** the field sizes come from a config file; a production version would take them
-(and, for rotations, nodal coordinates — `EDELWEISS_DUMP_COORDS` shows the path) from the DofManager
-through a widened linsolver interface. And a parallel outer Krylov (AMGCL's own, or a threaded matvec)
-would cut the serial GMRES overhead.
+**The field structure is discovered, not configured.** The block layout — each field's DOF range and
+its nodal dimension — is pushed in from the DofManager by the nonlinear solver, via the
+`FieldStructureAwareLinearSolver` mixin (`edelweissfe/linsolve/base.py`); the solver keys the near
+null-space on the dimension (a vector field's per-component translations, a scalar field's constant),
+so nothing about the blocks is specified by hand and the fields are named
+(`displacement`, `nonlocal damage`), not tagged "elasticity". The config file carries only solver
+knobs and is optional.
+
+**Not done (future):** rotations for the vector-field null-space still need nodal coordinates
+(`EDELWEISS_DUMP_COORDS` shows the path — they would ride the same `setFieldStructure` channel); and a
+parallel outer Krylov (AMGCL's own, or a threaded matvec) would cut the serial GMRES overhead.

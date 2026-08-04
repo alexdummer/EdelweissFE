@@ -1,11 +1,4 @@
 {
-  "fields": [
-    {
-      "size": 610,
-      "elasticity": true,
-      "components": 2
-    }
-  ],
   "outerTol": 1e-8,
   "sweeps": 1,
   "symmetric": true
