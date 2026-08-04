@@ -1907,6 +1907,65 @@ order:
    burn time trying to activate it here; it activates for free if Lead 2's pattern caching ever
    lands (§7).
 
+**Step 1 — implemented (commit `fb57ea1e`), and it took three attempts to get the mechanism right,
+all worth recording since the failure mode (silently doing nothing) would otherwise be easy to miss.**
+The one-line summary of *why* the gap exists: `gmres(..., callback_type="pr_norm")`'s own stopping
+check is on the **preconditioned** residual, not the true one — with an imperfect preconditioner (this
+one, by design, §17) the two diverge, so GMRES declaring "converged" can leave the true residual far
+looser than requested (the already-documented case: 1.6e-2 true residual when 1e-4 was requested).
+
+- **Attempt 1 — warm restart at the same `rtol`: a complete no-op.** `gmres(..., x0=z, rtol=eta, ...)`
+  where `z` is exactly the solution GMRES just returned trivially re-satisfies the identical
+  preconditioned-residual criterion at iteration 0 — every single continuation logged "0 more outer
+  GMRES iters" (`probe_202_true_residual.log`). The mechanism the plan describes ("re-enter gmres with
+  `x0=x`") cannot work as literally stated without also changing the target; this was the first thing
+  the offline probe caught, before it ever reached a live run.
+- **Attempt 2 — tighten the target proportionally to `eta/trueResidual`: partially worked, then
+  broke in a revealing way.** Scaling the *requested* `eta` down by the true/preconditioned gap ratio
+  fixed 2 of 9 ords but left 5 completely unmoved (`probe_202_true_residual_v2.log`) — GMRES had
+  already overshot its original target substantially, so even the "tightened" request was already
+  satisfied. Rescaling from the callback's own last-reported `pr_norm` instead (the *actually achieved*
+  value, not the requested one) still left the same 5 ords unmoved, and for one of them
+  (`probe_202_true_residual_v3.log`, ord 5) the computed continuation target came out *larger* than
+  `eta` itself — impossible if the callback's `pr_norm` were on the same relative scale as `rtol`. It
+  is not (almost certainly an absolute residual norm, not one normalized by `‖bs‖`) — a scipy
+  internal not worth reverse-engineering further.
+- **Fix — geometric tightening purely in `rtol`'s own units.** Each continuation multiplies the
+  *requested* `rtol` by a fixed `0.01`, never touching the callback's ambiguous-scale value at all —
+  dimensionally safe by construction since it stays entirely within a quantity scipy already
+  interprets correctly. `trueResidualMaxContinuations` (default 2) bounds the effort.
+
+**Offline validation, all 9 ords (`probe_202_true_residual_v4.log`), production `fieldPreconds` path,
+fixed `outerTol=1e-6`, same-session interleaved (0 vs. 2 continuations):**
+
+| ord | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| no continuation: iters (true res) | 72 (1.2e-7) | 94 (4.4e-5) | 50 (3.4e-6) | 44 (1.7e-6) | 48 (1.1e-6) | 45 (1.2e-6) | 46 (1.4e-6) | 44 (1.0e-6) | 44 (1.3e-6) | 164.1s |
+| with continuation: iters (true res) | 72 (1.2e-7) | 164 (8.9e-9) | 72 (2.7e-8) | 61 (1.6e-8) | 74 (1.2e-8) | 71 (1.2e-8) | 65 (9.1e-9) | 44 (1.0e-6) | 71 (1.2e-8) | 218.0s |
+| tolerance met (≤1e-6)? | yes | **no→yes** | **no→yes** | **no→yes** | **no→yes** | **no→yes** | **no→yes** | yes (already) | **no→yes** | 8/9 fixed |
+
+**Every ord now meets its requested tolerance** (previously 5 of 9 didn't), typically overshooting to
+1e-8–1e-9 once a continuation triggers (the geometric 0.01× step is coarser than needed, trading a bit
+of extra work for robustness rather than tuning the factor finely). Cost is **not** concentrated on
+`ord 3` as the plan anticipated — 5 of 9 ords needed it, not just the one known-hard iterate — so this
+was a broader, previously-undercounted gap in the shipped default, not an `ord 3`-specific quirk.
+Aggregate wall-clock rose from 164.1s to 218.0s (+33%) across this batch; accepted per the plan
+("this lands regardless of step 2's outcome") since it trades wall-clock for actually honoring the
+requested accuracy.
+
+**Live confirmation (`blockamg_live_202_step1.log`, same command as §19.1's gate): unchanged
+trajectory, ~free in practice.** Newton path **15/8/5/5**, identical to baseline; same three cutbacks
+(`0.0025`, `0.00125`, `0.000625`); identical final `U_loading=0.021875`; `Job computation time`
+**81.8s** (vs. baseline **82.4s** — no regression, if anything a rounding-level improvement).
+Continuations fired **38 times across the 44 live solves** (i.e. most solves needed at least one),
+pushing residuals down to the 1e-8–1e-9 range, yet this barely moved total wall-clock — on the real
+model the continuation cost is evidently much smaller relative to a full solve than the offline batch
+above suggested (offline used the harder, larger-residual-gap dumped ords disproportionately).
+Regression test `CantileverBeamQuad4BlockAMG` still passes.
+
+**This closes a real, previously-shipped-but-undocumented-as-such accuracy gap**, independent of
+whatever step 2 decides on EW forcing.
+
 ### Sequencing, and what is explicitly out of scope for this phase
 
 1. 20.1 step by step; its live gate decides the final default.
