@@ -42,10 +42,15 @@ cdef class PyAMGCLSolver:
     def __cinit__(self, dict params=None):
         """
         Initialize with parameters only.
+
+        The AMG smoother key is ``relax``, not ``relaxation``; AMGCL ignores unknown keys with only a
+        warning on stderr, so a misspelling here silently runs the default smoother instead of the
+        requested one.
+
         Example params:
         {
             "solver": {"type": "bicgstab", "tol": 1e-6},
-            "precond": {"relaxation": {"type": "ilu0"}}
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relax": {"type": "ilu0"}}
         }
         """
         if params is None:
@@ -54,7 +59,7 @@ cdef class PyAMGCLSolver:
                 "solver": {"type": "bicgstab", "tol": 1e-6},
                 "precond": {
                     "coarsening": {"type": "smoothed_aggregation"},
-                    "relaxation": {"type": "ilu0"}
+                    "relax": {"type": "ilu0"}
                 }
             }
 

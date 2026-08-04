@@ -468,14 +468,14 @@ _AMGCL_CONFIGURATIONS = [
         "bicgstab + AMG(SA, ilu0)  [wrapper default]",
         {
             "solver": {"type": "bicgstab", "tol": 1e-8, "maxiter": 500},
-            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relaxation": {"type": "ilu0"}},
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relax": {"type": "ilu0"}},
         },
     ),
     (
         "gmres(100) + AMG(SA, ilu0)",
         {
             "solver": {"type": "gmres", "M": 100, "tol": 1e-8, "maxiter": 500},
-            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relaxation": {"type": "ilu0"}},
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relax": {"type": "ilu0"}},
         },
     ),
     (
@@ -489,7 +489,7 @@ _AMGCL_CONFIGURATIONS = [
         "fgmres(100) + AMG(SA, spai0)",
         {
             "solver": {"type": "fgmres", "M": 100, "tol": 1e-8, "maxiter": 500},
-            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relaxation": {"type": "spai0"}},
+            "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relax": {"type": "spai0"}},
         },
     ),
     (
@@ -543,32 +543,58 @@ def commandAmgcl(args):
     )
 
     bNorm = max(np.linalg.norm(b), 1.0e-300)
+    referenceNorm = max(np.linalg.norm(reference), 1.0e-300)
 
-    print("{:<44} {:>8} {:>12} {:>13} {:>11}".format("configuration", "iters", "amgcl err", "true rel.res", "wall"))
+    # Swept, not fixed at 1e-8: a Newton step does not need a tight linear solve, and judging an
+    # iterative solver only at 1e-8 is what produced a wrong verdict in the `lagged` benchmark.
+    tolerances = [float(value) for value in args.tolerances.split(",")]
+
+    print(
+        "{:<40} {:>8} {:>8} {:>12} {:>13} {:>10}".format(
+            "configuration", "rtol", "iters", "amgcl err", "true rel.res", "wall"
+        )
+    )
 
     for description, parameters in _AMGCL_CONFIGURATIONS:
-        try:
-            solver = PyAMGCLSolver(parameters)
-            start = perf_counter()
-            x = solver.solve(A, b)
-            elapsed = perf_counter() - start
-        except Exception as failure:  # noqa: BLE001 - a config that AMGCL rejects should not abort the sweep
-            print("{:<44} {:>8}   {:}".format(description, "ERROR", failure))
-            continue
+        for tolerance in tolerances:
+            configured = {
+                "solver": dict(parameters["solver"], tol=tolerance, maxiter=args.maxiter),
+                "precond": parameters["precond"],
+            }
 
-        trueResidual = np.linalg.norm(A @ x - b) / bNorm
-        deviation = np.linalg.norm(x - reference) / max(np.linalg.norm(reference), 1.0e-300)
+            try:
+                solver = PyAMGCLSolver(configured)
+                start = perf_counter()
+                x = solver.solve(A, b)
+                elapsed = perf_counter() - start
+            except Exception as failure:  # noqa: BLE001 - a rejected config should not abort the sweep
+                print("{:<40} {:>8.0e} {:>8}   {:}".format(description, tolerance, "ERROR", failure))
+                continue
 
-        print(
-            "{:<44} {:>8} {:>12.2e} {:>13.2e} {:>9.2f} s   (dev from direct {:.2e})".format(
-                description,
-                solver.lastIterations,
-                solver.lastError,
-                trueResidual,
-                elapsed,
-                deviation,
+            trueResidual = np.linalg.norm(A @ x - b) / bNorm
+            deviation = np.linalg.norm(x - reference) / referenceNorm
+            hitCap = solver.lastIterations >= args.maxiter
+
+            print(
+                "{:<40} {:>8.0e} {:>8} {:>12.2e} {:>13.2e} {:>8.2f} s  {:}{:}".format(
+                    description,
+                    tolerance,
+                    solver.lastIterations,
+                    solver.lastError,
+                    trueResidual,
+                    elapsed,
+                    "dev {:.1e}".format(deviation),
+                    (
+                        "  <-- HIT MAXITER, did not converge"
+                        if hitCap
+                        else ("  <-- beats direct" if elapsed < directTime else "")
+                    ),
+                )
             )
-        )
+
+            # No point tightening a tolerance this configuration could not even reach.
+            if hitCap:
+                break
 
 
 def main():
@@ -577,6 +603,12 @@ def main():
 
     amgclParser = subparsers.add_parser("amgcl", help="AMGCL's OpenMP-parallel Krylov solvers")
     amgclParser.add_argument("dumpDir")
+    amgclParser.add_argument(
+        "--tolerances",
+        default="1e-2,1e-4,1e-8",
+        help="loosest first: the sweep stops tightening once a configuration fails to converge",
+    )
+    amgclParser.add_argument("--maxiter", type=int, default=500)
     amgclParser.set_defaults(function=commandAmgcl)
 
     patternParser = subparsers.add_parser("pattern", help="report sparsity-pattern evolution")
