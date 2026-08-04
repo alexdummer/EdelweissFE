@@ -2048,7 +2048,16 @@ worked around.
 | blockamg, fixed `outerTol=1e-6` (§19.1's gate) | 82.4s |
 | blockamg, true-residual stopping added, still fixed `outerTol=1e-6` (§20.2 step 1) | 81.8s |
 | blockamg, EW forcing `etaMax=1e-4` (§20.2 step 2) | 81.5s |
-| **blockamg, EW forcing `etaMax=3e-4` (shipped default)** | **81.3s** |
+| blockamg, EW forcing `etaMax=3e-4`, explicit config (§20.2 step 2) | 81.3s |
+| **blockamg, shipped defaults, zero explicit config** (`blockamg_live_202_final.log`) | **80.4s** |
+
+The last row is the one that matters going forward: the corrected constructor defaults (`outerTol=None`,
+`etaMax=3.0e-4`), the full Journal/`performancetiming`/`LinearSolver`-base refactor, and an empty
+`blockamg.json` (`{"sweeps": 1, "symmetric": true, "verbosity": "info"}` — no `outerTol`/`etaMax`
+override at all) reproduce the identical trajectory (15/8/5/5, same three cutbacks, final
+`U_loading=0.021875000000023462`) with no NaN/Inf and no "unknown parameter" warnings. The small further
+improvement (80.4s vs. 81.3s) is within this shared machine's normal run-to-run variance (§19.4), not a
+new effect — the conclusion below is unchanged by it.
 
 **Every row is within ~3% of every other row.** This is the headline finding of Phase 5, and it cuts
 against the ~1.56× offline win §19.2 originally measured: on the *live* model, wall-clock is dominated
