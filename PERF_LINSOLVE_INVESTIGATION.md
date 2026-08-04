@@ -717,3 +717,49 @@ displacement field reaches 71553 nodes); per-block quality via `python
 ~/constitutive_modeling/next_v2611/EdelweissFE/scripts/... ` prototypes (`amgcl_perblock.py`,
 `amgcl_disp.py`, `amgcl_rbm.py` in the profile dir). Logs: `amgcl_perblock.log`, `amgcl_disp.log`,
 `amgcl_rbm.log`.
+
+---
+
+## 14. Phase 3, Lead 3 step 3 — feasibility-grade `blockamg` delivered
+
+The field-split block-AMG solver is built end-to-end on the AMGCL backend, as chosen. It is registered
+as `linsolver=blockamg` and is a normal `(A, b) -> x` solver requiring a config file that names the
+field block sizes (the block structure cannot be inferred from the matrix; the nonlinear solver logs
+the sizes at equation-system build).
+
+**Delivered (commits `a518fb92`, `37026172`, `32de9639`, `99af48c8`, plus the coord-dump enabler
+`0c72bfa3`):**
+
+- **`build` / `applyPreconditioner` on the AMGCL wrapper** (`a518fb92`): build the AMG hierarchy once,
+  apply one V-cycle many times — the primitive an inner block preconditioner needs (the existing
+  `solve` rebuilds every call). Mirrors PARDISO's `factorize`/`solveFactorized`.
+- **`edelweissfe/linsolve/blockamg/`** (`37026172`): per solve — symmetric diagonal equilibration,
+  split into field diagonal blocks + couplings, one AMGCL hierarchy per field (elasticity fields get
+  their rigid-body translations as the near null-space from the DOF layout; scalar fields the default
+  constant), block Gauss–Seidel preconditioning an outer GMRES.
+- **Docs + a registered test** (`32de9639`, `99af48c8`): a single-field elasticity cantilever solved
+  through the Newton loop with `blockamg` (skipped where AMGCL is not built).
+
+**Measured:**
+
+- *Offline*, the dumped 280k-dof coupled system: **68 outer GMRES iterations** (symmetric block-GS,
+  `outerTol` 1e-4) to a solution matching the direct solve to **4e-4**. Better than the pyamg
+  prototype's ~100 — the double-smoothed displacement AMG + Chebyshev damage + symmetric block-GS
+  combination is effective.
+- *Live*, the real pryout model, step 2 with `linsolver=blockamg` at `outerTol` 1e-6: the first
+  step-2 solve converges in **115 outer iterations** to 1.85e-6, and the Newton loop consumes the
+  correction and converges the increment. (Full-run confirmation of the Newton path is the last
+  check.)
+
+**What it is and is not.** It converges the coupled system with **O(n) memory** — the route to sizes
+past the direct-solver wall (~1M+ dof), which was the *feasibility* half of the goal. It is **not**
+fast at 280k dof (~50 s/solve serial-outer vs ~12 s direct) and its ~100-iteration count reflects
+AMGCL's smoothed aggregation not converging tightly on the ~52% non-symmetric condensed displacement
+block. The count would drop with a nonsymmetric-aware elasticity AMG (Trilinos/MueLu) or a stronger
+smoother; the field-split machinery, the equilibration, and the DOF-layout null-space are all reusable
+if that backend is ever swapped in.
+
+**Not done (future):** the field sizes come from a config file; a production version would take them
+(and, for rotations, nodal coordinates — `EDELWEISS_DUMP_COORDS` shows the path) from the DofManager
+through a widened linsolver interface. And a parallel outer Krylov (AMGCL's own, or a threaded matvec)
+would cut the serial GMRES overhead.
