@@ -79,9 +79,9 @@ from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolve
 
 _DEFAULT_VECTOR_PRECOND = {
     "coarsening": {"type": "smoothed_aggregation", "aggr": {"eps_strong": 0.01}},
-    "relax": {"type": "chebyshev", "degree": 8, "power_iters": 50, "lower": 0.01},
-    "npre": 2,
-    "npost": 2,
+    "relax": {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01},
+    "npre": 1,
+    "npost": 1,
 }
 _DEFAULT_SCALAR_PRECOND = {
     "coarsening": {"type": "smoothed_aggregation"},
