@@ -80,11 +80,20 @@ The refactorization policy, all knobs configurable (see :func:`createSolver`):
    precondition), once ``maxReuse`` reuses have accumulated (bounded staleness), or when the previous
    reuse failed to reach its forcing tolerance within the Krylov budget.
 #. Otherwise reuse the standing factorization as a GMRES preconditioner, with the Eisenstat--Walker
-   forcing tolerance for this iterate.
+   forcing tolerance for this iterate, capped at a Krylov budget just above the break-even so a stale
+   reuse bails to a direct solve rather than grinding.
 
 A fresh factorization is a perfect preconditioner in exact arithmetic, so the solve right after one
 converges in ~1 GMRES iteration regardless of the forcing tolerance; the forcing sequence therefore
 only governs the reuse solves, which is where it belongs.
+
+In state-flipping phases (contact/damage settling) the Jacobian moves so much per iteration that a
+lagged factorization is intrinsically a poor preconditioner -- reuse there is a losing bet no matter
+how it is tuned, and the honest thing is to solve directly, as the direct baseline does. A probe
+backoff detects such phases from the reuse cost (an expensive-but-converged or bailed reuse) and
+inserts a geometrically growing run of direct solves before probing reuse again, resetting the moment
+a probe converges cheaply. Easy phases therefore reuse on every iterate; hard phases degrade
+gracefully to the direct baseline with only occasional probe overhead.
 """
 
 import numpy as np
@@ -149,16 +158,27 @@ class InexactNewtonSolver:
     ewGamma, ewAlpha
         The Eisenstat--Walker "choice 2" parameters: ``eta_k = gamma * (||b_k|| / ||b_{k-1}||) **
         alpha``. Defaults ``gamma = 0.9``, ``alpha = (1 + sqrt 5) / 2`` are the classic values.
-    gmresRestart
-        The GMRES Krylov subspace dimension between restarts.
-    gmresMaxOuter
-        The maximum number of GMRES restart cycles, so at most ``gmresRestart * gmresMaxOuter`` matrix
-        applies before a solve is declared not converged (and the factorization refreshed).
+    gmresRestart, gmresMaxOuter
+        The GMRES Krylov subspace dimension between restarts, and the maximum number of restart
+        cycles. Their product caps the matrix applies before a reuse is declared not converged and
+        falls back to a direct solve. The break-even against a direct solve is roughly
+        ``(reorder + factorization time) / (one back-substitution time)`` -- about 22 iterations on the
+        reference condensed system (~15 s of factorization at ~0.7 s per apply) -- so the default cap
+        (25) sits just above it, and a reuse never costs meaningfully more than a direct solve before
+        bailing. On a problem whose factorization is cheaper relative to a back-substitution, lower it.
     staleIterationThreshold
-        If a reuse solve needs more GMRES iterations than this to converge, the factorization is
-        refreshed on the next solve. Defaults to the measured break-even against the direct solve.
+        A reuse solve needing more GMRES iterations than this (but still converging) marks the region
+        as hardening: the factorization is refreshed next iterate and the probe backoff grows. Set a
+        little below the break-even so backoff engages before reuse actually starts losing.
+    cheapIterationThreshold
+        A reuse solve converging within this many iterations marks the region as easy and resets the
+        probe backoff, so easy phases reuse on every iterate.
+    maxProbeBackoff
+        The ceiling on the direct-solve run inserted between reuse probes in a persistently hard
+        region, bounding the probe overhead there to roughly one probe per ``maxProbeBackoff`` direct
+        solves.
     verbose
-        If True, print one line per solve (refactorize?, forcing tolerance, iteration count) -- useful
+        If True, print one line per solve (mode, forcing tolerance, iteration count, backoff) -- useful
         for reading the nonlinear cost of the forcing sequence off a real run.
     """
 
@@ -172,9 +192,11 @@ class InexactNewtonSolver:
         etaMax: float = 1.0e-3,
         ewGamma: float = 0.9,
         ewAlpha: float = 1.618033988749895,
-        gmresRestart: int = 50,
-        gmresMaxOuter: int = 4,
-        staleIterationThreshold: int = 15,
+        gmresRestart: int = 25,
+        gmresMaxOuter: int = 1,
+        staleIterationThreshold: int = 20,
+        cheapIterationThreshold: int = 10,
+        maxProbeBackoff: int = 8,
         verbose: bool = False,
     ):
         self._delegate = delegate
@@ -187,6 +209,8 @@ class InexactNewtonSolver:
         self._gmresRestart = gmresRestart
         self._gmresMaxOuter = gmresMaxOuter
         self._staleIterationThreshold = staleIterationThreshold
+        self._cheapIterationThreshold = cheapIterationThreshold
+        self._maxProbeBackoff = maxProbeBackoff
         self._verbose = verbose
 
         self._hasFactorization = False
@@ -196,6 +220,16 @@ class InexactNewtonSolver:
         # Set when the *next* solve must refactorize: after a new-increment refactorization (its first
         # correction is the largest and preconditions worst), or after a reuse solve that under-performed.
         self._refactorizeNext = False
+        # Probe backoff: in a state-flipping region (contact/damage settling) the Jacobian changes so
+        # much per iteration that a lagged factorization is intrinsically a poor preconditioner and no
+        # reuse is worth attempting -- the honest thing is to solve directly, exactly as the direct
+        # baseline does. Rather than pay a stale GMRES burst on every such iterate, once reuse turns
+        # expensive we solve directly for a growing run of iterates (``_probeBackoff``) before probing
+        # reuse again, doubling the run each time reuse is still expensive (``_staleStreak``) and
+        # resetting the moment a probe converges cheaply. Easy regions therefore reuse on every
+        # iterate; hard regions degrade gracefully to the direct baseline with only occasional probes.
+        self._probeBackoff = 0
+        self._staleStreak = 0
 
     def _forcingTolerance(self, residualNorm: float) -> float:
         """The Eisenstat--Walker "choice 2" forcing tolerance for a reuse solve, clamped and safeguarded.
@@ -239,69 +273,89 @@ class InexactNewtonSolver:
         newIncrement = (
             self._lastResidualNorm is not None and residualNorm > self._residualGrowthFactor * self._lastResidualNorm
         )
-        refactorize = (
-            not self._hasFactorization or self._reuseCount >= self._maxReuse or newIncrement or self._refactorizeNext
+        # Solve directly (fresh exact factorization) rather than reuse when there is nothing to reuse
+        # yet, staleness is at its ceiling, a new increment / cutback just began, the previous solve
+        # asked for it, or we are backing off from a hard region.
+        backingOff = self._probeBackoff > 0
+        forceDirect = (
+            not self._hasFactorization
+            or self._reuseCount >= self._maxReuse
+            or newIncrement
+            or self._refactorizeNext
+            or backingOff
         )
         self._refactorizeNext = False
 
-        if refactorize:
-            self._delegate.factorize(A)
-            self._hasFactorization = True
-            self._reuseCount = 0
-            # Keep the large first correction after a state change direct as well: that iterate
-            # preconditions worst of all (measured), so reusing this fresh factorization for it would
-            # cost a long GMRES burst.
-            if newIncrement:
-                self._refactorizeNext = True
-            # A fresh factorization is a near-perfect preconditioner, so any tolerance converges in ~1
-            # iteration; ask for the loosest so nothing is wasted overshooting it.
-            eta = self._etaMax
-        else:
-            eta = self._forcingTolerance(residualNorm)
-
-        preconditioner = LinearOperator(A.shape, matvec=self._delegate.solveFactorized, dtype=A.dtype)
-
-        history = []
-        x, info = gmres(
-            A,
-            b,
-            M=preconditioner,
-            rtol=eta,
-            atol=0.0,
-            restart=self._gmresRestart,
-            maxiter=self._gmresMaxOuter,
-            callback=history.append,
-            callback_type="pr_norm",
-        )
-        iterations = len(history)
-
-        if info != 0:
-            # The standing factorization was too stale to reach the forcing tolerance within the
-            # Krylov budget: refresh it and solve exactly. Costs one wasted GMRES burst, but this is
-            # the safety net, not the common path (the proactive rules above pre-empt most staleness).
+        if forceDirect:
+            # Solve directly: a fresh factorization is an exact inverse, so wrapping it in GMRES would
+            # only add one redundant preconditioner apply. Skip the Krylov layer entirely.
             self._delegate.factorize(A)
             self._hasFactorization = True
             self._reuseCount = 1
+            if backingOff:
+                self._probeBackoff -= 1
+            # A new increment (or cutback) is a fresh chance for reuse -- clear any backoff carried in
+            # from the previous increment's hard phase, but keep the large first correction after the
+            # state change direct too (it preconditions worst of all).
+            if newIncrement:
+                self._refactorizeNext = True
+                self._staleStreak = 0
+                self._probeBackoff = 0
             x = self._delegate.solveFactorized(b)
             iterations = 0
-            eta = 0.0
+            eta = self._etaMax
+            bailed = False
         else:
-            self._reuseCount += 1
-            self._lastEta = eta
-            if not refactorize and iterations > self._staleIterationThreshold:
-                # Converged, but only just: refresh next time before it stops converging.
-                self._refactorizeNext = True
+            eta = self._forcingTolerance(residualNorm)
+            preconditioner = LinearOperator(A.shape, matvec=self._delegate.solveFactorized, dtype=A.dtype)
+            history = []
+            x, info = gmres(
+                A,
+                b,
+                M=preconditioner,
+                rtol=eta,
+                atol=0.0,
+                restart=self._gmresRestart,
+                maxiter=self._gmresMaxOuter,
+                callback=history.append,
+                callback_type="pr_norm",
+            )
+            iterations = len(history)
+            bailed = info != 0
+
+            if bailed:
+                # Too stale to reach the forcing tolerance within the capped Krylov budget (a cap set
+                # just above the break-even, so the wasted burst stays below a direct solve): refresh
+                # and solve exactly, then back off probing so this does not recur.
+                self._delegate.factorize(A)
+                self._hasFactorization = True
+                self._reuseCount = 1
+                x = self._delegate.solveFactorized(b)
+                eta = 0.0
+                self._staleStreak += 1
+                self._probeBackoff = min(self._maxProbeBackoff, 2**self._staleStreak)
+            else:
+                self._reuseCount += 1
+                self._lastEta = eta
+                # Grade the probe against the measured break-even. A cheap reuse says the region is
+                # easy -- keep reusing every iterate. An expensive-but-converged one still won against a
+                # direct solve, but signals the region is hardening -- back off, doubling the direct run
+                # each time reuse stays expensive.
+                if iterations <= self._cheapIterationThreshold:
+                    self._staleStreak = 0
+                    self._probeBackoff = 0
+                elif iterations > self._staleIterationThreshold:
+                    self._refactorizeNext = True
+                    self._staleStreak += 1
+                    self._probeBackoff = min(self._maxProbeBackoff, 2**self._staleStreak)
 
         self._lastResidualNorm = residualNorm
 
         if self._verbose:
+            mode = "BAIL->direct" if bailed else ("REFACTORIZE " if forceDirect else "reuse       ")
             print(
-                "inexactnewton: |b|={:.3e} {:} eta={:.1e} gmres_iters={:} reuse={:}".format(
-                    residualNorm,
-                    "REFACTORIZE" if refactorize else "reuse     ",
-                    eta,
-                    iterations,
-                    self._reuseCount,
+                "inexactnewton: |b|={:.3e} {:} eta={:.1e} gmres_iters={:} reuse={:} backoff={:}".format(
+                    residualNorm, mode, eta, iterations, self._reuseCount, self._probeBackoff
                 ),
                 flush=True,
             )

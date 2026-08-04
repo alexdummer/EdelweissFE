@@ -110,15 +110,18 @@ All configuration keys are optional; the defaults are a turnkey configuration (t
     * - ``ewGamma`` / ``ewAlpha``
       - ``0.9`` / ``1.618…``
       - Eisenstat–Walker "choice 2" parameters, ``eta_k = ewGamma * (||b_k|| / ||b_{k-1}||) ** ewAlpha``.
-    * - ``gmresRestart``
-      - ``50``
-      - GMRES Krylov subspace dimension between restarts.
-    * - ``gmresMaxOuter``
-      - ``4``
-      - Maximum GMRES restart cycles before a solve is declared not converged (and the factorization refreshed).
+    * - ``gmresRestart`` / ``gmresMaxOuter``
+      - ``25`` / ``1``
+      - GMRES Krylov dimension between restarts and maximum restart cycles; their product caps the iterations before a reuse falls back to a direct solve (default cap 25, just above the ~22-iteration break-even of the reference condensed system).
     * - ``staleIterationThreshold``
-      - ``15``
-      - A reuse solve needing more GMRES iterations than this triggers a refresh on the next solve.
+      - ``20``
+      - A reuse converging in more iterations than this marks the region as hardening: refresh next iterate and grow the probe backoff. Set a little below the break-even.
+    * - ``cheapIterationThreshold``
+      - ``10``
+      - A reuse converging within this many iterations marks the region as easy and resets the probe backoff.
+    * - ``maxProbeBackoff``
+      - ``8``
+      - Ceiling on the direct-solve run inserted between reuse probes in a persistently hard region.
     * - ``verbose``
       - ``false``
       - Print one line per solve (refactorize?, forcing tolerance, iteration count).
