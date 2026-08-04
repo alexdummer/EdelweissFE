@@ -50,6 +50,9 @@ Choose a linsolver after the ``*solver`` keyword:
     * - ``inexactnewton``
       - ✗
       - ``edelweissfe.linsolve.inexactnewton.inexactnewton``
+    * - ``blockamg``
+      - ✗
+      - ``edelweissfe.linsolve.blockamg.blockamg``
     * - ``matrixdump``
       - —
       - ``edelweissfe.linsolve.matrixdump.matrixdump``
@@ -135,6 +138,39 @@ Example configuration selecting the SuperLU delegate for a dependency-free run:
         "etaMax": 1e-3,
         "maxReuse": 8
     }
+
+
+The ``blockamg`` solver
+-----------------------
+
+``blockamg`` is a field-split block-AMG solver for **large coupled multi-field systems** (e.g. displacement + gradient-enhanced damage). It is the O(n)-memory route to problem sizes a direct factorization cannot reach — past roughly a million DOFs its fill-in exceeds memory, whereas algebraic multigrid stays linear.
+
+Applied *monolithically*, AMG is ineffective on such a coupled system (a single hierarchy cannot represent the disparate fields at once). ``blockamg`` instead builds **one AMG hierarchy per field** (AMGCL) and combines them with a **block Gauss–Seidel** sweep to precondition an outer GMRES, following Alkmim et al. (IJNME 2026). Per solve it equilibrates the system (symmetric diagonal scaling, to tame the large dynamic range), splits it into field blocks, gives each elasticity field its rigid-body **translations** as the AMG near null-space (from the DOF layout — node-major, ``components`` per node), and preconditions GMRES with the block sweep.
+
+The block structure cannot be inferred from the matrix, so a ``linsolverConfigFile`` is **required** and must list the field block sizes. These are contiguous and field-major in the DOF vector, and the nonlinear solver logs them at equation-system build ("field '...': N dofs, [a, b)"). Requires the optional ``amgcl`` extension.
+
+.. code-block:: edelweiss
+
+    *solver, solver=NIST, name=theSolver
+    linsolver=blockamg
+    linsolverConfigFile=blockamg.json
+
+.. code-block:: json
+
+    {
+        "fields": [
+            { "size": 214659, "elasticity": true, "components": 3 },
+            { "size": 65496 }
+        ],
+        "outerTol": 1e-6,
+        "sweeps": 1,
+        "symmetric": true
+    }
+
+Recognised keys: ``fields`` (required; each with ``size``, and optionally ``elasticity``, ``components``, and a ``precond`` AMGCL parameter tree overriding that block's default), ``outerTol`` / ``outerRestart`` / ``outerMaxiter`` (the outer GMRES), ``sweeps`` and ``symmetric`` (the block Gauss–Seidel), and ``verbose``.
+
+.. note::
+   This is a *feasibility-grade* solver: on the reference model AMGCL's smoothed aggregation converges on the coupled system (~68 outer iterations with symmetric block Gauss–Seidel) but not tightly on the non-symmetric, condensed displacement block, so the count is O(100) rather than the O(30) a nonsymmetric-aware AMG (e.g. Trilinos/MueLu) would give. It is the right tool where the goal is to *fit in memory* at sizes a direct solver cannot, not to be fastest at moderate sizes.
 
 
 The ``amgcl`` solver
