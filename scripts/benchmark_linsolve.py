@@ -314,6 +314,14 @@ def commandLagged(args):
     records = loadManifest(args.dumpDir)
     systems = [loadSystem(args.dumpDir, record) for record in records]
 
+    print(
+        "MKL threads: {:} (OMP_NUM_THREADS={:}, MKL_NUM_THREADS={:})\n".format(
+            os.environ.get("MKL_NUM_THREADS") or os.environ.get("OMP_NUM_THREADS", "(unset)"),
+            os.environ.get("OMP_NUM_THREADS", "(unset)"),
+            os.environ.get("MKL_NUM_THREADS", "(unset)"),
+        )
+    )
+
     baseRecord, (baseMatrix, _) = records[0], systems[0]
     print(
         "factorizing the base system (instance {:}, ordinal {:}) with {:} ...".format(
@@ -335,8 +343,49 @@ def commandLagged(args):
 
     preconditioner = spla.LinearOperator(baseMatrix.shape, matvec=applyInverse, dtype=baseMatrix.dtype)
 
+    # Which parts of a GMRES iteration are actually threaded is the first thing anyone will ask of a
+    # verdict against the iterative route, so measure the pieces rather than inferring them. The
+    # preconditioner apply is MKL-threaded; SciPy's CSR matvec and the orthogonalization are not.
+    probe = np.ones(baseMatrix.shape[0])
+
+    start = perf_counter()
+    for _ in range(args.probeRepeats):
+        applyInverse(probe)
+    applyTime = (perf_counter() - start) / args.probeRepeats
+
+    start = perf_counter()
+    for _ in range(args.probeRepeats):
+        baseMatrix @ probe
+    matvecTime = (perf_counter() - start) / args.probeRepeats
+
+    print(
+        "per-iteration cost floor: preconditioner apply {:.3f} s (MKL-threaded)"
+        " + matvec {:.3f} s (SciPy, serial) = {:.3f} s\n".format(applyTime, matvecTime, applyTime + matvecTime)
+    )
+
+    # The thing the iterative route has to beat, measured in this same process rather than quoted
+    # from a different run. Reuse is on so this is the *post-fix* direct solve -- the fair target,
+    # since a fixed pattern is assumed to be in place before any of this would be considered.
+    from edelweissfe.linsolve.pardiso.pardiso import PardisoSolver
+
+    referenceSolver = PardisoSolver(reuseSymbolicFactorization=True)
+    referenceSolver(baseMatrix, systems[0][1])  # absorb the one-off analyze
+    start = perf_counter()
+    referenceSolver(baseMatrix, systems[0][1])
+    directTime = perf_counter() - start
+    print(
+        "reference: one direct solve with a reused symbolic factorization takes {:.3f} s"
+        " -- so GMRES pays off only below ~{:.0f} iterations\n".format(
+            directTime, directTime / max(applyTime + matvecTime, 1.0e-12)
+        )
+    )
+
     print("GMRES preconditioned by the base factorization, rtol={:}, maxiter={:}".format(args.rtol, args.maxiter))
-    print("{:>4} {:>10} {:>8} {:>12} {:>14}".format("ord", "staleness", "iters", "converged", "rel. residual"))
+    print(
+        "{:>4} {:>10} {:>8} {:>12} {:>14} {:>12}".format(
+            "ord", "staleness", "iters", "converged", "rel. residual", "wall time"
+        )
+    )
 
     for offset, (record, (A, b)) in enumerate(zip(records, systems)):
         iterationCount = 0
@@ -345,6 +394,7 @@ def commandLagged(args):
             nonlocal iterationCount
             iterationCount += 1
 
+        start = perf_counter()
         x, info = spla.gmres(
             A,
             b,
@@ -356,15 +406,17 @@ def commandLagged(args):
             callback=countIteration,
             callback_type="pr_norm",
         )
+        elapsed = perf_counter() - start
 
         residual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1.0e-300)
         print(
-            "{:>4} {:>10} {:>8} {:>12} {:>14.3e}".format(
+            "{:>4} {:>10} {:>8} {:>12} {:>14.3e} {:>10.2f} s".format(
                 record["ordinal"],
                 offset,
                 iterationCount,
                 "yes" if info == 0 else "NO (info={:})".format(info),
                 residual,
+                elapsed,
             )
         )
 
@@ -401,6 +453,7 @@ def main():
         default="pardiso",
         help="which LU factorizes the base system; same iteration counts, wildly different setup cost",
     )
+    laggedParser.add_argument("--probeRepeats", type=int, default=5)
     laggedParser.add_argument("--maxiter", type=int, default=200)
     laggedParser.add_argument("--restart", type=int, default=50)
     laggedParser.add_argument("--rtol", type=float, default=1.0e-8)
