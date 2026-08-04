@@ -380,19 +380,46 @@ def commandLagged(args):
         )
     )
 
-    print("GMRES preconditioned by the base factorization, rtol={:}, maxiter={:}".format(args.rtol, args.maxiter))
-    print(
-        "{:>4} {:>10} {:>8} {:>12} {:>14} {:>12}".format(
-            "ord", "staleness", "iters", "converged", "rel. residual", "wall time"
+    # How far the preconditioned operator actually sits from the identity. This is the quantity that
+    # governs the iteration count -- NOT the norm-wise difference between the matrices, which on a
+    # system with this dynamic range (||diag|| ~ 1e8 against residuals of order 1) is dominated by the
+    # large entries and says nothing about the stiff directions. Estimated from below by applying
+    # E = A_base^-1 (A_k - A_base) to random unit vectors, which needs only a matvec.
+    rng = np.random.default_rng(0)
+    print("distance of the preconditioned operator from the identity, ||A_base^-1 (A_k - A_base)||:")
+    for record, (A, _) in list(zip(records, systems))[1:4]:
+        delta = A - baseMatrix
+        amplification = 0.0
+        for _ in range(args.probeRepeats):
+            v = rng.standard_normal(baseMatrix.shape[0])
+            v /= np.linalg.norm(v)
+            amplification = max(amplification, np.linalg.norm(applyInverse(delta @ v)))
+        print(
+            "  ord {:>3}: >= {:10.3e}   (while ||A_k - A_base||_F / ||A_base||_F = {:9.3e})".format(
+                record["ordinal"],
+                amplification,
+                np.linalg.norm(delta.data) / np.linalg.norm(baseMatrix.data),
+            )
         )
+    print()
+
+    # Iterations to reach a range of tolerances, from one run each. A Newton step does not need the
+    # linear system solved to 1e-8: an inexact-Newton (Eisenstat-Walker) scheme would ask for 1e-2 to
+    # 1e-4 early on and tighten only near convergence. Reporting a single tight-tolerance count would
+    # benchmark the iterative route against a target it never has to hit.
+    tolerances = [1.0e-2, 1.0e-4, 1.0e-6, 1.0e-8]
+
+    print("GMRES preconditioned by the base factorization, restart={:}, maxiter={:}".format(args.restart, args.maxiter))
+    print(
+        "{:>4} {:>10} {:>32} {:>12} {:>12}".format("ord", "staleness", "iterations to reach rtol", "total", "wall time")
     )
+    print("{:>4} {:>10} {:>8} {:>7} {:>7} {:>8} {:>12} {:>12}".format("", "", "1e-2", "1e-4", "1e-6", "1e-8", "", ""))
 
     for offset, (record, (A, b)) in enumerate(zip(records, systems)):
-        iterationCount = 0
+        history = []
 
-        def countIteration(_):
-            nonlocal iterationCount
-            iterationCount += 1
+        def recordResidual(residualNorm):
+            history.append(residualNorm)
 
         start = perf_counter()
         x, info = spla.gmres(
@@ -403,19 +430,23 @@ def commandLagged(args):
             atol=0.0,
             restart=args.restart,
             maxiter=args.maxiter,
-            callback=countIteration,
+            callback=recordResidual,
             callback_type="pr_norm",
         )
         elapsed = perf_counter() - start
 
-        residual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1.0e-300)
+        def itersToReach(tolerance):
+            for iteration, residualNorm in enumerate(history, start=1):
+                if residualNorm <= tolerance:
+                    return str(iteration)
+            return "-"
+
         print(
-            "{:>4} {:>10} {:>8} {:>12} {:>14.3e} {:>10.2f} s".format(
+            "{:>4} {:>10} {:>8} {:>7} {:>7} {:>8} {:>12} {:>10.2f} s".format(
                 record["ordinal"],
                 offset,
-                iterationCount,
-                "yes" if info == 0 else "NO (info={:})".format(info),
-                residual,
+                *[itersToReach(tolerance) for tolerance in tolerances],
+                "{:} ({:})".format(len(history), "ok" if info == 0 else "info={:}".format(info)),
                 elapsed,
             )
         )
