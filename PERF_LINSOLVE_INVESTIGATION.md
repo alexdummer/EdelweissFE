@@ -15,8 +15,13 @@ has begun. Two cheap leads are now measured on the real model:**
 - **Lead 3 step 2** ([§12](#12-phase-3-lead-3-step-2--block-amg-is-feasible)): the block preconditioner
   (AMG per field inside block Gauss–Seidel) **converges** — 93–117 GMRES iterations where monolithic
   stalls. **Feasibility for the 1M+ goal is proven.** The count is bottlenecked by per-field AMG
-  quality (not the coupling), so the production build (a parallel AMG + block driver + the 6 RBMs,
-  which need nodal coordinates) is substantial but no longer a research risk.
+  quality (not the coupling).
+- **Lead 3 step 3, started** ([§13](#13-phase-3-lead-3-step-3-started--the-amgcl-backend-hits-the-displacement-block)):
+  backend = AMGCL (chosen). Coordinate-dump enabler committed. But AMGCL's SA-AMG **caps at ~120
+  iterations on the displacement block** and the **6 RBMs do not help** — the ~52% non-symmetric
+  condensed elasticity operator defeats it. AMGCL gives a *feasibility-grade* block solver (converges,
+  O(n) memory) but not an *efficient* one; efficient needs MueLu/Trilinos. **Backend decision now
+  pending.**
 
 Two measured leads plus one untested-but-not-excluded route; see
 [§4](#4-recommendation), which ends with a suggested order of work. One open question blocks part of
@@ -662,3 +667,53 @@ a deliberate decision, not a quick add.
 Reproduce: on xeon, in the profile dir, `OMP_NUM_THREADS=16 python
 ~/constitutive_modeling/next_v2611/EdelweissFE/scripts/block_amg_prototype.py linsolveDumps`. Log:
 `block_amg.log`.
+
+---
+
+## 13. Phase 3, Lead 3 step 3 (started) — the AMGCL backend hits the displacement block
+
+Chosen backend: AMGCL (Matthias, this session). Before building the block-solver infrastructure, two
+offline probes on the dumped blocks asked whether AMGCL can build a *good* per-field hierarchy — the
+whole scheme's convergence rides on it.
+
+**Enabler committed (`0c72bfa3`):** `EDELWEISS_DUMP_COORDS=<dir>` makes the solver dump per-field
+nodal coordinates aligned with the DOF vector (the MPC transform is size-preserving, so the condensed
+system keeps the DofManager ordering — a clean 1:1 map, no re-indexing). Verified to match a dumped
+280k-dof system exactly (displacement 71553 nodes → `[0, 214659)`). This is the geometry a
+geometry-aware preconditioner needs; the interface-widening for a *production* solver is still to do,
+but the offline path is unblocked.
+
+**Result — the damage block is easy, the displacement block is the wall:**
+
+| block | best AMGCL (scaled) | near null-space |
+|---|---|---|
+| damage (scalar) | **18 iters** (SA + chebyshev) | constant |
+| displacement (elasticity) | **121 iters** (SA + GS, 2 sweeps) | translations *or* 6 RBMs — **no difference** |
+
+- Most smoothers *diverge* on the displacement block (chebyshev → 0.26–0.62, ilu0/iluk → 3.4/NaN);
+  only Gauss–Seidel converges, and only at ~120–210 iterations. `aggr.block_size=3` did not help.
+- **The full 6 rigid body modes give no improvement over 3 translations** (121 → 121, 140 → 129). So
+  the near-null-space is *not* the missing ingredient here — the obstacle is the operator itself:
+  the condensed displacement block is ~52% structurally non-symmetric (finite strain + contact + tie
+  condensation), and AMGCL's runtime smoothed aggregation (a symmetric-operator method) cannot build
+  a strong hierarchy on it, RBMs or not.
+
+**Verdict.** Block AMG is *feasible* (step 2, §12) — but on **AMGCL** the displacement-field AMG caps
+at ~120 iterations regardless of the near-null-space, so an AMGCL block solver would be
+*feasibility-grade* (converges, O(n) memory → unlocks 1M+ where direct can't fit) but **not
+efficient**. Reaching the ~20–40 iters the literature shows needs the sophisticated elasticity AMG
+that **MueLu/Trilinos** provides (nonsymmetric-aware aggregation, elasticity-tuned smoothers) — the
+stack Alkmim et al. actually used. This is the evidence that decides the backend, and it argues
+against AMGCL for the displacement block.
+
+Open decision (for Matthias): (a) build the AMGCL block solver anyway as feasibility-grade for the
+1M+ goal (~120 iters, accept it), (b) switch the backend to Trilinos/MueLu (heavy dependency, but the
+proven path to good convergence on this operator class), or (c) stop the AMG line here with
+feasibility proven and the backend obstacle documented.
+
+Reproduce: on xeon, in the profile dir — coordinates via
+`EDELWEISS_DUMP_COORDS=coorddump edelweissfe profile.inp` (grab `coorddump/coordinates.npz` once the
+displacement field reaches 71553 nodes); per-block quality via `python
+~/constitutive_modeling/next_v2611/EdelweissFE/scripts/... ` prototypes (`amgcl_perblock.py`,
+`amgcl_disp.py`, `amgcl_rbm.py` in the profile dir). Logs: `amgcl_perblock.log`, `amgcl_disp.log`,
+`amgcl_rbm.log`.
