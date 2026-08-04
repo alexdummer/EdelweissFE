@@ -42,11 +42,20 @@ has begun. Two cheap leads are now measured on the real model:**
   (chebyshev degree=5, npre=npost=1, needing *more* outer iterations) cuts real wall-clock by
   **~23%** across all 9 dumped ords despite a looser (but still acceptable) true residual. Default
   updated again; offline-only so far, live re-validation still owed.
-- **Phase 4 is planned but not started** ([§19](#19-phase-4-plan--wall-clock-to-parity-and-beyond)):
-  the AMGCL apply path is verified threaded (so the dominant 68% smoother cost is bandwidth-bound,
-  not thread-starved), and the prioritized plan is: live validation gate → D3 (Eisenstat–Walker
-  forcing + lagged hierarchy) → D2 (mixed-precision `builtin<float>` hierarchy) → smoother
-  micro-sweep → B3 as stretch. D1 and rotational RBMs are explicitly deprioritized.
+- **Phase 4 executed** ([§19](#19-phase-4-plan--wall-clock-to-parity-and-beyond), see its summary
+  subsection): the gate passed — the shipped default is at **live PARDISO parity** (82.4 s vs
+  83.9 s whole-job) — but both big levers failed their safety bars and stayed opt-in: EW forcing
+  is **~1.56× offline** yet changed the live Newton *trajectory* (§19.2); mixed precision measured
+  **~1.03×** because iteration inflation ate the bandwidth saving, and CSR *index* traffic (which
+  float cannot shrink) turned out to be a large share of hierarchy bandwidth (§19.3). Hierarchy
+  reuse shipped but is provably inert here (the pattern churns every iteration). The shipped
+  default's behaviour is unchanged.
+- **Phase 5 is planned, not started** ([§20](#20-phase-5-plan--b3-first-then-the-ew-rescue-experiment-on-the-final-setup)):
+  Part 1 = **B3, the block-valued backend**, promoted by §19.3's index-bandwidth finding from
+  stretch goal to the strongest remaining wall-clock lever — it settles the final solver
+  configuration. Part 2 = the **EW rescue** (true-residual outer stopping, then an `etaMax` ladder
+  starting at 1e-4), deliberately run only against that final setup. Ordering is an explicit
+  decision (Matthias). D4 (the ≥1M-dof demonstration) is the phase after.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -1691,3 +1700,151 @@ blockamg's O(n) memory becomes a structural advantage rather than an incremental
 - Commit per change with conventional-commit messages, as the branch has been doing; nothing is
   pushed to `mn` yet (22 local commits on `d83728ba`), and pushing remains a deliberate decision
   (§15).
+
+---
+
+## 20. Phase 5 plan — B3 first, then the EW rescue experiment on the final setup
+
+Planned (this session), not started. Two independent parts, **executed in this order by explicit
+decision (Matthias):** Part 1 (B3, the block-valued backend) settles the final solver configuration
+first; Part 2 (the Eisenstat–Walker rescue) is deliberately deferred until that final setup exists,
+because forcing behaviour interacts with preconditioner quality — validating EW against a
+configuration that is about to change would have to be redone anyway.
+
+Context entering this phase (§19 summary): the shipped `blockamg` default is at live PARDISO parity
+(82.4 s vs 83.9 s whole-job, §19.1); EW forcing is a measured ~1.56× offline but opt-in only, gated
+on a live Newton-trajectory change (§19.2); mixed precision measured ~1.03× — iteration inflation ate
+the bandwidth saving, and the level-0 memory saving was only ~25% because **CSR index arrays, not
+values, are a large share of hierarchy bandwidth** (§19.3). That last finding is what promotes B3
+from stretch goal to the strongest remaining wall-clock lever: block-CSR storage cuts index traffic
+by ~(block_size)² and makes the smoothers block-aware, attacking exactly the term that capped §19.3.
+
+### 20.1 Part 1 — B3: the block-valued AMGCL backend (~1 day)
+
+**Goal.** A `static_matrix<double,B,B>` builtin backend for the per-field hierarchies, B ∈ {2, 3}
+(the pryout's displacement field is 3D; the registered `CantileverBeamQuad4BlockAMG` test is 2D —
+implement both instantiations, they are one template apart). Expected gains, in order of confidence:
+(i) per-iteration bandwidth — block CSR stores one column index per 3×3 block instead of nine;
+(ii) block-aware smoothers — GS/ILU0 invert the nodal 3×3 couplings exactly, which is AMGCL's own
+canonical elasticity recipe and §16's reason to expect ILU-class smoothers to stop diverging;
+(iii) possibly fewer outer iterations.
+
+**Implementation (edit here, build/measure on xeon):**
+
+1. **Wrapper** (`edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp` / `.pxd` / `.pyx`): the wrapper is
+   already templated on the backend value type since §19.3 (`LinearSolverT<ValueType>`,
+   double/float). Add `static_matrix<double,2,2>` and `static_matrix<double,3,3>` instantiations,
+   selected by `"backendBlockSize": 1|2|3` in the params dict (default 1, existing behaviour;
+   composes with `"backendPrecision"` in principle, but see the sweep — float-block is a follow-up
+   column, not the first target). The scalar CSR from Python is adapted with
+   `amgcl::adapter::block_matrix<value_type>(...)` at `build()`/`solve()`; RHS/solution stay
+   `double*` at the Cython boundary and are reinterpreted to block vectors internally
+   (`amgcl::backend::reinterpret_as_rhs` — the pattern from AMGCL's own structural-problem
+   tutorial). Preconditions to assert, not assume: n divisible by blockSize, and node-major DOF
+   ordering (true for the displacement field: node-major, 3 components/node, §4).
+2. **`set_nullspace` is incompatible with block value types** (§16, confirmed AMGCL limitation).
+   The wrapper must raise a clear error if both are requested; `blockamg.py` must skip
+   `set_nullspace` when it selects a block backend. This is a measured non-loss: RBMs/translations
+   do not help on this operator (§11, §13), and the near-null-space wins of §17 (`eps_strong`,
+   chebyshev bounds) are orthogonal to it.
+3. **`blockamg.py`**: keep the block backend **opt-in via `fieldPreconds` for the whole offline
+   phase** — the default only changes after the full validation chain below. A vector field of
+   dimension d maps to `backendBlockSize: d`.
+4. **Equilibration, two variants to compare** (§16's caveat: point-Jacobi scaling slightly breaks
+   the nodal block structure the backend exploits):
+   - v1, zero new code: the existing point-Jacobi `dinv`. Run this first — if block-GS/block-ILU0
+     already win with it, the block-Jacobi variant is a refinement, not a blocker.
+   - v2: 3×3 **block**-Jacobi equilibration for block-backed fields — extract the nodal 3×3
+     diagonal blocks (batched reshape of the diagonal block's CSR), factor each (batched
+     `numpy.linalg.cholesky`; fall back to eigendecomposition clamped at a floor if any block is
+     not SPD — Dirichlet identity rows make their node's block trivially SPD, but assert rather
+     than assume), and scale symmetrically. Note the coupled off-diagonal blocks and the RHS must
+     use the same per-field scaling — the change lives in `__call__`'s equilibration step, keyed on
+     the field's backend choice.
+
+**Offline validation (xeon, `Pryout_profile_investigation/`, dumped systems; same-session
+interleaved measurements only — §19.4's load gotcha):**
+
+1. **Displacement block alone first** (ord 2, `A_00_00002.npz` displacement diagonal block, the
+   §17 testbed). Sweep on the block-3 backend: smoother ∈ {gauss_seidel, ilu0, chebyshev(d=5,
+   power_iters=50, lower=0.01)} × eps_strong ∈ {default, 0.01} × equilibration {v1, v2}. Reference
+   numbers to beat, measured in the same probe run, same session: the tuned scalar config (§17's
+   29 iters; §18's wall). Block-ILU0 is the headline candidate. Do NOT set `aggr.block_size` on a
+   block backend — that parameter is the *scalar* backend's aggregation hint (§13), not applicable
+   here; setting both is exactly the kind of silently-ignored-key hazard §8 warns about (check
+   stderr).
+2. **Full coupled system**, all 9 ords, production `fieldPreconds` path, best block config vs the
+   shipped scalar default, wall-clock as the metric. **Bar for changing the default: ≥20% aggregate
+   wall-clock win** (the bar every prior default change cleared, §19.4's reasoning), no ord
+   regressing past ~1.05×, true residuals no looser than the shipped default's (§18 table).
+3. **Optional column, only if double-block wins:** `static_matrix<float,3,3>` — block storage cuts
+   the index share that capped §19.3's float result at 1.03×, so float may pay *on top of* blocks
+   even though it failed alone. Watch the chebyshev spectral estimate (§19.3's suspected
+   float-degradation mechanism); prefer block-GS/block-ILU0 columns for the float comparison since
+   they carry no spectral estimate.
+4. **Live gate** (only if 2 clears the bar): the 19.1 run, identical pass criteria — Newton path
+   15/8/5/5, same cutbacks, `Job computation time` vs the 82.4 s reference from the same window.
+   Then, and only then, flip the vector-field default; the 2D regression test must pass with
+   whatever the default becomes (`run_tests_edelweissfe ./testfiles/edelweiss-only/ --tests
+   CantileverBeamQuad4BlockAMG`, plus the marmot suite if available locally).
+
+**Failure handling:** if block-ILU0 diverges *and* block-GS/chebyshev show no wall-clock win at
+step 1, stop Part 1 there, record the sweep table (it finally puts numbers on §16's B3 hypothesis),
+and proceed to Part 2 against the unchanged scalar default — Part 2 does not depend on Part 1's
+outcome, only on its *completion*, because whatever configuration survives Part 1 is the "final
+setup" Part 2 validates against.
+
+### 20.2 Part 2 — the EW rescue experiment, on the final setup from Part 1 (~half day, mostly runs)
+
+**Do not start until Part 1 has concluded** (either outcome). Everything here runs against the
+solver configuration Part 1 leaves as the default.
+
+**Why there is something to rescue.** §19.2 measured EW forcing at ~1.56× offline but the live run
+changed the Newton *trajectory* (2 cutbacks instead of 3, more load reached in the same increment
+budget). The diagnosis in §19.2 — "§10's guarantee does not transfer from lagged-LU to AMG" — can be
+sharpened: with a near-exact LU preconditioner, GMRES's preconditioned residual ≈ the true residual,
+so §10's `etaMax=1e-3` really meant 1e-3. With blockamg the two are documented to diverge
+(§14/§17/§18: true residuals 5e-4–3e-3 when EW asked for 1e-3), so the live EW run was effectively
+solving to ~3e-3–1e-2 on the hard iterates — far looser than anything §10 validated. Two fixes, in
+order:
+
+1. **True-residual stopping in `blockamg.__call__`** (small, benefits fixed-tolerance mode too):
+   after `gmres` returns, compute the *unscaled* true relative residual `‖Ax−b‖/‖b‖` (already
+   computed for the verbose path); if it exceeds the requested tolerance, re-enter `gmres` with
+   `x0=x` (warm restart), up to 2 continuations, logging each. This makes the requested tolerance
+   preconditioner-independent — it also closes the shipped default's own documented gap (ord 3
+   reaching 1.6e-2 when 1e-4 was requested, §17). Validate offline (all 9 ords: true residuals now
+   ≤ tolerance; wall-clock cost of the continuations recorded — expect it concentrated on ord 3),
+   and confirm the existing live gate still passes unchanged. This lands regardless of step 2's
+   outcome.
+2. **The `etaMax` ladder, live** (~35 min per rung): with step 1 in place, enable EW
+   (`outerTol="adaptive"`) at `etaMax=1e-4` and run the 19.1 gate. Pass criteria are §19.1's,
+   strictly: increments 15/8/5/5, the same three cutbacks, same final `U_loading=0.021875` — a
+   *trajectory* match, not just an iteration-count match (§19.2's failure mode).
+   - Pass at 1e-4 → record the live `Job computation time` win (offline counts at 1e-4 were 20–41
+     vs 44–94 at 1e-6, so a large fraction of the 1.56× should survive) and, optionally, try
+     `etaMax=3e-4` as one more rung to find the edge. Ship EW as the default only on a pass, with
+     the winning clamp recorded here.
+   - Fail at 1e-4 → try 1e-5 as a sanity rung (it bounds where the trajectory sensitivity starts);
+     regardless of that rung's outcome, EW stays opt-in and the decision escalates to Matthias with
+     the ladder's data — at that point it is a genuine §7-class judgement (the EW trajectory took
+     *fewer* cutbacks and reached *more* load, which is not obviously worse, but it is not the
+     reference path), not something an agent decides.
+3. **Bookkeeping either way:** hierarchy reuse (§19.2(b)) stays inert on this model regardless of
+   EW — the pattern churns every iteration and the nnz guard correctly forces refreshes. Do not
+   burn time trying to activate it here; it activates for free if Lead 2's pattern caching ever
+   lands (§7).
+
+### Sequencing, and what is explicitly out of scope for this phase
+
+1. 20.1 step by step; its live gate decides the final default.
+2. 20.2 on whatever that final default is; its step 1 (true-residual stopping) ships regardless,
+   its step 2 decides EW's fate or escalates it.
+3. **Out of scope:** D4 (the ≥1M-dof scale demonstration) is the phase after this one — it should
+   run once, on the final configuration this phase produces, not before. D1, rotational RBMs, and
+   Lead 2 remain deprioritized/blocked exactly as §19 lists them. The `performancetiming.timeit`
+   thread-safety bug (§19.1) is real but is general-infrastructure work, not linsolve work — track
+   it separately; until fixed, live wall-clock claims use `Job computation time` only.
+
+The §19 "Execution notes for the hand-off agent" apply to this phase verbatim (xeon workflow, env
+vars, gotcha lists, commit conventions, no pushing).
