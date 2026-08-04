@@ -44,8 +44,17 @@ Choose a linsolver after the ``*solver`` keyword:
     * - ``gmres``
       - ✗
       - ``edelweissfe.linsolve.gmres.gmres``
+    * - ``amgcl``
+      - ✗
+      - ``edelweissfe.linsolve.amgcl.amgcl``
+    * - ``inexactnewton``
+      - ✗
+      - ``edelweissfe.linsolve.inexactnewton.inexactnewton``
+    * - ``matrixdump``
+      - —
+      - ``edelweissfe.linsolve.matrixdump.matrixdump``
 
-Currently, only the linsolver ``gmres`` allows the use of an optional configuration file ``linsolverConfigFile``.
+Several linsolvers accept an optional configuration file ``linsolverConfigFile`` (a ``.json`` file), among them ``gmres``, ``amgcl``, ``inexactnewton`` and ``matrixdump``; the direct solvers ignore it (``pardiso`` additionally reads a single ``reuseSymbolicFactorization`` flag).
 
 Choose the options for the linsolver (in this case ``gmres``) in an extra file:
 
@@ -59,3 +68,79 @@ Choose the options for the linsolver (in this case ``gmres``) in an extra file:
 	},
 	"linsolveopts": {"maxiter": 1, "restart": 1500}
 	}
+
+
+The ``inexactnewton`` solver
+----------------------------
+
+``inexactnewton`` is not a solver in its own right but a *modified-Newton–Krylov* scheme intended for large, coupled nonlinear models (for example penalty contact combined with adaptive mesh refinement and gradient-enhanced damage) where a direct factorization dominates the run time while the Jacobian changes only slightly from one Newton iteration to the next.
+
+Instead of factorizing the system matrix on every Newton iteration, it keeps an **exact LU factorization of one iterate** (computed by a *delegate* direct solver, ``pardiso`` by default) and reuses it as a **preconditioner for GMRES** on the next few iterates. The linear tolerance follows an **Eisenstat–Walker forcing sequence** rather than being solved tightly: a Newton correction does not need the linear system solved to machine precision, so the reuse solves converge in only a handful of GMRES iterations. When the factorization goes stale it is refreshed automatically; the first solve of an increment and its large first correction — the iterates that precondition worst — are kept direct.
+
+Because it exposes the ordinary ``(A, b) -> x`` interface, selecting it requires no other change to the analysis:
+
+.. code-block:: edelweiss
+
+    *solver, solver=NIST, name=theSolver
+    linsolver=inexactnewton
+    linsolverConfigFile=inexactnewton.json
+
+All configuration keys are optional; the defaults are a turnkey configuration (the PARDISO delegate with the measured sweet-spot policy). The recognised keys:
+
+.. list-table:: ``inexactnewton`` configuration keys
+    :width: 100%
+    :widths: 20 10 45
+    :header-rows: 1
+
+    * - Key
+      - Default
+      - Meaning
+    * - ``delegate``
+      - ``"pardiso"``
+      - Factorizing backend supplying the lagged LU. ``"pardiso"`` in production, or ``"superlu"`` (SciPy, dependency-free) for testing or installs without the PARDISO extension.
+    * - ``maxReuse``
+      - ``8``
+      - How many consecutive reuse solves one factorization may serve before it is refreshed.
+    * - ``residualGrowthFactor``
+      - ``4.0``
+      - A solve whose ``||b||`` exceeds this multiple of the previous one is treated as a new increment (or a cutback) and refactorized.
+    * - ``etaMin`` / ``etaMax``
+      - ``1e-6`` / ``1e-3``
+      - Clamp on the Eisenstat–Walker forcing tolerance (tightest / loosest a reuse solve may use).
+    * - ``ewGamma`` / ``ewAlpha``
+      - ``0.9`` / ``1.618…``
+      - Eisenstat–Walker "choice 2" parameters, ``eta_k = ewGamma * (||b_k|| / ||b_{k-1}||) ** ewAlpha``.
+    * - ``gmresRestart``
+      - ``50``
+      - GMRES Krylov subspace dimension between restarts.
+    * - ``gmresMaxOuter``
+      - ``4``
+      - Maximum GMRES restart cycles before a solve is declared not converged (and the factorization refreshed).
+    * - ``staleIterationThreshold``
+      - ``15``
+      - A reuse solve needing more GMRES iterations than this triggers a refresh on the next solve.
+    * - ``verbose``
+      - ``false``
+      - Print one line per solve (refactorize?, forcing tolerance, iteration count).
+
+Example configuration selecting the SuperLU delegate for a dependency-free run:
+
+.. code-block:: json
+
+    {
+        "delegate": "superlu",
+        "etaMax": 1e-3,
+        "maxReuse": 8
+    }
+
+
+The ``amgcl`` solver
+--------------------
+
+``amgcl`` is an iterative solver (Krylov method plus algebraic-multigrid or single-level preconditioner) built on the `AMGCL <https://github.com/ddemidov/amgcl>`_ library. Its ``linsolverConfigFile`` is forwarded as an AMGCL parameter tree; note that AMGCL silently ignores unknown parameter keys (warning only on stderr), so check its stderr if a configuration behaves unexpectedly.
+
+
+The ``matrixdump`` diagnostic solver
+------------------------------------
+
+``matrixdump`` is not a solver but a diagnostic wrapper: it writes the equation systems it is handed to disk and then delegates the actual solve to a real linear solver, so a sequence of authentic ``(A, b)`` pairs can be replayed offline (see ``scripts/benchmark_linsolve.py``) instead of by rerunning the simulation. Its ``linsolverConfigFile`` selects the ``delegate`` solver, the dump ``directory``, and which solves to capture (``dumpAt`` / ``skipFirst`` / ``maxDumps`` / ``instances``).
