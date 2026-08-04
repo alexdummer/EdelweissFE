@@ -35,3 +35,4 @@ cdef extern from "amgcl-wrapper.hpp":
                    double* x,
                    int& iters,
                    double& error) except +
+        void set_nullspace(const double* B, int rows, int cols) except +

@@ -75,6 +75,28 @@ cdef class PyAMGCLSolver:
         if self.solver != NULL:
             del self.solver
 
+    def set_nullspace(self, object B):
+        """
+        Supply near null-space vectors for smoothed-aggregation coarsening.
+
+        AMGCL's smoothed aggregation defaults to a single constant near null-space vector, which is
+        wrong for an elasticity operator -- there the near null-space is the rigid body modes. AMGCL
+        takes these vectors as a raw pointer in its property tree, so they cannot be passed through the
+        JSON parameter string like every other option; this is the separate entry point for them.
+
+        B: an (n, cols) array-like; column j is the j-th near null-space vector (float64). Copied into
+        the C++ solver, so the array need not be kept alive. Must be called before the first solve().
+        Passing an (n, 0) array clears any previously set null-space.
+        """
+        cdef np.ndarray[np.float64_t, ndim=2, mode="c"] B_arr = np.ascontiguousarray(B, dtype=np.float64)
+        cdef int rows = B_arr.shape[0]
+        cdef int cols = B_arr.shape[1]
+        if cols == 0:
+            self.solver.set_nullspace(<const double*> 0, rows, 0)
+            return
+        cdef double[:, ::1] B_view = B_arr
+        self.solver.set_nullspace(&B_view[0, 0], rows, cols)
+
     def solve(self, object A, object rhs):
         """
         A: scipy.sparse.csr_matrix

@@ -549,6 +549,89 @@ def commandAmgcl(args):
     # iterative solver only at 1e-8 is what produced a wrong verdict in the `lagged` benchmark.
     tolerances = [float(value) for value in args.tolerances.split(",")]
 
+    def runConfiguration(description, configured, nullspace):
+        """Build a solver for one configuration (optionally with a near null-space), solve, print."""
+        try:
+            solver = PyAMGCLSolver(configured)
+            if nullspace is not None:
+                solver.set_nullspace(nullspace)
+            start = perf_counter()
+            x = solver.solve(A, b)
+            elapsed = perf_counter() - start
+        except Exception as failure:  # noqa: BLE001 - a rejected config should not abort the sweep
+            print("{:<44} {:>8}   {:}".format(description, "ERROR", failure))
+            return None
+        trueResidual = np.linalg.norm(A @ x - b) / bNorm
+        deviation = np.linalg.norm(x - reference) / referenceNorm
+        hitCap = solver.lastIterations >= args.maxiter
+        print(
+            "{:<44} {:>8} {:>12.2e} {:>13.2e} {:>8.2f} s  {:}{:}".format(
+                description,
+                solver.lastIterations,
+                solver.lastError,
+                trueResidual,
+                elapsed,
+                "dev {:.1e}".format(deviation),
+                (
+                    "  <-- HIT MAXITER, did not converge"
+                    if hitCap
+                    else ("  <-- beats direct" if elapsed < directTime else "")
+                ),
+            )
+        )
+        return not hitCap
+
+    if args.nullspace == "translations":
+        # The cheap, no-geometry partial test of PERF_LINSOLVE_INVESTIGATION.md section 4, step 1:
+        # does supplying smoothed aggregation the three rigid-body *translations* of the displacement
+        # block (its default is a single constant vector) improve monolithic AMG at all? Translations
+        # dominate the elasticity near null-space, and they are constructible from the DOF layout
+        # alone -- the displacement block is node-major with 3 components per node -- so no nodal
+        # coordinates are needed. If three translations do not help over the default one constant,
+        # the six rigid body modes will not rescue it and block-unaware AMG is a dead end here.
+        n = A.shape[0]
+        dispDofs = min(args.dispDofs, n)
+        rowIndex = np.arange(dispDofs)
+
+        # Pure translations: 1 on each displacement component, zero on the coupled (damage) block.
+        translations = np.zeros((n, 3), dtype=np.float64)
+        translations[rowIndex, rowIndex % 3] = 1.0
+
+        # Block-structured variant: the same three translations on the displacement block, plus a
+        # fourth vector that is constant on the coupled block and zero on displacement -- so the
+        # coupled rows are not left with a degenerate (all-zero) near null-space. This isolates
+        # whether the pure-translations result above is an artefact of the zero coupled block rather
+        # than a genuine verdict on monolithic AMG.
+        blockTranslations = np.zeros((n, 4), dtype=np.float64)
+        blockTranslations[rowIndex, rowIndex % 3] = 1.0
+        blockTranslations[dispDofs:, 3] = 1.0
+
+        print(
+            "near null-space test: {:} displacement dofs (3 components, node-major) + {:} coupled "
+            "dofs, of {:} total\n".format(dispDofs, n - dispDofs, n)
+        )
+
+        tolerance = tolerances[0]
+        print(
+            "{:<44} {:>8} {:>12} {:>13} {:>10}   rtol={:.0e}\n".format(
+                "configuration", "iters", "amgcl err", "true rel.res", "wall", tolerance
+            )
+        )
+        candidates = [
+            ("1 constant", None),
+            ("3 translations", translations),
+            ("3 transl + coupled const", blockTranslations),
+        ]
+        smootherByName = {"ilu0": {"type": "ilu0"}, "spai0": {"type": "spai0"}}
+        for smootherName, smoother in smootherByName.items():
+            configured = {
+                "solver": {"type": "gmres", "M": 100, "tol": tolerance, "maxiter": args.maxiter},
+                "precond": {"coarsening": {"type": "smoothed_aggregation"}, "relax": smoother},
+            }
+            for label, nullspace in candidates:
+                runConfiguration("gmres(100) + AMG(SA, {:}), {:}".format(smootherName, label), configured, nullspace)
+        return
+
     print(
         "{:<40} {:>8} {:>8} {:>12} {:>13} {:>10}".format(
             "configuration", "rtol", "iters", "amgcl err", "true rel.res", "wall"
@@ -609,6 +692,21 @@ def main():
         help="loosest first: the sweep stops tightening once a configuration fails to converge",
     )
     amgclParser.add_argument("--maxiter", type=int, default=500)
+    amgclParser.add_argument(
+        "--nullspace",
+        choices=["none", "translations"],
+        default="none",
+        help="feed smoothed aggregation a near null-space: 'translations' supplies the 3 rigid-body "
+        "translations of the displacement block (constructible from the DOF layout alone), and runs "
+        "each SA configuration both with and without it for a direct comparison",
+    )
+    amgclParser.add_argument(
+        "--dispDofs",
+        type=int,
+        default=214659,
+        help="size of the leading displacement block (3 components per node, node-major); the "
+        "translational near null-space is nonzero only on it. Default matches the reference model.",
+    )
     amgclParser.set_defaults(function=commandAmgcl)
 
     patternParser = subparsers.add_parser("pattern", help="report sparsity-pattern evolution")

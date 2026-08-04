@@ -29,6 +29,10 @@ public:
   std::vector< int >        cached_ptr_;
   std::vector< int >        cached_col_;
 
+  // Near null-space vectors, kept alive here because the property tree only stores a raw pointer to
+  // them (AMGCL copies from it when the hierarchy is built). Must outlive every solver construction.
+  std::vector< double > nullspace_;
+
   // Constructor: Just stores the parameters
   LinearSolver( const char* json_params ) : solver_(), cached_n( -1 ), cached_nnz( -1 )
   {
@@ -37,6 +41,27 @@ public:
       std::stringstream ss( json_str );
       boost::property_tree::read_json( ss, prm );
     }
+  }
+
+  // Supply near null-space vectors for smoothed-aggregation coarsening. B is a rows-by-cols matrix in
+  // row-major order (column j is the j-th near null-space vector). AMGCL takes these as a raw pointer
+  // in its property tree -- they cannot travel through the JSON parameter string -- so this is a
+  // separate entry point. Must be called before the first solve(); the pointer is read when the AMG
+  // hierarchy is constructed. Passing cols == 0 clears any previously set null-space.
+  void set_nullspace( const double* B, int rows, int cols )
+  {
+    if ( cols <= 0 ) {
+      nullspace_.clear();
+      boost::optional< boost::property_tree::ptree& > coarsening = prm.get_child_optional( "precond.coarsening" );
+      if ( coarsening ) {
+        coarsening->erase( "nullspace" );
+      }
+      return;
+    }
+    nullspace_.assign( B, B + static_cast< size_t >( rows ) * cols );
+    prm.put( "precond.coarsening.nullspace.cols", cols );
+    prm.put( "precond.coarsening.nullspace.rows", rows );
+    prm.put( "precond.coarsening.nullspace.B", nullspace_.data() );
   }
 
   void solve( int           n,
