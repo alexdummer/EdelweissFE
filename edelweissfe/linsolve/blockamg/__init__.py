@@ -48,7 +48,12 @@ def createSolver(opts) -> Callable:
         :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`):
 
         ``outerTol``, ``outerRestart``, ``outerMaxiter``, ``sweeps``, ``symmetric``, ``verbose``
-            The outer GMRES and block Gauss-Seidel knobs.
+            The outer GMRES and block Gauss-Seidel knobs. ``outerTol``, if given, fixes the outer
+            tolerance and disables the Eisenstat--Walker forcing described next.
+        ``etaMin``, ``etaMax``, ``ewGamma``, ``ewAlpha``, ``residualGrowthFactor``,
+        ``hierarchyStalenessFactor``
+            Knobs for the adaptive outer tolerance and the per-field AMG hierarchy reuse across Newton
+            iterations -- see :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`.
         ``fieldPreconds``
             Optional mapping of field name (e.g. ``"displacement"``) to an AMGCL preconditioner
             parameter tree, overriding the dimension-based default for that field.
@@ -74,6 +79,12 @@ def createSolver(opts) -> Callable:
         ("sweeps", int),
         ("symmetric", bool),
         ("verbose", bool),
+        ("etaMin", float),
+        ("etaMax", float),
+        ("ewGamma", float),
+        ("ewAlpha", float),
+        ("residualGrowthFactor", float),
+        ("hierarchyStalenessFactor", float),
     ):
         if key in optionMap:
             kwargs[key] = cast(optionMap[key])

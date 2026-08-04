@@ -97,10 +97,29 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     near null-space is decided from its nodal dimension: a vector field (dimension > 1) gets its
     per-component rigid-body translations, a scalar field the default constant.
 
+    Stateful across calls in two independent ways (both driven by ``||b||`` alone -- this solver, like
+    :mod:`~edelweissfe.linsolve.inexactnewton.inexactnewton`, sees only ``(A, b)`` per call and
+    reconstructs Newton-loop state from residual jumps rather than being told about them):
+
+    #. **Adaptive outer tolerance** (Eisenstat--Walker forcing, "choice 2"). Most Newton iterates do
+       not need the solve tight; forcing it anyway multiplies the dominant per-application AMG cost by
+       more outer iterations than the nonlinear convergence actually requires. ``outerTol``, if given,
+       overrides this with a fixed tolerance (matching the solver's original, pre-EW behaviour).
+    #. **Per-field AMG hierarchy reuse across Newton iterations.** Building a hierarchy (~3.4 s on the
+       reference model) is a large, avoidable fraction of a solve when the Jacobian has moved only a
+       little since the last one. The outer GMRES always operates on the current, fresh matrix; only
+       the block preconditioner ``M`` may be stale, so correctness is unaffected -- a stale ``M`` only
+       costs a few extra outer iterations. Refreshed on a residual jump (new increment / cutback), on a
+       field-structure change (e.g. AMR), or when the previous solve's outer count grew past
+       ``hierarchyStalenessFactor`` times the one before it.
+
     Parameters
     ----------
-    outerTol, outerRestart, outerMaxiter
-        The outer GMRES relative tolerance, restart length, and maximum restart cycles.
+    outerTol
+        If given, a fixed outer GMRES relative tolerance, disabling Eisenstat--Walker forcing. If
+        ``None`` (the default), the tolerance is computed per solve, see ``etaMin``/``etaMax`` below.
+    outerRestart, outerMaxiter
+        The outer GMRES restart length and maximum restart cycles.
     sweeps
         Block Gauss-Seidel sweeps per preconditioner application.
     symmetric
@@ -108,19 +127,41 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     fieldPreconds
         Optional mapping of field name to an AMGCL preconditioner parameter tree, overriding the
         dimension-based default for that field.
+    etaMin, etaMax
+        Clamp on the Eisenstat--Walker forcing tolerance (ignored if ``outerTol`` is given). ``etaMax``
+        is also the tolerance used whenever there is no residual history to base a ratio on (the first
+        solve, or the one right after a detected new increment/cutback).
+    ewGamma, ewAlpha
+        The Eisenstat--Walker "choice 2" parameters: ``eta_k = gamma * (||b_k|| / ||b_{k-1}||) **
+        alpha``. Defaults ``gamma = 0.9``, ``alpha = (1 + sqrt 5) / 2`` are the classic values.
+    residualGrowthFactor
+        A solve whose ``||b||`` exceeds this multiple of the previous solve's ``||b||`` is treated as
+        the first solve of a new increment (or a cutback): the forcing tolerance resets to ``etaMax``
+        and the AMG hierarchies are refreshed rather than reused.
+    hierarchyStalenessFactor
+        Refresh the AMG hierarchies before the *next* solve if this solve's outer GMRES count exceeded
+        this factor times the previous solve's -- a growing count is the signal that the reused
+        hierarchies are drifting away from the current Jacobian.
     verbose
-        If True, print the outer iteration count and residual per solve.
+        If True, print the outer iteration count, residual, forcing tolerance, and hierarchy
+        reuse/refresh decision per solve.
     """
 
     def __init__(
         self,
         *,
-        outerTol: float = 1.0e-6,
+        outerTol: float = None,
         outerRestart: int = 100,
         outerMaxiter: int = 8,
         sweeps: int = 1,
         symmetric: bool = True,
         fieldPreconds: dict = None,
+        etaMin: float = 1.0e-6,
+        etaMax: float = 1.0e-3,
+        ewGamma: float = 0.9,
+        ewAlpha: float = 1.618033988749895,
+        residualGrowthFactor: float = 4.0,
+        hierarchyStalenessFactor: float = 1.5,
         verbose: bool = False,
     ):
         self._outerTol = outerTol
@@ -129,7 +170,48 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         self._sweeps = sweeps
         self._symmetric = symmetric
         self._fieldPreconds = fieldPreconds or {}
+        self._etaMin = etaMin
+        self._etaMax = etaMax
+        self._ewGamma = ewGamma
+        self._ewAlpha = ewAlpha
+        self._residualGrowthFactor = residualGrowthFactor
+        self._hierarchyStalenessFactor = hierarchyStalenessFactor
         self._verbose = verbose
+
+        # Eisenstat-Walker forcing state.
+        self._lastResidualNorm = None
+        self._lastEta = etaMax
+
+        # Reused hierarchy state: the built per-field AMG hierarchies, the equilibration they were
+        # built for, and the field-block layout they assume -- all None until the first solve.
+        self._preconditioners = None
+        self._dinv = None
+        self._blocks = None
+        self._n = None
+        self._lastNnz = None
+        self._lastOuterIters = None
+        self._refreshNext = False
+
+    def _forcingTolerance(self, residualNorm: float, newIncrement: bool) -> float:
+        """The Eisenstat--Walker "choice 2" forcing tolerance for this solve, clamped and safeguarded.
+
+        ``eta_k = gamma (||b_k|| / ||b_{k-1}||) ** alpha``, with the classic safeguard against
+        over-solving (a large tightening step is only trusted if the previous tolerance was already
+        small), clamped to ``[etaMin, etaMax]``. Falls back to ``etaMax`` with no history to compare
+        against (the first solve, or the one right after a new increment / cutback jump -- the ratio
+        across that jump does not reflect Newton convergence and is not meaningful).
+        """
+        if self._lastResidualNorm is None or newIncrement:
+            return self._etaMax
+
+        ratio = residualNorm / self._lastResidualNorm
+        eta = self._ewGamma * ratio**self._ewAlpha
+
+        safeguard = self._ewGamma * self._lastEta**self._ewAlpha
+        if safeguard > 0.1:
+            eta = max(eta, safeguard)
+
+        return min(self._etaMax, max(self._etaMin, eta))
 
     def _resolveBlocks(self, n: int) -> list:
         """The field blocks tiling ``[0, n)``, in DOF order, with any trailing DOFs not covered by a
@@ -177,15 +259,51 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         n = A.shape[0]
         blocks = self._resolveBlocks(n)
         slices = [slice(block.start, block.stop) for block in blocks]
+        b = np.asarray(b).reshape(n)
 
-        # Symmetric diagonal equilibration. Solve A x = b as (D A D)(D^-1 x) = D b, i.e. As z = bs
-        # with x = D z; D = diag(dinv), dinv = 1/sqrt(|diag A|).
-        dinv = 1.0 / np.sqrt(np.abs(A.diagonal()))
+        residualNorm = float(np.linalg.norm(b))
+        newIncrement = (
+            self._lastResidualNorm is not None and residualNorm > self._residualGrowthFactor * self._lastResidualNorm
+        )
+        # A's sparsity pattern churns between Newton iterations on this class of problem (condensed
+        # contact/tie systems, see the module docstring and PERF_LINSOLVE_INVESTIGATION.md §3.1) -- a
+        # hierarchy built for a different pattern is not just "a bit stale", it can be a drastically
+        # worse preconditioner (measured: 494 vs. 94 outer iterations on one such transition, an
+        # outright wall-clock regression, not a graceful few-extra-iterations degradation). ``nnz`` is a
+        # cheap, free (O(1)) proxy for "the pattern changed" -- not exact (two different patterns could
+        # coincidentally share a total nnz), but it caught the one measured failure case and errs in the
+        # safe direction (an unnecessary refresh costs time, never correctness).
+        patternChanged = self._lastNnz is not None and A.nnz != self._lastNnz
+
+        # Refresh the per-field AMG hierarchies (rather than reuse the standing ones) when there is
+        # nothing to reuse yet, the field-block layout changed (e.g. an AMR event resized the DOF
+        # vector), the sparsity pattern changed, a residual jump marks a new increment / cutback, or the
+        # previous solve's own outer count asked for it (drifted too far from the one before it).
+        mustRefresh = (
+            self._preconditioners is None
+            or blocks != self._blocks
+            or n != self._n
+            or patternChanged
+            or newIncrement
+            or self._refreshNext
+        )
+        self._refreshNext = False
+
+        if mustRefresh:
+            # Symmetric diagonal equilibration. Solve A x = b as (D A D)(D^-1 x) = D b, i.e. As z = bs
+            # with x = D z; D = diag(dinv), dinv = 1/sqrt(|diag A|).
+            dinv = 1.0 / np.sqrt(np.abs(A.diagonal()))
+        else:
+            # Reuse the equilibration the standing hierarchies were built for. This stays a valid
+            # diagonal similarity scaling of the *current* A x = b regardless of how it was chosen, so
+            # correctness (the outer GMRES converges on the true, fresh As/bs) is unaffected; only the
+            # preconditioner's quality can drift, which costs outer iterations, never a wrong answer.
+            dinv = self._dinv
+
         As = (sp.diags(dinv) @ A @ sp.diags(dinv)).tocsr()
-        bs = dinv * np.asarray(b).reshape(n)
+        bs = dinv * b
 
-        # Field diagonal blocks (for the per-field AMG) and off-diagonal couplings (for the sweep).
-        diagBlocks = [As[sl, :][:, sl].tocsr() for sl in slices]
+        # Off-diagonal couplings (for the sweep) are needed every solve regardless of refresh/reuse.
         offBlocks = {}
         for i in range(len(slices)):
             rowBlock = As[slices[i], :]
@@ -193,19 +311,27 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
                 if i != j:
                     offBlocks[(i, j)] = rowBlock[:, slices[j]].tocsr()
 
-        # One AMG hierarchy per field, built once for this solve. A vector field gets its translations
-        # as the near null-space; a scalar field the default constant.
-        preconditioners = []
-        for i, block in enumerate(blocks):
-            isVectorField = block.dimension > 1
-            precondParams = self._fieldPreconds.get(
-                block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
-            )
-            solver = PyAMGCLSolver({"precond": precondParams})
-            if isVectorField:
-                solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
-            solver.build(diagBlocks[i])
-            preconditioners.append(solver)
+        if mustRefresh:
+            # One AMG hierarchy per field, built fresh. A vector field gets its translations as the
+            # near null-space; a scalar field the default constant.
+            diagBlocks = [As[sl, :][:, sl].tocsr() for sl in slices]
+            preconditioners = []
+            for i, block in enumerate(blocks):
+                isVectorField = block.dimension > 1
+                precondParams = self._fieldPreconds.get(
+                    block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
+                )
+                solver = PyAMGCLSolver({"precond": precondParams})
+                if isVectorField:
+                    solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
+                solver.build(diagBlocks[i])
+                preconditioners.append(solver)
+            self._preconditioners = preconditioners
+            self._dinv = dinv
+            self._blocks = blocks
+            self._n = n
+            self._lastNnz = A.nnz
+        preconditioners = self._preconditioners
 
         nFields = len(slices)
         sizes = [block.stop - block.start for block in blocks]
@@ -228,12 +354,17 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
 
         preconditioner = LinearOperator((n, n), matvec=blockGaussSeidel, dtype=As.dtype)
 
+        if self._outerTol is not None:
+            eta = self._outerTol
+        else:
+            eta = self._forcingTolerance(residualNorm, newIncrement)
+
         history = []
         z, info = gmres(
             As,
             bs,
             M=preconditioner,
-            rtol=self._outerTol,
+            rtol=eta,
             atol=0.0,
             restart=self._outerRestart,
             maxiter=self._outerMaxiter,
@@ -242,11 +373,24 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         )
         x = dinv * z
 
+        outerIters = len(history)
+        if self._lastOuterIters is not None and outerIters > self._hierarchyStalenessFactor * self._lastOuterIters:
+            self._refreshNext = True
+        self._lastOuterIters = outerIters
+        self._lastResidualNorm = residualNorm
+        self._lastEta = eta
+
         if self._verbose:
-            trueResidual = np.linalg.norm(A @ x - np.asarray(b).reshape(n)) / max(np.linalg.norm(b), 1e-300)
+            trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
             print(
-                "blockamg: fields {:} | {:} outer GMRES iters, info={:}, true rel.res={:.2e}".format(
-                    [block.name for block in blocks], len(history), info, trueResidual
+                "blockamg: fields {:} | {:} outer GMRES iters, info={:}, true rel.res={:.2e}, "
+                "eta={:.1e}, {:}".format(
+                    [block.name for block in blocks],
+                    outerIters,
+                    info,
+                    trueResidual,
+                    eta,
+                    "REFRESH" if mustRefresh else "reuse",
                 ),
                 flush=True,
             )
