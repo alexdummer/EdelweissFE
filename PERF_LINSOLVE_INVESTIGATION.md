@@ -4,10 +4,17 @@ Branch `perf/linsolve-investigation`, based on `feat/amr-recovery-marker` (`d495
 Local, remote `mn` and xeon in sync. Working tree clean.
 
 **Status: Phases 1 (instrument + capture) and 2 (offline benchmark) are complete. Phase 3 (implement)
-has begun: Lead 1 is implemented, and measured on the real model — see [§10](#10-phase-3-lead-1-measured).
-The headline: it is safe and preserves the Newton path exactly, but on this thrashing contact+damage
-model it is break-even, not the 2–3× the offline benchmark projected. Lead 2 now looks like the more
-reliable lever.** Two measured leads plus one untested-but-not-excluded route; see
+has begun. Two cheap leads are now measured on the real model:**
+- **Lead 1** ([§10](#10-phase-3-lead-1-measured)): implemented, safe, preserves the Newton path
+  exactly, but **break-even** on this thrashing contact+damage model — not the 2–3× the offline
+  benchmark projected. The reliable speed lever is now **Lead 2** (freeze the symbolic factorization),
+  which is blocked on the §7 drift question.
+- **Lead 3 step 1** ([§11](#11-phase-3-lead-3-step-1-measured)): a near-null-space (translations,
+  with or without a coupled-block constant) **does not** rescue monolithic AMG — it stalls at
+  0.2–0.65 residual regardless. Block structure, not the near-null-space, is the missing ingredient;
+  the real AMG route is the full block preconditioner (Lead 3 steps 2–3), a substantial effort.
+
+Two measured leads plus one untested-but-not-excluded route; see
 [§4](#4-recommendation), which ends with a suggested order of work. One open question blocks part of
 it, see [§7](#7-the-open-question).
 
@@ -313,11 +320,14 @@ which `createSolver(opts)` never receives** — a real widening of the linsolver
 
 So prove it offline before plumbing anything:
 
-1. **Cheap partial test, no geometry needed.** The three *translational* near-null-space vectors are
-   constructible from the DOF layout alone (displacement is field-major, node-major, 3 components per
-   node). Translations dominate the elasticity near-null-space; if AMG does not improve at all with 3
-   candidates instead of AMGCL's default 1, rotations will not rescue it. Highest information per hour
-   available on this question.
+1. **Cheap partial test, no geometry needed. — DONE, negative, see [§11](#11-phase-3-lead-3-step-1-measured).**
+   The three *translational* near-null-space vectors are constructible from the DOF layout alone
+   (displacement is field-major, node-major, 3 components per node). Translations dominate the
+   elasticity near-null-space; if AMG does not improve at all with 3 candidates instead of AMGCL's
+   default 1, rotations will not rescue it. **Measured: it does not improve — monolithic AMG stalls at
+   0.2–0.65 residual with 1 constant, 3 translations, or 3 translations + a coupled-block constant
+   alike. So steps 2–3 (the real block preconditioner) are the only AMG path left, not an optional
+   escalation.**
 2. **If that is promising**, dump nodal coordinates + field slices alongside the matrices (small
    `matrixdump` extension), build all 6 RBMs offline, add the field-split `pmask`, and re-benchmark
    against the same 11.46 s target.
@@ -546,3 +556,49 @@ Reproduce: on xeon, `~/constitutive_modeling/next_v2611/Pryout_profile_investiga
 `PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHON_GIL=0 edelweissfe inexact.inp >
 inexact.log 2>&1`. Per-solve trace is on (`inexact.json` has `"verbose": true`); baseline is
 `baseline_omp16.log`.
+
+---
+
+## 11. Phase 3, Lead 3 step 1 — measured
+
+The cheap, no-geometry gate from §4: does supplying smoothed aggregation a hand-built near-null-space
+improve monolithic AMG *at all*? If three translations do not help over AMGCL's default single
+constant, the full rigid body modes will not either, and block-unaware AMG is a dead end here.
+
+**Enabler (commit `4828673a`):** AMGCL takes near-null-space vectors as a raw pointer in its property
+tree — they cannot travel through the JSON parameter string — so the wrapper gained a `set_nullspace(B)`
+entry point (`.hpp`/`.pxd`/`.pyx`, additive; the default one-constant behaviour is unchanged when it is
+not called). This is the §3.5 "highest-value single change", and it is reusable for the block-AMG work.
+`benchmark_linsolve.py amgcl --nullspace translations` builds the three displacement-block translations
+from the DOF layout alone (node-major, 3 components/node) and runs SA-AMG with 1 constant vs 3
+translations vs 3 translations + a coupled-block constant.
+
+**Measured** (first dumped system, 280,155 dof, 40.9M nnz, 16 threads, gmres(100), rtol 1e-4, maxiter
+300; direct-solve target 13.1 s):
+
+| coarsening / smoother | 1 constant | 3 translations | 3 transl + coupled const |
+|---|---|---|---|
+| SA-AMG, ilu0 | 2.25e-1 ✗ | 3.00e-1 ✗ | 2.95e-1 ✗ |
+| SA-AMG, spai0 | 6.53e-1 ✗ | 6.42e-1 ✗ | 6.54e-1 ✗ |
+
+✗ = hit maxiter (300) without converging; the number is the true relative residual reached.
+
+**Verdict: the near-null-space is not the missing ingredient — block structure is.** Every variant
+stalls at 0.2–0.65 residual, orders of magnitude from 1e-4, and none beats the direct solve. The three
+translations are *no better* than (worse than, for ilu0) the default constant, and adding a constant on
+the coupled block — which rules out the objection that the translations' zero on the damage dofs left
+that block degenerate — does not change the picture. (The variants do give distinct residuals, so
+`set_nullspace` is genuinely taking effect; this is a real result, not a no-op.)
+
+This closes the §4 gate exactly as it anticipated: monolithic, block-unaware AMG is ineffective on this
+coupled system *regardless of the near-null-space*, consistent with Alkmim et al. (2026) §3.2. The only
+AMG route that removes the memory ceiling (the *feasible-at-1M+* half of the goal) is the **full block
+preconditioner** — nested B-AMG (AMG per field inside block Gauss–Seidel) or monolithic AMG-B (block
+transfer operators + block smoothers), Lead 3 steps 2–3. That needs the rigid body modes (nodal
+coordinates, i.e. widening `createSolver`'s interface) *and* the field-split `[0, 214659) | [214659,
+280155)` block structure — the substantial effort §4 describes, now the only remaining path to the
+size goal. `set_nullspace` is the first piece of it and is in place.
+
+Reproduce: on xeon, in the profile dir, `OMP_NUM_THREADS=16 python $B amgcl linsolveDumps --nullspace
+translations --tolerances 1e-4 --maxiter 300` (`B` = `scripts/benchmark_linsolve.py`). Log:
+`amg_nullspace.log`.
