@@ -444,6 +444,10 @@ for _linsolverName in [
     # forcing sequence -- a modified-Newton-Krylov scheme that turns most direct solves into a handful
     # of back-substitutions on the large coupled fracture models where the factorization dominates.
     "inexactnewton",
+    # a field-split block-AMG solver for large coupled multi-field systems: an AMG hierarchy per field
+    # (elasticity displacement, scalar damage) combined by a block Gauss-Seidel sweep to precondition
+    # an outer GMRES. The O(n)-memory route to sizes a direct factorization cannot reach.
+    "blockamg",
     # not a solver in its own right: it dumps the equation systems it is handed and delegates the
     # actual solve to one of the above, so linear-solver variants can be compared offline on one
     # authentic sequence of matrices instead of by rerunning the simulation.
