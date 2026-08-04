@@ -148,6 +148,13 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
        when the previous solve's outer count grew past ``hierarchyStalenessFactor`` times the one
        before it.
 
+    Every solve also enforces the requested tolerance on the *true* (unpreconditioned) residual, not
+    just GMRES's own preconditioned stopping check -- see ``trueResidualMaxContinuations`` and
+    PERF_LINSOLVE_INVESTIGATION.md §20.2. GMRES's convergence test here is on the preconditioned
+    residual (``callback_type="pr_norm"``), which can be considerably smaller than the true one under
+    an imperfect preconditioner (this one, by design), so "converged" could previously mean a true
+    residual well above ``eta`` (measured: 1.6e-2 true residual when 1e-4 was requested, §17/§18).
+
     Parameters
     ----------
     outerTol
@@ -178,6 +185,11 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         Refresh the AMG hierarchies before the *next* solve if this solve's outer GMRES count exceeded
         this factor times the previous solve's -- a growing count is the signal that the reused
         hierarchies are drifting away from the current Jacobian.
+    trueResidualMaxContinuations
+        How many times to warm-restart GMRES (``x0`` from the previous attempt, same ``As``/``bs``/``M``
+        /``eta``) if the true relative residual still exceeds ``eta`` after GMRES itself reports
+        convergence. ``0`` disables this and restores the original preconditioned-residual-only
+        behaviour.
     verbose
         If True, print the outer iteration count, residual, forcing tolerance, and hierarchy
         reuse/refresh decision per solve.
@@ -198,6 +210,7 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         ewAlpha: float = 1.618033988749895,
         residualGrowthFactor: float = 4.0,
         hierarchyStalenessFactor: float = 1.5,
+        trueResidualMaxContinuations: int = 2,
         verbose: bool = False,
     ):
         self._outerTol = outerTol
@@ -212,6 +225,7 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         self._ewAlpha = ewAlpha
         self._residualGrowthFactor = residualGrowthFactor
         self._hierarchyStalenessFactor = hierarchyStalenessFactor
+        self._trueResidualMaxContinuations = trueResidualMaxContinuations
         self._verbose = verbose
 
         # Eisenstat-Walker forcing state.
@@ -422,6 +436,62 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
             callback_type="pr_norm",
         )
         x = dinv * z
+        trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
+
+        # GMRES's own stopping check (callback_type="pr_norm") is on the *preconditioned* residual,
+        # not the true one -- with an imperfect preconditioner (this one, by design, §17) the two can
+        # diverge substantially, so "converged" per GMRES can still leave a true residual well above
+        # the requested eta (documented gap: ord 3 reaching 1.6e-2 true residual when 1e-4 was
+        # requested, §17/§18).
+        #
+        # Two failed attempts before this one, both found empirically (every continuation logged "0
+        # more outer GMRES iters" until fixed):
+        #   1. A warm restart with the *same* rtol is a no-op -- x0=z already satisfies that exact
+        #      preconditioned-residual criterion, so GMRES re-declares convergence immediately.
+        #   2. Tightening the *requested* eta proportionally (eta * (eta/trueResidual)), or relative to
+        #      the callback's last-reported "pr_norm" -- both still occasionally produced a target
+        #      *larger* than eta itself (impossible if the callback's pr_norm were on the same relative
+        #      scale as rtol; it evidently is not -- likely an absolute residual, not one normalized by
+        #      ||bs||). Rather than reverse-engineer scipy's internal residual bookkeeping, avoid it
+        #      entirely: tighten purely within rtol's own units, which scipy already interprets
+        #      correctly by construction.
+        # Fix: geometrically tighten the *requested* rtol itself by a fixed factor each continuation
+        # (0.01x), guaranteeing a strictly smaller, dimensionally-consistent target with no dependency
+        # on the callback's residual scale.
+        continuationEta = eta
+        continuations = 0
+        while trueResidual > eta and continuations < self._trueResidualMaxContinuations:
+            continuations += 1
+            continuationEta *= 0.01
+            continuationHistory = []
+            z, info = gmres(
+                As,
+                bs,
+                x0=z,
+                M=preconditioner,
+                rtol=continuationEta,
+                atol=0.0,
+                restart=self._outerRestart,
+                maxiter=self._outerMaxiter,
+                callback=lambda residualNorm: continuationHistory.append(residualNorm),
+                callback_type="pr_norm",
+            )
+            x = dinv * z
+            trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
+            history.extend(continuationHistory)
+            if self._verbose:
+                print(
+                    "blockamg: true-residual continuation {:}/{:} | target eta={:.1e} | {:} more outer "
+                    "GMRES iters, info={:}, true rel.res={:.2e}".format(
+                        continuations,
+                        self._trueResidualMaxContinuations,
+                        continuationEta,
+                        len(continuationHistory),
+                        info,
+                        trueResidual,
+                    ),
+                    flush=True,
+                )
 
         outerIters = len(history)
         if self._lastOuterIters is not None and outerIters > self._hierarchyStalenessFactor * self._lastOuterIters:
@@ -431,16 +501,16 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         self._lastEta = eta
 
         if self._verbose:
-            trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
             print(
                 "blockamg: fields {:} | {:} outer GMRES iters, info={:}, true rel.res={:.2e}, "
-                "eta={:.1e}, {:}".format(
+                "eta={:.1e}, {:}, continuations={:}".format(
                     [block.name for block in blocks],
                     outerIters,
                     info,
                     trueResidual,
                     eta,
                     "REFRESH" if mustRefresh else "reuse",
+                    continuations,
                 ),
                 flush=True,
             )

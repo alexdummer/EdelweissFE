@@ -58,6 +58,10 @@ def createSolver(opts) -> Callable:
         ``hierarchyStalenessFactor``
             Knobs for the adaptive outer tolerance and the per-field AMG hierarchy reuse across Newton
             iterations -- see :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`.
+        ``trueResidualMaxContinuations``
+            How many warm-restart continuations enforce the requested tolerance on the true residual,
+            not just GMRES's own preconditioned stopping check (§20.2). Defaults to ``2``; ``0``
+            restores the original preconditioned-residual-only behaviour.
         ``fieldPreconds``
             Optional mapping of field name (e.g. ``"displacement"``) to an AMGCL preconditioner
             parameter tree, overriding the dimension-based default for that field.
@@ -91,6 +95,7 @@ def createSolver(opts) -> Callable:
         ("ewAlpha", float),
         ("residualGrowthFactor", float),
         ("hierarchyStalenessFactor", float),
+        ("trueResidualMaxContinuations", int),
     ):
         if key in optionMap:
             kwargs[key] = cast(optionMap[key])
