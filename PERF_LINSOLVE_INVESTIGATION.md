@@ -1393,6 +1393,101 @@ reused-hierarchy counts stay near the fresh-build counts (the §3.4 staleness da
 (ii) `ord 3` triggers the refresh. Then one live run as in 19.1; Newton path must stay 15/8/5/5.
 Expected combined win: ~1.5–2× on most solves (fewer iterations × amortized fixed cost).
 
+**Implemented** — `edelweissfe/linsolve/blockamg/blockamg.py` (commit `6811d4e4`). Both halves
+landed in `__call__`, plus a third refresh trigger that (b)'s plan text above did not anticipate.
+`outerTol`, if explicitly given, still fixes the tolerance and fully disables (a) (preserves the old
+behaviour for the existing `CantileverBeamQuad4BlockAMG` regression test and anyone with a config
+file that already sets it); the new EW knobs (`etaMin`/`etaMax`/`ewGamma`/`ewAlpha`/
+`residualGrowthFactor`/`hierarchyStalenessFactor`) are wired through the `blockamg` registry factory
+in `__init__.py` too.
+
+**Offline validation — a real hazard found and fixed before it reached xeon's config.** A new probe,
+`probe_192_sequence.py` (ad hoc, `Pryout_profile_investigation/`, not checked in — same convention as
+the other loose sweep scripts there), replays all 9 dumped ords through one `BlockAMGSolver` instance
+in call order and diffs against 9 independent fresh-build solves at the old fixed `outerTol=1e-6`.
+First attempt (reuse triggered only by `‖b‖`-jump / field-structure-change / outer-count-drift, exactly
+as planned above) reproduced the plan's own already-stated caveat the hard way: **`ord 3`, reusing the
+hierarchy built for `ord 2`, needed 494 outer GMRES iterations (136 s) against 94 fresh (27 s) at the
+same tolerance** — not "a few extra iterations," a 5× wall-clock regression on that one solve, because
+this module's own docstring already documents that *the sparsity pattern churns between Newton
+iterations* on this condensed contact/tie system (§3.1) — confirmed directly: `ord 2`→`ord 3`'s `nnz`
+drops from 40910093 to 40687250, a different pattern, not just a moved Jacobian. Nothing in 19.2(b)'s
+two stated triggers (residual jump, outer-count drift) catches a pattern change that happens to occur
+on a residual *drop* (Newton converging normally, no jump) — exactly ord 3's case relative to ord 2.
+
+**Fix:** a third, free refresh trigger — compare `A.nnz` (whole-matrix, O(1)) against the value at the
+last refresh; refresh on any change. Not an exact pattern check (two different patterns could
+coincidentally share a total nnz) but it caught the one measured failure case, costs nothing to
+evaluate, and only ever errs towards *more* refreshing (safe direction — the plan's own "failure mode
+is just extra iterations" principle, now actually enforced). Re-running the probe after the fix: `ord
+3` correctly refreshes (94 iterations, matching the fresh build exactly) and no other ord regresses.
+
+**(b) delivers ~zero measured benefit on this reference model — record this as the headline result,
+not a footnote.** `nnz` differs between *every consecutive pair* of the 9 dumped ords (checked
+directly against `manifest.jsonl`), i.e. the pattern churns on every single Newton iteration here, not
+just at increment boundaries. The nnz guard therefore forces a refresh on every call in this sequence,
+so hierarchy reuse never actually activates on the reference Pryout model — the mechanism is correct
+and safe (verified above) but inert here, exactly consistent with what this module's docstring already
+said before this session touched it ("the hierarchy cannot be reused *across* solves"). The entire
+measured win below is (a) alone.
+
+**Offline result, sequential replay, all 9 ords, one instance, EW forcing + guarded reuse vs. 9 fresh
+instances at fixed `outerTol=1e-6`:**
+
+| ord | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fixed-tol fresh-build (old) | 23.6s (72it) | 27.3s (94it) | 16.5s (50it) | 15.2s (44it) | 15.8s (48it) | 16.2s (45it) | 15.5s (46it) | 15.4s (44it) | 14.9s (44it) | **160.4s** |
+| EW forcing, guarded reuse (new) | 12.3s (33it) | 26.3s (94it, REFRESH — pattern changed) | 11.2s (29it) | 9.3s (21it) | 10.1s (24it) | 9.3s (21it) | 9.7s (23it) | 7.3s (12it) | 7.6s (13it) | **103.0s** |
+| speedup | 1.92× | 1.04× | 1.47× | 1.63× | 1.56× | 1.74× | 1.60× | 2.11× | 1.96× | **1.56×** |
+
+**~36% aggregate wall-clock reduction** (every ord except the pattern-forced-refresh `ord 3` — which
+is a wash, not a regression, since it correctly falls back to the old behaviour exactly). True
+residuals with EW forcing sit at 5e-4–3e-3 (looser, as expected — `eta` mostly lands at `etaMax=1e-3`
+on this sequence since most consecutive residual ratios trigger the safeguard), versus ~1e-6 for the
+fixed-tolerance baseline. Reproduce: `python probe_192_sequence.py linsolveDumps` in
+`Pryout_profile_investigation/` on xeon (log: `probe_192_sequence_v2.log`; the pre-fix log,
+`probe_192_sequence.log`, is kept as the record of the found hazard).
+
+**Live confirmation: FAILED the Newton-path pass criterion — EW forcing (a) is not the default.**
+`blockamg.json` on xeon had `"outerTol": 1e-6` (backed up as `blockamg_fixedtol.json.bak`) — removed so
+EW forcing engaged; ran `blockamg_live_192.log` (same command as 19.1's gate). Result:
+
+| | increments (Newton iters) | cutbacks | final `U_loading` | `Job computation time` |
+|---|---|---|---|---|
+| fixed `outerTol=1e-6` (baseline, §19.1's gate) | 15, 8, 5, 5 | 3 (`0.0025`, `0.00125`, `0.000625`) | 0.021875 | 82.4s |
+| EW forcing + guarded reuse (this run) | 15, 12, 7, 14 | 2 (`0.0025`, `0.00125`) | 0.03125 | 81.5s |
+
+Not "a Newton iteration lost" (§19.1's anticipated failure mode) — a **different trajectory**: the
+adaptive time-stepper took only 2 cutbacks instead of 3 and pushed further total load (`0.03125` vs
+`0.021875`) within the same `maxNumInc` cap, at the cost of needing more Newton iterations per
+increment once it did. Total job wall-clock came out a wash (81.5s vs 82.4s) — the fewer/cheaper
+linear solves roughly paid for the extra Newton iterations — but the *physical trajectory itself*
+changed, which is a different and more serious kind of risk than a wall-clock regression on a
+softening/contact model (§7's drift concern: this doc's own established position is that even
+round-off-level differences over hundreds of increments warrant a human judgement call, and this is
+far larger than round-off).
+
+This contradicts the plan's stated basis for expecting otherwise: "§10 already proved EW forcing
+clamped to `[1e-6, 1e-3]` reproduces the Newton path *exactly* on this model" — but §10 validated that
+claim for `inexactnewton`'s lagged-**LU** preconditioner, not `blockamg`'s lagged-**AMG** one; it does
+not transfer. A stale/approximate AMG preconditioner evidently interacts with the loosened outer
+tolerance differently than a near-exact LU one does.
+
+**Fix, applied before this landed as anyone's default:** reverted `outerTol`'s class default back to
+the original fixed `1e-6` (commit `5d86a0f6`) — EW forcing is now strictly opt-in (`outerTol=None`, or
+`"adaptive"` through the JSON registry, since this cast pipeline has no bare `null`). Hierarchy reuse
+(b) stays on by default: it cannot by itself change the Newton path (GMRES always converges on the
+fresh matrix at the same requested tolerance; a stale `M` only costs outer iterations, never a
+different `x`), and is provably inert-but-harmless on this model anyway (its pattern-change guard
+forces a refresh on every call here, as shown above). `blockamg.json` on xeon was restored from its
+backup (now redundant with the new default, but kept explicit).
+
+**Net position after 19.2:** the safe, shipped default is unchanged Newton-path behaviour plus a
+hierarchy-reuse mechanism that is correct and free but currently a no-op on this reference model. The
+~36%/~1.56× wall-clock win from EW forcing is real (offline, §19.2 above) but gated behind a human
+decision on the trajectory change — this is now the single most valuable remaining lever if that
+decision comes back "acceptable", and should be the first thing revisited with that judgement.
+
 ### 19.3 D2 — mixed-precision hierarchy, `builtin<float>` (~half day C++/Cython, ~1.3–1.5×)
 
 The direct attack on bandwidth-bound smoother cost: a float hierarchy halves memory traffic on an
