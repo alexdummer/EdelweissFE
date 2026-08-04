@@ -21,17 +21,25 @@ has begun. Two cheap leads are now measured on the real model:**
   quality (not the coupling).
 - **Lead 3 step 3** ([§13](#13-phase-3-lead-3-step-3-started--the-amgcl-backend-hits-the-displacement-block),
   [§14](#14-phase-3-lead-3-step-3--feasibility-grade-blockamg-delivered)): backend = AMGCL (chosen).
-  AMGCL's SA-AMG **caps at ~120 iterations on the displacement block** and the **6 RBMs do not help** —
-  the ~52% non-symmetric condensed elasticity operator defeats it (efficient convergence would need
-  MueLu/Trilinos). But it *converges*, so a **feasibility-grade `linsolver=blockamg` is delivered**:
-  field-split, per-field AMGCL hierarchies, block Gauss–Seidel, outer GMRES, with the field structure
-  discovered from the DofManager (not hand-configured). Offline it solves the 280k-dof coupled system
-  in **68 outer iterations** matching the direct solve to 4e-4; a registered test passes end-to-end.
-  This is the O(n)-memory route to 1M+ dof.
+  AMGCL's SA-AMG **capped at ~120 iterations on the displacement block** and the **6 RBMs did not
+  help** — read at the time as the ~52% non-symmetric condensed elasticity operator defeating it
+  (efficient convergence would need MueLu/Trilinos). But it *converged*, so a **feasibility-grade
+  `linsolver=blockamg` was delivered**: field-split, per-field AMGCL hierarchies, block Gauss–Seidel,
+  outer GMRES, with the field structure discovered from the DofManager (not hand-configured).
+  Offline it solved the 280k-dof coupled system in **68 outer iterations** matching the direct solve
+  to 4e-4; a registered test passes end-to-end. This is the O(n)-memory route to 1M+ dof.
+- **A second verdict was reversed** ([§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)):
+  §13's "needs MueLu" conclusion rested on an under-swept AMGCL configuration. Two untried
+  parameters — `aggr.eps_strong` and chebyshev's spectral-radius estimate — take the displacement
+  block from 121–225 iterations to **29**, and the full 280k-dof coupled `blockamg` solve from 68 to
+  **20–34** across all 9 dumped Newton iterates (only the known-hard `ord 3` iterate reaches 41).
+  AMGCL stays the backend; MueLu/Trilinos and the block-valued 3×3 backend (B3) are no longer
+  required for the feasibility goal, only possible further wins.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
-tested. What is left is validation and the two bigger swings (Lead 2 for speed, MueLu for AMG
-efficiency) — see [§15](#15-what-remains).
+tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
+(uncommitted). What is left is validation and the remaining swings (Lead 2 for speed, wall-time work
+for `blockamg`) — see [§15](#15-what-remains) and [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted).
 
 > **A verdict was reversed during this investigation.** An earlier version of this document
 > concluded the iterative route was dead. That was an artefact of benchmarking GMRES at
@@ -832,3 +840,318 @@ tested, and committed — **16 commits on `d83728ba`, all local, nothing pushed 
 - **`edelweissfe/linsolve/klu/klu.c`** is still not gitignored (§8) — the `git add`/clang-format trap
   bit twice this session on `.json` files instead; worth gitignoring `klu.c` and adding `*.json` to the
   clang-format exclude.
+
+---
+
+## 16. Reassessment of the §13 verdict — the AMGCL sweep was too shallow to conclude "needs MueLu"
+
+Matthias did not accept the §13 conclusion. On re-reading the actual probes (`amgcl_disp.py`,
+`amgcl_rbm.py` + logs on xeon), the skepticism is justified. What was actually swept on the
+displacement block: coarsening ∈ {SA, unsmoothed aggregation} × smoother ∈ {GS(1), GS(2+2), ilu0,
+iluk(1), chebyshev} × nullspace ∈ {3 translations, 6 RBMs}, `aggr.block_size=3`, Jacobi
+equilibration — **~13 configurations, all on the scalar backend**. Best: SA + GS `npre=npost=2` at
+121–128 iters. That is a reasonable first pass, but three levers with the highest prior expected
+value for elasticity were never touched, and the causal story is unverified:
+
+1. **The block-valued backend was never compiled.** `amgcl-wrapper.hpp` instantiates only
+   `backend::builtin<double>`. `aggr.block_size=3` is *not* a substitute: it only groups dofs during
+   aggregation, the smoothers stay scalar. AMGCL's canonical elasticity recipe is
+   `builtin<static_matrix<double,3,3>>` + `adapter::block_matrix<3>`, which turns GS/ILU0 into
+   *block* smoothers that invert the 3×3 nodal couplings exactly — in AMGCL's own elasticity
+   benchmarks this is what makes ILU0 stop diverging and typically cuts iteration counts severalfold.
+   The ilu0/iluk divergence observed in §13 is the classic scalar-on-elasticity symptom, not
+   evidence about AMGCL.
+2. **The "~52% non-symmetric operator defeats SA" hypothesis was asserted, never measured.** The 52%
+   is *structural* (storage-pattern) asymmetry, which §3.1/§7 themselves trace to
+   `eliminate_zeros()` pruning — a storage artifact. The **value** asymmetry
+   `‖A−Aᵀ‖_F/‖A‖_F` of the displacement block was never computed, and the physics (hyperelastic UL
+   + penalty contact are symmetric operators; the genuinely nonsymmetric damage coupling sits in the
+   *off-diagonal* field blocks) suggests it may be small. One cheap decisive probe exists: build the
+   AMG on the symmetrized block `(A+Aᵀ)/2` and use it to precondition GMRES on the true block. If
+   chebyshev/SA come alive, the nonsymmetry story is wrong and no backend swap is needed.
+3. **Strength-of-connection was never swept.** `aggr.eps_strong` stayed at its default while the
+   block mixes concrete/steel stiffness, ~1e8 contact penalties, and tie condensation. The one
+   anomaly already in the data points here: *unsmoothed* aggregation beat single-sweep SA (173 vs
+   225) — the prolongation smoothing (whose spectral-radius estimate assumes symmetry and is
+   penalty-sensitive) is plausibly being poisoned.
+
+Also unexamined: what hierarchy AMGCL actually built (levels / operator complexity — pyamg managed
+only 3 levels on this block; AMGCL's shape was never printed), the smoothing/cycle intensity curve
+beyond `npre=npost=2` (which alone halved the count), and cross-Newton hierarchy reuse (AMG tolerates
+lagging far better than an LU; today `blockamg` rebuilds every solve — a wall-time lever).
+
+### Plan (all offline on the dumped block, minutes per probe on xeon)
+
+**Phase A — diagnose (~1 h):**
+- A1. Measure value asymmetry of the (scaled) displacement block; also with Dirichlet/identity rows
+  masked. Settles whether the §13 causal story is even true.
+- A2. Log AMGCL's hierarchy (levels, complexity, coarse size) for the current best config — AMGCL
+  streams this via `operator<<` on the solver; surface it through the wrapper or a probe.
+
+**Phase B — the untried levers, in expected-value order:**
+- B1. Symmetrized-preconditioner probe (pure Python, no wrapper change): AMG on `(A+Aᵀ)/2`
+  preconditioning GMRES on the true block; retry chebyshev under it.
+- B2. Sweep `aggr.eps_strong` ∈ {0.0, 0.01, 0.08, 0.2, 0.4} × {SA, aggregation}; `npre/npost` ∈
+  {2,3,4}; `ncycle=2` (W-cycle); 2 V-cycles per outer apply.
+- B3. **Block-valued backend** (~half day): add a compiled `builtin<static_matrix<double,3,3>>`
+  variant to the wrapper (`.hpp`/`.pxd`/`.pyx`, selected by a `blockSize` option), re-run the
+  smoother sweep — block-ILU0 is the headline config. This is the experiment that actually decides
+  AMGCL vs MueLu. Two caveats: AMGCL's `coarsening.nullspace` and block value types do not combine —
+  acceptable, since §13 measured that RBMs don't help here anyway; and with a block backend, try
+  3×3 **block**-Jacobi equilibration in place of the point-Jacobi scaling (point scaling slightly
+  breaks the nodal block structure the backend exploits).
+- B4. **Outer/inner Krylov hygiene** (near-free, add to the B2 sweep): every 121–225-iteration
+  number was `gmres(M=100)` — i.e. it includes at least one restart, and restarted GMRES stalls
+  precisely on operators like this. Re-run the best configs with `M≥300` (no restart), `fgmres`,
+  and `idrs(4)` (which already beat GMRES in §3.5). Plausibly shaves 10–30% by itself.
+- B5. **Chebyshev rehabilitation**: its §13 divergence may be the *spectral estimator*, not the
+  method — the default power iteration assumes symmetry and few iterations. Sweep
+  `relax.power_iters` up and try explicit `relax.lower`/scale bounds. Matters because Chebyshev is
+  the cheapest strong smoother (matvec-only, perfectly threaded) — it is what makes the damage
+  block cost 18 iterations.
+
+**Phase C — fold in and validate:**
+- C1. Winner into `_DEFAULT_VECTOR_PRECOND`; re-run the coupled offline bench (target ≤40 outer
+  iters vs today's 68).
+- C2. The still-owed live pryout `blockamg.inp` validation run (§15).
+- C3. Update this document; only if the block still needs >80 iterations after B1–B5 is the
+  "needs MueLu/Trilinos" conclusion earned.
+
+**Phases A/B — done, and the §13 verdict is retracted.** See [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted).
+
+**Phase D — AMGCL-native production leads (after C, independent of each other):**
+- D1. **Move the whole coupled solve into AMGCL** via `precond.class = schur_pressure_correction`
+  with a `pmask` marking the damage field (pointer-valued, rides the same channel `set_nullspace`
+  proved). Today's `blockamg` outer loop is scipy GMRES — serial matvec plus a Python block-GS
+  callback per iteration (~50 s/solve live). Schur pressure correction is AMGCL's built-in
+  two-field split; it makes the *entire* solve threaded C++ end-to-end. Compare against the
+  hand-rolled block-GS at equal iteration counts; keep whichever wins wall-clock. (The hand-rolled
+  driver stays as the >2-field general path.)
+- D2. **Mixed precision**: compile the hierarchy backend as `builtin<float>` under the
+  double-precision outer Krylov (a preconditioner does not need double). Halves preconditioner
+  memory and bandwidth — directly serves the 1M+ goal and typically costs no iterations.
+- D3. **Lagged hierarchy + Eisenstat–Walker**: reuse a built AMG hierarchy across Newton iterations
+  instead of rebuilding every solve. The §10 break-even that killed lagged-LU does not transfer:
+  an AMG rebuild is O(n) (seconds, not the 15 s reorder+factor), and a slightly stale *hierarchy*
+  is still built from a nearby operator's graph — refresh it every k iterations or on the §10
+  staleness signals. Reuse `inexactnewton`'s forcing logic for the outer tolerance (the live run
+  used a fixed 1e-6 → 115 iters; §10 showed EW-clamped [1e-6, 1e-3] loses nothing on the Newton
+  path — that alone should cut the live outer count substantially).
+- D4. **Scale demonstration**: once the outer count is acceptable, run a ≥1M-dof model (uniformly
+  refined pryout, or boxgen at scale) with `blockamg` vs PARDISO, recording peak RSS and wall.
+  This closes the original feasibility question with data instead of extrapolation.
+
+---
+
+## 17. Phases A/B executed — the §13 "needs MueLu" verdict is retracted
+
+Executed on xeon, same dumped displacement block (`linsolveDumps/A_00_00002.npz`, 214,659 dof,
+28.1M nnz scaled). **Result: a properly tuned AMGCL configuration reaches 20–34 outer GMRES
+iterations on the full 280k-dof coupled system (34/41/29/20/22/21/22/21/20 across all 9 dumped
+Newton iterates) — inside the literature's ~20–40 range, without a block-valued backend (B3) and
+without switching to MueLu/Trilinos.** §13's causal story ("the ~52% non-symmetric condensed
+elasticity operator defeats AMGCL's smoothed aggregation") was an overstatement from an
+under-swept configuration space, exactly as flagged when this phase was scoped.
+
+### A1 — the "52% non-symmetric operator" was a storage artifact, not physics
+
+Measuring `‖A−Aᵀ‖_F/‖A‖_F` (value asymmetry, not the structural/index-set asymmetry §3.1 already
+measured) on the displacement block: **14.6%** raw, **141%** after point-Jacobi scaling — large,
+seemingly confirming §13. But masking out the 24,160 Dirichlet/identity rows (`nnz==1`,
+diagonal-only) **and their columns** drops it to **0.03%** raw / **0.58%** scaled. The condensed
+elasticity operator itself is essentially symmetric; the asymmetry lives entirely in how Dirichlet
+elimination interacts with `eliminate_zeros()` pruning (§3.1/§7), not in the physics (finite strain +
+contact + tie condensation, which §13 blamed). This reframed B1 from "does a near-null-space fix
+save monolithic AMG" (already answered no, §11/§13) to "is the operator that reaches AMGCL actually
+as pathological as claimed" (answered: no).
+
+### A2 — the hierarchy really was shallow, confirmed directly on AMGCL (not just pyamg)
+
+Added `LinearSolver::report()` to the AMGCL wrapper (`amgcl-wrapper.hpp`/`.pxd`/`.pyx`, additive,
+streams AMGCL's own `operator<<`) so the C++ hierarchy stats are inspectable from Python. Default
+SA on the raw block: **3 levels**, operator complexity 1.22 (214659 → 11658 → 1224, i.e. ~18×
+coarsening the first level — far more aggressive than healthy SA's usual ~3–4×). This matches §12's
+pyamg finding but was previously never confirmed on AMGCL's own runtime aggregation. Root cause
+turned out to be the untuned strength-of-connection threshold (B2, below), not a backend limitation.
+
+### B1-corrected — a genuine numerical hazard found, then the real test run safely
+
+The first attempt tested "does symmetrizing the *hierarchy-build* operator let chebyshev/ilu0 stop
+diverging" by building AMG on `(A+Aᵀ)/2` and applying it via a Python `scipy.sparse.linalg.gmres`
++ `LinearOperator` wrapping the wrapper's `build()`/`applyPreconditioner()`. **This produced NaN
+from iteration 0**, confirmed via isolated `applyPreconditioner()` calls (input matrix verified
+clean — no NaN/Inf, canonical CSR, no duplicate indices). Root cause: a Dirichlet dof's row is a
+pure identity (diag 1, nothing else), but `eliminate_zeros()` deliberately keeps the corresponding
+*column* entry in other rows (§3.1/§7). Naively symmetrizing hands that identity row a new spurious
+off-diagonal coupling (half the kept column entry), which corrupts the coarsest AMG level into
+near-singularity. **New gotcha for §8**: never symmetrize a Dirichlet-eliminated operator without
+first masking the Dirichlet rows/columns. Compounding this, a NaN preconditioned residual means
+GMRES's stopping check (`pr_norm <= tol`) never fires — comparisons against NaN are always false —
+so the solve ran for tens of thousands of iterations instead of the intended few hundred before it
+was noticed and killed (see "gotchas" below).
+
+Rerun correctly — masking the Dirichlet rows/columns (A1's approach) rather than symmetrizing them —
+on the resulting 190,499-dof free submatrix, with **no spectral tuning at all**:
+
+| config | iters | note |
+|---|---|---|
+| SA + Gauss–Seidel, npre=npost=2 | 92 | vs 121–128 on the full (Dirichlet-corrupted) block |
+| SA + chebyshev, default | **117, converges** | vs 300/diverged (0.26–0.62 residual) on the full block |
+| SA + ilu0, default | 300, diverges | unchanged — ilu0's problem is separate from Dirichlet handling |
+
+Confirms A1 directly: once the Dirichlet-row corruption is removed, chebyshev converges even with
+zero tuning. ilu0 still fails — its divergence is not explained by the Dirichlet artifact, so it
+remains a dead end here (consistent with a genuinely poor fit to this operator's nonsymmetric
+tie/contact terms, which A1 shows sit in the *free* submatrix, not the Dirichlet rows).
+
+### B2 — the default strength-of-connection threshold was bad
+
+Sweeping `aggr.eps_strong` × {smoothed_aggregation, aggregation}, GS npre=npost=2, on the full
+(untouched) block:
+
+| eps_strong | SA iters | aggregation iters |
+|---|---|---|
+| default (unset) | 129 | 83 |
+| 0.0 | 102 | 94 |
+| **0.01** | **76** | **78** |
+| 0.08 | 121 | 82 |
+| 0.2 | 183 | *(memory blowup, see below)* |
+| 0.4 | 212 | *(not run)* |
+
+`eps_strong=0.01` roughly halves the default's iteration count for both coarsening types. **New
+gotcha for §8**: `aggregation` (plain, non-smoothed) coarsening at `eps_strong=0.2` caused an
+**83.7 GB memory blowup** (44.6% of xeon's 187 GB) — almost certainly a too-high strength threshold
+classifying most connections as weak, producing a barely-coarsening, many-level hierarchy. Killed
+before it produced a result or threatened the shared machine; the two untested `AG` values were
+skipped rather than re-risked, since SA's own numbers already show high `eps_strong` is worse, not
+better. Any future `eps_strong` sweep should run with a hard RSS cap (as `remaining_sweep.py` now
+does — self-aborts above 60 GB) rather than trusting wall-clock alone to catch it.
+
+### B5 — chebyshev's divergence was a bad spectral-radius estimate, not a fundamental limit
+
+Confirms the hypothesis exactly. Sweeping `relax.power_iters` (fused `solve()`, full block, default
+`degree`/`lower`):
+
+| power_iters | iters | note |
+|---|---|---|
+| 0 (AMGCL's cheap default) | 300, diverges | res 0.62 — this is what §13 measured |
+| 5, 10 | 300, diverges | res 0.95–0.99, worse |
+| 20 | 196, converges | |
+| 50 | **96, converges** | |
+| 100 | 97, converges | (no further gain past 50) |
+
+Then sweeping explicit `degree`/`lower` bounds at `power_iters=50`:
+
+| degree | lower | iters |
+|---|---|---|
+| 3 | 0.0333 | 173 |
+| 3 | 0.01 | 142 |
+| 5 | 0.0333 | 96 |
+| 5 | 0.01 | 88 |
+| 8 | 0.0333 | 79 |
+| **8** | **0.01** | **65** |
+
+A short power iteration (AMGCL's default) badly underestimates the spectral radius on this operator;
+a longer one plus a tighter explicit lower bound fixes it outright — no operator-level intervention
+(symmetrization, block backend) needed. This is the more important and more elegant fix than B1's
+symmetrization idea, and it doesn't carry B1's numerical hazard.
+
+### Combined — B2 + B5 stack, and npre/npost matters more once the smoother is good
+
+| config | iters |
+|---|---|
+| SA (default eps_strong) + chebyshev(d=8,lower=0.01,pi=50), npre=npost=1 | 65 |
+| SA (default eps_strong) + chebyshev(d=8,lower=0.01,pi=50), npre=npost=2 | 49 |
+| SA (default eps_strong) + chebyshev(d=8,lower=0.01,pi=50), npre=npost=3 | 41 |
+| SA eps_strong=0.01 + chebyshev(d=8,lower=0.01,pi=50), npre=npost=1 | 38 |
+| **SA eps_strong=0.01 + chebyshev(d=8,lower=0.01,pi=50), npre=npost=2** | **29** |
+
+**29 iterations on the displacement block alone** — down from 121–225 (§13) — is the session's
+headline number. `eps_strong` and the chebyshev spectral fix are synergistic (each alone gives
+~65–78; combined gives 29), and going past npre=npost=2 wasn't tried further (diminishing returns
+were already visible: 65→49→41 for npre=npost=1→2→3 on the untuned-eps_strong variant).
+
+### B4 — Krylov hygiene: restart wasn't the bottleneck for the good preconditioner
+
+On the chebyshev(d=8,lower=0.01,pi=50) config (default eps_strong, 65-iteration baseline):
+
+| outer solver | iters |
+|---|---|
+| gmres, M=100 (restart) | 65 |
+| gmres, M=300 (no restart) | 65 |
+| fgmres, M=100 | 65 |
+| idrs, s=4 | 120 |
+| bicgstab | 97 |
+
+Identical iteration counts with and without restart settle B4's original concern: this
+preconditioner already converges well inside 100 Krylov vectors, so restart wasn't costing anything.
+IDR(s) and BiCGStab are both worse here — standard GMRES remains the right outer solver. (This
+contradicts §3.5's finding that IDR(s) beat GMRES — but that was on the *monolithic*, ILU0-only
+system; with a good block-AMG preconditioner the picture reverses.)
+
+### Folded into production, validated on the full coupled system
+
+`blockamg._DEFAULT_VECTOR_PRECOND` (`edelweissfe/linsolve/blockamg/blockamg.py`) updated to
+`{coarsening: smoothed_aggregation with aggr.eps_strong=0.01, relax: chebyshev(degree=8,
+power_iters=50, lower=0.01), npre=npost=2}` — **uncommitted**, ready for review. Re-ran the full
+280,155-dof coupled offline bench (`blockamg`'s actual field-split + block-GS + outer GMRES, not the
+displacement block in isolation) across **all 9 dumped Newton iterates**:
+
+| ord | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|
+| outer iters | 34 | 41 | 29 | 20 | 22 | 21 | 22 | 21 | 20 |
+
+Down from **68** (§14) to a **20–34** range (ord 3 at 41 is the sole, expected exception — the
+known-hard post-large-correction iterate flagged since §3.4/§10). This is inside both the §16 gate
+(≤80, avoiding the MueLu conclusion) and the literature's ~20–40 target (§4). Residuals match the
+outer tolerance (1e-4) to within the solver's usual preconditioned/true-residual gap (§14 already
+noted a 4e-4 gap on this same solver; ord 3 shows the largest gap here too, 1.6e-2, consistent with
+it being the hardest iterate). Wall time per solve is 14–24 s (single-threaded scipy outer GMRES +
+Python block-GS callback) — worse than PARDISO's ~11.5 s, but wall time was never this phase's
+target; D1 (Schur-pressure-correction, fully-threaded C++ outer solve) is the lever for that.
+
+### Revised verdict
+
+**§13's conclusion — "AMGCL caps at ~120 iterations regardless of near-null-space; efficient
+convergence needs MueLu/Trilinos" — is retracted.** It was correct about the specific configurations
+tested (default eps_strong, default/untuned chebyshev, RBMs) and correct that RBMs don't help (still
+true here — rotations were never revisited this session and B2/B5's wins are orthogonal to the
+near-null-space question). But the configuration space was too shallow to license a backend-level
+conclusion: two parameters neither swept nor diagnosed in §13 (`aggr.eps_strong`, chebyshev's
+spectral-radius estimate) account for essentially the whole gap between "stalls at 120" and "29".
+Neither required a block-valued backend (B3, still untried) or a different AMG library. **AMGCL
+stays the backend.** B3 (the 3×3 block-valued backend) is now a stretch goal for going below ~20
+iterations, not a requirement for feasibility.
+
+### Gotchas worth not rediscovering (additions to §8)
+
+- **Never symmetrize a Dirichlet-eliminated operator naively.** `(A+Aᵀ)/2` gives identity
+  (Dirichlet) rows spurious off-diagonal coupling from `eliminate_zeros()`'s asymmetric column
+  retention (§3.1/§7), which can corrupt the coarsest AMG level into near-singularity and produce
+  NaN. Mask Dirichlet rows/columns instead of symmetrizing across them.
+- **A NaN preconditioned residual defeats GMRES's stopping check silently.** `pr_norm <= tol` is
+  always false against NaN, so a broken preconditioner doesn't fail fast — it runs to whatever
+  iteration cap applies (and scipy's `maxiter`/`restart` interaction can make that cap far larger
+  than expected), looking like a hang rather than a crash. Always sanity-check
+  `applyPreconditioner()`/`solve()` output for NaN/Inf before trusting a "still running" job.
+- **`aggr.eps_strong` too high on plain `aggregation` coarsening can blow up memory**, not just
+  iteration count — 83.7 GB observed on a 214k-dof block. Sweep this parameter with a hard RSS cap.
+- **`MKL_NUM_THREADS`/`OPENBLAS_NUM_THREADS` must be set alongside `OMP_NUM_THREADS` even for
+  offline probe scripts**, not just full simulation runs — scipy/numpy BLAS calls (diagonal
+  scaling, symmetrization, matvecs) oversubscribe otherwise. Two probes sharing a 36-core box each
+  spawned 31 threads (62 total) with only `OMP_NUM_THREADS=16` set on each.
+
+### What remains after this phase
+
+- **Push the config to git** (currently uncommitted local edits): `blockamg.py`'s new default,
+  `amgcl-wrapper.hpp`/`.pxd`/`.pyx`'s additive `report()` method.
+- **Rotations were not revisited.** B2/B5's wins are independent of the near-null-space question;
+  §13's finding that 6 RBMs don't improve over 3 translations stands untouched.
+- **Wall time is still unaddressed** (D1–D3 in §16) — this phase was entirely about iteration
+  count, which was the metric that transfers to a real parallel AMG backend (§12's framing).
+- **The live pryout `blockamg.inp` validation run** (§15) is still owed, now with the improved
+  default — worth re-running given the outer count dropped by half.
+- Only ord 2's dumped system had per-config sweeps (A1/B1/B2/B5/B4); the final validated
+  precond was checked against all 9 ords, but the *diagnostic* sweeps (eps_strong values,
+  chebyshev bounds) were not repeated across ords. Given the consistent 20–34 range on the final
+  config, this is low-risk, but worth knowing if a future ord behaves anomalously.
