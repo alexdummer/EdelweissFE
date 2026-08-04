@@ -53,7 +53,8 @@ def createSolver(opts) -> Callable:
             the intended production backend) or ``"superlu"`` (SciPy, dependency-free, for testing or
             installs without the PARDISO extension).
         ``maxReuse``, ``residualGrowthFactor``, ``etaMin``, ``etaMax``, ``ewGamma``, ``ewAlpha``,
-        ``gmresRestart``, ``gmresMaxOuter``, ``staleIterationThreshold``, ``verbose``
+        ``gmresRestart``, ``gmresMaxOuter``, ``staleIterationThreshold``, ``cheapIterationThreshold``,
+        ``maxProbeBackoff``, ``verbose``
             The policy and GMRES knobs, forwarded to the solver's constructor.
 
         As with the other factories, a non-mapping ``opts`` is tolerated (the implicit-static solver
@@ -110,6 +111,8 @@ def createSolver(opts) -> Callable:
         ("gmresRestart", int),
         ("gmresMaxOuter", int),
         ("staleIterationThreshold", int),
+        ("cheapIterationThreshold", int),
+        ("maxProbeBackoff", int),
         ("verbose", bool),
     ):
         if key in optionMap:
