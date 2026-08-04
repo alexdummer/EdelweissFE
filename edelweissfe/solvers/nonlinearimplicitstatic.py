@@ -110,6 +110,22 @@ class NISTSchema:
     linsolverConfigFile: str | None = schemaField(
         description="A JSON configuration file for the linear solver.", dtype=str, default=""
     )
+    pruneCondensedMatrixZeros: bool | None = schemaField(
+        description=(
+            "Compact explicitly stored zeros out of the multi-point-constraint-condensed system "
+            "matrix before solving (default True, the long-standing behaviour). Setting this False "
+            "keeps the pattern the assembly produced, which is what makes it stable enough across "
+            "Newton iterations for a linear solver to reuse a symbolic factorization -- pruning "
+            "removes whichever entries happen to be exactly zero this iteration, so the pattern "
+            "changes every iteration and reuse can never engage. Off by default because the pruning "
+            "was introduced deliberately: PARDISO's reordering is sensitive to the extra structural "
+            "entries on these path-dependent condensed systems, and keeping them has been observed "
+            "to drift from the converged reference path. Only set False together with a solver that "
+            "actually freezes its reordering, and verify the load path against a reference run."
+        ),
+        dtype=bool,
+        default=True,
+    )
 
 
 class NIST(NonlinearSolverBase):
@@ -137,6 +153,7 @@ class NIST(NonlinearSolverBase):
         "equilibrateAfterModelChange": False,
         "linsolver": "pardiso",
         "linsolverConfigFile": "",
+        "pruneCondensedMatrixZeros": True,
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
@@ -733,7 +750,16 @@ class NIST(NonlinearSolverBase):
         #   poorly conditioned, path-dependent (contact/friction) condensed systems is
         #   sensitive enough to the extra explicit-zero structural entries to visibly
         #   drift from the converged reference path if they are kept.
-        if self.mpcTransformation is not None:
+        #
+        # The pruning has a measured cost, though, which is why it is now switchable: it removes
+        # whichever entries happen to be exactly zero on *this* iteration, so the pattern differs from
+        # one Newton iteration to the next (observed swings of ~200k nnz within a single increment)
+        # and a linear solver can never reuse its symbolic factorization -- worth ~35% of each
+        # iteration on a 280k-dof model. Turning it off is only half the story: it pays off solely in
+        # combination with a solver that then actually freezes its reordering, and the drift the
+        # comment above describes has to be re-checked against a reference load path before it is
+        # adopted. Hence default True.
+        if self.mpcTransformation is not None and self.options["pruneCondensedMatrixZeros"]:
             K.eliminate_zeros()
 
         return K

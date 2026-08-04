@@ -176,11 +176,25 @@ threaded, unlike the SciPy path. Target to beat: **11.46 s** (`bench_amgcl_fixed
 
 ✗ = hit maxiter (500) without converging.
 
-**AMG does not work on this system at all** — not at any tolerance, and *worse* with the correct
-ILU0 smoother than with the default weak one, because ILU0 smoothing is expensive per iteration and
-still does not fix the convergence. This is the expected outcome for an operator that is 52%
-structurally asymmetric, couples two fields with no constant nodal block size, carries a ~1e8
-dynamic range, and has constraint-equation rows that are not an elliptic operator.
+**This measured the configuration that is already known not to work, so it does not license any
+conclusion about AMG on this problem.** Alkmim, Gamnitzer, Dummer, Neuner & Hofstetter, *Algebraic
+Multigrid Based Preconditioning Approaches for Generalized Continuum Models and Indirect Displacement
+Control*, IJNME 127:e70309 (2026), §3.2, states it plainly: *"applying AMG directly to a multi-field
+problem is ineffective"* — multi-field systems need AMG **inside a block preconditioner**. What was
+run above is monolithic, block-unaware AMG on the coupled system. Two specific defects:
+
+- **No near-null-space.** AMGCL's smoothed aggregation defaults to a single constant vector. For an
+  elasticity block the near-null-space is the **rigid body modes** — 6 in 3D (that paper, Table 1 and
+  §3.3). Withholding them is on its own enough to make AMG useless on an elasticity operator, and it
+  is the most likely single cause of the failure above.
+- **No block structure.** The paper's two working strategies are *nested AMG* (B-AMG): AMG per field
+  inside a block Gauss–Seidel preconditioner, Eq. (44)/(46); and *monolithic AMG* (AMG-B): block
+  transfer operators and block smoothers so the coupling is represented on every hierarchy level,
+  Eq. (50)/(51). Both reach ~1e-7 with GMRES on 348k–1.95M-dof three-field systems of the same model
+  class (gradient-enhanced micropolar, Marmot constitutive models).
+
+The ILU0 numbers stand on their own — that path is block-agnostic by nature — but the AMG rows should
+be read as "not yet tested", not as evidence against AMG.
 
 **Single-level ILU0 works but is not competitive.** The best configuration, IDR(s=4) + ILU0, is
 slower than the direct solve at every usable tolerance: 20.6 s at 1e-4 versus 11.46 s, i.e. **1.8×
@@ -188,17 +202,17 @@ slower**. The 1e-2 rows look close on wall time but are useless as Newton correc
 residual leaves a **15–19% error** in the solution, another consequence of the conditioning
 (residual is not error here).
 
-**This refutes the "it just needs to be properly parallel" hypothesis directly.** AMGCL *is*
-properly parallel and it still loses. Compare at the same 1e-4 tolerance:
+**What this does settle: parallelism is not the missing ingredient.** AMGCL *is* threaded end to end
+and still loses, because at the same 1e-4 tolerance:
 
 | | iterations to 1e-4 | wall |
 |---|---|---|
 | lagged exact LU + SciPy GMRES (partly serial) | **4–9** | 3–7 s |
 | AMGCL ILU0 + IDR(s), fully threaded | **298** | 20.6 s |
 
-~35× more iterations. Preconditioner *quality* dominates, and parallelism cannot make up the
-difference. On this system only an exact factorization — even a stale one — is a good enough
-preconditioner.
+~35× more iterations. Preconditioner *quality* dominates by a margin threading cannot recover. That
+conclusion is about **ILU0**, and it is what motivates trying a *good* preconditioner (block AMG with
+rigid body modes) rather than abandoning the iterative route.
 
 Two defects found and fixed along the way (`dca36610`, `731bb2b3`): AMGCL's iteration count and
 error were computed and discarded, so an unconverged solve was indistinguishable from a converged
@@ -206,9 +220,20 @@ one (a finite wrong answer passes the nonlinear solvers' NaN check); and the AMG
 `relax`, not `relaxation`, so the wrapper's shipped "BiCGStab + ILU0" default had never actually used
 ILU0 — AMGCL warns on stderr about the unknown key and silently substitutes its default.
 
-Still untried: AMGCL's `schur_pressure_correction` / field-split preconditioners against the
-`[0, 214659) | [214659, 280155)` block structure, and a scaling/equilibration pass to attack the 1e8
-dynamic range. Given the margin above, neither looks likely to close a 35× iteration gap.
+**What a proper test needs** (none of it expressible through the current wrapper, which only forwards
+a JSON parameter tree):
+
+- **Rigid body modes** as `precond.coarsening.nullspace` — AMGCL takes these as a raw pointer in its
+  property tree, so they cannot come through JSON. Needs an optional array argument threaded through
+  `.pyx` / `.pxd` / `.hpp`. This is the highest-value single change.
+- **Block/field-split**, either `precond.class = schur_pressure_correction` with a `pmask` over the
+  `[0, 214659) | [214659, 280155)` split (also a pointer, same problem), or a hand-rolled block
+  Gauss-Seidel following Eq. (44)/(46).
+- Possibly a scaling/equilibration pass against the 1e8 dynamic range.
+
+For reference, the paper's own stack is Trilinos — Belos (GMRES, no restarts), Teko (block
+preconditioner), MueLu (AMG), Chebyshev(6, 20) smoothers, 3 levels — which is a plausible alternative
+to extending the AMGCL wrapper if that turns out awkward.
 
 ### 3.6 What the first reading got wrong
 
@@ -394,9 +419,10 @@ it does not care whether the pattern is stable.
 - **Phase 3.** Lead 1 is unblocked and is the place to start; Lead 2 is blocked on §7.
 - **The nonlinear cost of loose linear tolerances.** Lead 1's headline assumes Newton is unharmed by
   a 1e-4 linear solve. Unverified, and it could eat the gain.
-- **AMGCL field-split / equilibration.** §3.5 rejected AMGCL as configured; `schur_pressure_correction`
-  against the two-field block structure and a scaling pass against the 1e8 dynamic range remain
-  untried, but face a 35× iteration gap.
+- **AMG done properly.** §3.5's AMG rows tested the configuration the literature already calls
+  ineffective (monolithic, block-unaware, no near-null-space). Rigid body modes + a block
+  preconditioner, per Alkmim et al. (2026), are the real test and are untried. Requires extending the
+  AMGCL wrapper to accept pointer-valued parameters, or using Trilinos as that paper does.
 - **Docs.** `doc/source/documentation/linsolvers.rst` is stale — omits `amgcl` and now `matrixdump`,
   and still claims only `gmres` accepts a config file. Per `CLAUDE.md`, docs gate merging.
 - **Tests.** Nothing covers `matrixdump` or `factorize`/`solveFactorized`.
