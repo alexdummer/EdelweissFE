@@ -50,12 +50,22 @@ has begun. Two cheap leads are now measured on the real model:**
   float cannot shrink) turned out to be a large share of hierarchy bandwidth (§19.3). Hierarchy
   reuse shipped but is provably inert here (the pattern churns every iteration). The shipped
   default's behaviour is unchanged.
-- **Phase 5 is planned, not started** ([§20](#20-phase-5-plan--b3-first-then-the-ew-rescue-experiment-on-the-final-setup)):
-  Part 1 = **B3, the block-valued backend**, promoted by §19.3's index-bandwidth finding from
-  stretch goal to the strongest remaining wall-clock lever — it settles the final solver
-  configuration. Part 2 = the **EW rescue** (true-residual outer stopping, then an `etaMax` ladder
-  starting at 1e-4), deliberately run only against that final setup. Ordering is an explicit
-  decision (Matthias). D4 (the ≥1M-dof demonstration) is the phase after.
+- **Phase 5 executed** ([§20](#20-phase-5-plan--b3-first-then-the-ew-rescue-experiment-on-the-final-setup)):
+  Part 1 — **B3, the block-valued backend** — implemented and correct but **failed its bar**: a ~23%
+  aggregate wall-clock *regression* inside the block-GS preconditioner (despite winning standalone;
+  a better standalone solver is not a better single-cycle preconditioner). Default stays scalar.
+  Part 2 — the **EW rescue** — **succeeded**: true-residual stopping closed the
+  preconditioned-vs-true residual gap that caused §19.2's trajectory change, both `etaMax` ladder
+  rungs passed strictly, and **EW forcing shipped as the default (`etaMax=3e-4`,
+  commit `76cb09da`)**. Net: trajectory-safe and an accuracy gap closed, but live wall-clock stays
+  at PARDISO parity (81.3 s vs 83.9 s) — fixed per-solve costs dominate, not outer iterations.
+- **Phase 6 is planned, not started** ([§21](#21-phase-6-plan--attack-the-fixed-per-solve-costs-stable-pattern-part-a-cached-pattern-condensation-part-b)):
+  attack those fixed per-solve costs. Part A = a stable sparsity pattern via
+  `pruneCondensedMatrixZeros=False` under blockamg, to activate the shipped-but-inert hierarchy
+  reuse. Part B = the MPC condensation rebuilt as a cached-pattern value scatter (the assembly-side
+  half of Lead 2, no §7 exposure). Includes a mandatory metric-reconciliation prerequisite (§21.0) —
+  the `Job computation time` figure the Phase 4/5 parity claims rest on does not reconcile with the
+  offline per-solve measurements. D4 (the ≥1M-dof demonstration) remains the phase after.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -2085,3 +2095,232 @@ count, which is where every lever in §19 and §20 has been aimed.
 
 The §19 "Execution notes for the hand-off agent" apply to this phase verbatim (xeon workflow, env
 vars, gotcha lists, commit conventions, no pushing).
+
+---
+
+## 21. Phase 6 plan — attack the fixed per-solve costs: stable pattern (Part A), cached-pattern condensation (Part B)
+
+Planned (this session), not started. Motivation is §20's closing finding: live wall-clock is
+dominated by per-solve *fixed* costs — the AMG hierarchy build + equilibration (~21% of a blockamg
+solve, §18) and the MPC condensation (2.75 s per Newton iteration, single-threaded, §2) — not by
+the outer iteration count every §19/§20 lever targeted. Two independent parts:
+
+- **Part A (~half day, mostly xeon runs):** an experiment, not a build. Turn off
+  `pruneCondensedMatrixZeros` under `blockamg` so the sparsity pattern stops churning, which should
+  let the already-shipped-but-inert hierarchy reuse (§19.2(b)) engage. Zero new code before the
+  measurements; the open question is whether reuse buys more than the fatter (unpruned) matrix
+  costs.
+- **Part B (~1–1.5 days):** implementation. Rebuild `transformSystemMatrix` as a value scatter into
+  a cached pattern instead of two SciPy SpGEMMs per iteration. Benefits *every* linsolver on every
+  MPC-carrying model. This is the assembly-side half of Lead 2 only — it does **not** touch
+  PARDISO's reordering freeze, which stays blocked on §7 (Matthias).
+
+**Part B does not depend on Part A's outcome.** Run A first because it is cheaper and its nnz-growth
+measurement (A1) informs B; if A stops early at any gate, proceed to B regardless.
+
+The §19 "Execution notes for the hand-off agent" apply verbatim (xeon workflow in
+`~/constitutive_modeling/next_v2611/Pryout_profile_investigation/`, never the real project dir;
+`PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHON_GIL=0`, output redirected to log
+files; §8/§17 gotcha lists; conventional commits; nothing pushed to `mn`). D4 (the ≥1M-dof
+demonstration) remains the phase after this one — do not start it here.
+
+### 21.0 Measurement basis for every gate in this phase (read once, then follow)
+
+Neither internal timing figure is a safe gate metric. The per-category `acc. runtime` table is
+provably corrupted under `PYTHON_GIL=0` (§19.1's gotcha). And `Job computation time` — the number
+§19/§20's parity claims used — does not reconcile with the offline evidence: 44 live solves at the
+offline-verified ≥11.5 s/solve cannot fit inside 83.9 s, so treat it as suspect rather than
+authoritative. Do not investigate why (out of scope); instead:
+
+- **Every wall-clock gate in this phase uses externally measured whole-run time** — wrap each run
+  in `date +%s` before/after (or `/usr/bin/time -v`, which also gives peak RSS), recorded in the
+  log.
+- **A/B comparisons are always same-session, back-to-back runs** on xeon (§19.4's load gotcha —
+  cross-session absolute numbers differ by ~30% under contention).
+- Offline probes keep timing with their own `perf_counter()` as all prior probes did — those
+  numbers are trustworthy.
+- If the externally measured baseline turns out far from 83.9 s, add one sentence to §19.1/§20.2
+  flagging that their parity claims are metric-relative. Record forward; do not rewrite history.
+
+### 21.1 Part A — `pruneCondensedMatrixZeros=False` under blockamg: does a stable pattern activate hierarchy reuse, and does it pay?
+
+**Hypothesis chain (each link already in evidence).** The pattern churn (§3.1) is caused by
+`K.eliminate_zeros()` at `nonlinearimplicitstatic.py:810` pruning whichever entries happen to be
+exactly zero *this* iteration (contact/damage state). Upstream of that pruning the pattern is
+fixed within a step: the assembled `K` is the csrGenerator's persistent buffer with a fixed
+assembly map (see the long comment in `applyDirichletK`, `nonlinearimplicitstatic.py:781-809`),
+the MPC transformation `T` is rebuilt only on model change (`nonlinearimplicitstatic.py:352`), and
+SpGEMM/`+ C` output patterns are structural, hence deterministic. So with pruning off, `A.nnz` is
+constant between model changes → blockamg's pattern-change guard (`blockamg.py`, the
+`_lastNnz` comparison) stops forcing a refresh every call → hierarchy reuse engages, saving the
+~3.4 s/solve hierarchy build (§18). The equilibration-apply and off-diagonal split still run every
+solve regardless of reuse (see `__call__`) — that residual fixed cost is A5's optional follow-up.
+
+**Known counter-force — this is the experiment's actual question.** Keeping the zeros grows nnz:
+§3.1's 21.1M structurally asymmetric entries are pruned partners, so the unpruned matrix could
+carry up to ~+50% nnz, and the smoother apply — 68% of a solve (§18) — scales with nnz. The
+hierarchy build itself also gets more expensive on a fatter matrix. Reuse must buy more than the
+fatter matvecs cost. Measure; do not argue from priors.
+
+**A1 — fresh capture with pruning off (~20 min).** The existing `linsolveDumps/` were captured
+with pruning on, so a new set is needed: `capture_noprune.inp` = `capture.inp` +
+`pruneCondensedMatrixZeros=False` on the same options line that carries `linsolver=matrixdump`
+(it is a NIST option, schema at `nonlinearimplicitstatic.py:115`). Copy `linsolveDumpConfig.json`
+and change its `directory` to `linsolveDumpsNoPrune`. Run per §6. Then:
+
+1. `python $B pattern linsolveDumpsNoPrune` — the gate. Expect `UNCHANGED` (index-array
+   comparison) between consecutive iterates of the same increment. **If the pattern still
+   churns**, the fixed-pattern assumption fails at this layer; record which arrays differ, stop
+   Part A, and carry the finding into Part B (whose identity-based cache invalidation, B1, is
+   designed to survive exactly this).
+2. Record nnz vs the pruned dumps' ~40.9M (`manifest.jsonl` in both dirs) — the growth factor is
+   the headline input to A2's economics.
+3. Caveat to record: this capture's delegate is PARDISO solving *unpruned* systems — the §7 drift
+   scenario. Compare the capture log's Newton path against `baseline_omp16.log` (15/8/5/5, three
+   cutbacks). If it differs, the dumps remain valid specimens for A2 (the replay question is about
+   the solver, not the trajectory), but say so here — it is also a free §7 data point either way.
+
+**A2 — offline replay, three-way, same probe run.** New probe modeled on
+`probe_192_sequence.py` (xeon, investigation dir, ad hoc, not checked in). Three arms, interleaved
+in one script invocation, all with the shipped default config (EW forcing `etaMax=3e-4`,
+true-residual stopping):
+
+- (i) no-prune dumps, **one** `BlockAMGSolver` instance, sequence order → reuse allowed to engage;
+- (ii) no-prune dumps, one instance but `solver._refreshNext = True` forced before every call →
+  same systems, reuse denied; isolates the reuse benefit from the nnz-growth cost;
+- (iii) pruned dumps (`linsolveDumps/`), one instance → today's live behaviour, the baseline.
+
+Record per ord: the solver's own REFRESH/reuse decision, outer iterations, true-residual
+continuation count (a staler `M` widens the preconditioned/true gap, so continuations are part of
+the honest cost), true residual, `perf_counter` wall. Confirm reuse actually engages in (i) and
+note how often the `hierarchyStalenessFactor` backstop fires.
+
+**Bar** (the same one every prior default change cleared): (i) beats (iii) by **≥20% aggregate
+wall**, no ord regressing past ~1.05×, tolerances still met. If (i) loses to (iii) because nnz
+growth eats the reuse saving: record the table and stop Part A — "a stable pattern does not pay at
+280k under blockamg" is itself a valuable, citable conclusion (it also caps what Lead 2 could ever
+buy blockamg, without touching its value for the direct-solver path).
+
+**A3 — live gate (only if A2 clears).** `blockamg_noprune.inp` = `blockamg.inp` +
+`pruneCondensedMatrixZeros=False`. Run per §19.1's command, plus a back-to-back rerun of the
+unmodified `blockamg.inp` in the same session (§21.0). Pass: trajectory identical (15/8/5/5,
+cutbacks `0.0025`/`0.00125`/`0.000625`, final `U_loading=0.021875`) and an external-wall win
+roughly matching A2's margin. Correctness risk is structurally low — reuse never changes the
+answer (outer GMRES runs on the fresh matrix; true-residual stopping enforces the tolerance) — but
+the unpruned matrix reaching AMG has more (zero-valued) entries, so hierarchies and outer counts
+may shift; that is expected, not alarming.
+
+**A4 — ship/record.** Do **not** flip the `pruneCondensedMatrixZeros` default — its `True` default
+protects the PARDISO path (§7). On a pass: document the recommended pairing (blockamg +
+`pruneCondensedMatrixZeros=False`) with measured numbers in
+`doc/source/documentation/linsolvers.rst`, and extend the option's schema docstring (currently
+worded around frozen reorderings only) to name hierarchy reuse as the second legitimate consumer.
+Update this document either way.
+
+**A5 — optional, only after a live pass and only if the reuse win is visibly capped by the
+remaining per-solve fixed cost.** With a stable pattern, the equilibration-apply and off-diagonal
+split (~2.1 s/solve, §18) can be cached too: `As.data` computed as
+`dinv[row] * dinv[col] * A.data` via a precomputed row-index expansion, block submatrices via
+cached index gathers. Separate commit, own offline A/B.
+
+### 21.2 Part B — MPC condensation on a cached pattern (value scatter instead of two SpGEMMs)
+
+**Target.** `MultiPointConstraintTransformation.transformSystemMatrix`
+(`edelweissfe/numerics/mpctransformation.py:204`): `TᵀK` 1.485 s + `(TᵀK)T` 0.296 s +
+`+C`/`tocsr`/`sort_indices` 0.970 s ≈ **2.75 s per Newton iteration**, single-threaded SciPy,
+~14% of the reference job and growing as a share with every core added (§2, §3.3).
+
+**Why it is safe (scope guard).** This changes *how* `TᵀKT + C` is computed, not *what*: with
+pruning left on (the default), the downstream `eliminate_zeros()` makes the final matrix identical
+to today's in pattern, and in values up to summation-order round-off — no §7 exposure. It composes
+with Part A trivially (A only switches that downstream pruning off). The frozen-reordering half of
+Lead 2 remains out of scope.
+
+**B1 — verify the two cache-invalidation facts before writing code (~30 min).**
+
+1. `K`'s CSR arrays are persistent and returned by reference every iteration with a fixed pattern
+   (the `applyDirichletK` comment asserts this; verify `K.indices is` the same object across two
+   assembly calls on any tie testfile). Consequence: `K.indices is self._cachedKIndices` is a
+   valid O(1) staleness check.
+2. `self.mpcTransformation` is reconstructed wholesale on model change
+   (`nonlinearimplicitstatic.py:352`, constructed in `nonlinearsolverbase.py:512`) and never
+   mutated in place — so caches stored **on the transformation object** die at exactly the right
+   time, with no epoch counter needed. Verify no other mutation/call site exists (grep).
+
+If either fact does not hold, add an explicit invalidation key instead — but verify first.
+
+**B2 — implementation (primary design: D+S split, pure numpy/scipy, no build-system work).**
+Decompose `T = D + S` once at construction: `D` = diagonal selector (1 on independent DOFs, 0 on
+slaves), `S` = the slave rows only (~16.5k rows, ~2–3 nnz each, on the reference model). Then
+
+```
+TᵀKT + C  =  DKD  +  DᵀKS  +  SᵀKD  +  SᵀKS  +  C
+```
+
+- `DKD` is `K` with slave rows/columns masked: pattern = `K`'s own; values = `K.data ×` a float
+  mask precomputed once per epoch. Pure numpy, ~tens of ms.
+- The three `S`-terms are SpGEMMs with one tiny operand (~40k nnz) — expected well under 0.3 s
+  total; their output patterns are fixed per epoch. Measure each.
+- **First call of an epoch:** compute the decomposition's sum once with plain scipy ops, keep it
+  as the returned matrix, and harvest the caches: the union pattern (`indices`/`indptr`, built
+  sorted once), per-term scatter maps (position of each term's nnz inside the union CSR —
+  vectorized `searchsorted` within `indptr` ranges), and `C`'s pre-scattered baseline data vector.
+  Each term's map is duplicate-free (a CSR pattern maps injectively into a superset pattern), so
+  plain fancy-index `+=` is safe, term by term.
+- **Subsequent calls:** fresh output data array; `out[:] = cBase`, then one `+=` per term. No
+  SpGEMM on `K`.
+- **Aliasing hazard — do not skip this.** The returned matrix must **not** alias the cached
+  `indices`/`indptr`: downstream, `applyDirichletK` zeroes values in place and
+  `eliminate_zeros()` **compacts the index arrays in place** — exactly the corruption mechanism the
+  `applyDirichletK` comment documents for the csrGenerator buffer. Return
+  `csr_matrix((freshData, indices.copy(), indptr.copy()))` every call; the ~165 MB index copy costs
+  tens of ms against the ~2.5 s saved. Micro-optimize later only with that hazard designed around.
+- Pattern note: `DKD` carries `K`'s full pattern, so the cached union is a slight superset of the
+  legacy product's structural pattern (explicit zeros at slave rows/columns). With pruning on this
+  is erased downstream; with pruning off (Part A) it just means a slightly larger stable pattern —
+  record the nnz delta. If exact legacy-pattern parity is ever wanted, compress `DKD` through a
+  precomputed gather instead; not required to ship.
+- **Exactness assertion** behind a debug flag (env var), on through all of B3: on the second call
+  of each epoch, also compute the legacy scipy expression and require max |Δ| ≤ 1e-9 × max|data|
+  on the pattern-aligned arrays (matrix-norm-relative — entry-relative fails on cancellation-tiny
+  entries).
+- Keep it switchable (option through `buildMPCTransformation`); default decided in B3.
+- Fallback design, only if measurement shows the S-terms or the scatter dominating (≥0.5 s): a
+  Cython numeric-only Gustavson kernel into the cached patterns (`numerics/`, `prange` over rows).
+  Real work — do not start it unless the pure-Python numbers demand it.
+
+**B3 — validation.**
+
+1. **Exactness:** full `run_tests_edelweissfe ./testfiles/edelweiss-only/` with the debug
+   assertion on — identical results (the tie/AMR/contact cases are the ones that exercise this
+   path). `NodeToDeformableSurfaceContactPullOut` fails pre-existing (§9) — confirm it fails
+   *identically*, then ignore. Then `./testfiles/marmot/` where built.
+2. **Live trajectory:** the pryout on xeon, both `profile.inp` (PARDISO) and `blockamg.inp`, each
+   with the cached path on, back-to-back with their unmodified references (§21.0). The strong
+   check: with pruning on, the solver sees the same matrix up to round-off, so the journal's
+   increment/cutback/`U_loading` sequence should match byte-for-byte on this 5-increment window.
+3. **Performance:** externally timed A/B (§21.0), plus per-call `perf_counter` prints around the
+   transform behind a temporary env flag (the internal table is not trustworthy, §19.1). Target:
+   the transform stage ≥2× (2.75 → ≤1.4 s), expected ~5× (≤0.6 s); job-level win bounded by the
+   stage's ~14% share at 16 threads.
+4. **Ship decision:** default **on** only if (1) is green, (2) matches byte-for-byte on both
+   solvers, and (3) clears ≥2× on the stage. If (2) shows round-off-level trajectory divergence,
+   ship default **off** with the numbers recorded and escalate to Matthias — that is a §7-class
+   judgement (value round-off from summation order, much milder than §7's structural case, but the
+   same person's call).
+
+**B4 — docs + housekeeping.** Update the relevant Sphinx page (wherever MPC condensation is
+documented; `linsolvers.rst` cross-reference at minimum) and this document. While committing:
+finally gitignore `edelweissfe/linsolve/klu/klu.c` (§8/§15 — it has bitten twice).
+
+### 21.3 Sequencing, and what is explicitly out of scope
+
+1. §21.0's measurement discipline governs every gate. Then Part A (A1 → A4, A5 optional), then
+   Part B (B1 → B4). B proceeds regardless of where A stops.
+2. **Out of scope:** D4 (next phase, run on whatever configuration this phase leaves); PARDISO's
+   frozen reordering (§7, Matthias); the `performancetiming` thread-safety fix (general infra,
+   tracked separately); D1, rotational RBMs, mixed precision, B3-as-preconditioner (all measured
+   and closed, §19/§20).
+3. Update this document as results land, in the style of §17–§20: record failures and their
+   mechanisms with the same care as wins, and never change a shipped default without the ≥20%
+   bar plus a live trajectory-identical gate.
