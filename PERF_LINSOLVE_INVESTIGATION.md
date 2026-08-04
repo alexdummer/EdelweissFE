@@ -4,8 +4,9 @@ Branch `perf/linsolve-investigation`, based on `feat/amr-recovery-marker` (`d495
 Local, remote `mn` and xeon in sync. Working tree clean.
 
 **Status: Phases 1 (instrument + capture) and 2 (offline benchmark) are complete. Phase 3
-(implement) has not started.** Two leads survive measurement; see [§4](#4-recommendation). One open
-question blocks part of it, see [§7](#7-the-open-question).
+(implement) has not started.** Two measured leads plus one untested-but-not-excluded route; see
+[§4](#4-recommendation), which ends with a suggested order of work. One open question blocks part of
+it, see [§7](#7-the-open-question).
 
 > **A verdict was reversed during this investigation.** An earlier version of this document
 > concluded the iterative route was dead. That was an artefact of benchmarking GMRES at
@@ -32,8 +33,16 @@ Two independent wins, both measured, which stack:
 
 They compose: (1) removes most direct solves, (2) makes the periodic refactorization cheaper.
 
-Neither is the thing originally proposed. Plain "GMRES + AMG/ILU" is not what pays off — the payoff
-comes from reusing exact factorizations across Newton iterations.
+Neither is the thing originally proposed. Plain "GMRES + ILU" is not what pays off — the payoff comes
+from reusing *exact* factorizations across Newton iterations.
+
+**But note which problem that solves.** Both wins keep a direct factorization in the loop, so both
+inherit PARDISO's memory ceiling: they make the present model faster, they do not raise the size limit.
+The original framing was "PARDISO becomes the bottleneck past 500k dof" — if that means *time*, these
+two wins are the answer; if it means *memory at 1M+ dof*, only a genuinely factorization-free
+preconditioner (block AMG, §3.5) removes the wall, and that remains untested. At the current 280k dof
+the model peaks at 18.9 GB of 187 GB, so the wall is not close. **Which of those two goals is meant
+should be settled before Phase 3, because it changes the ordering in [§4](#4-recommendation).**
 
 ---
 
@@ -157,7 +166,7 @@ it is a single iteration.
 iterate right after the large first correction, it has the largest amplification (below), and the
 smallest `‖b‖` (4.1e-2). **The first solve after a big state change should stay direct.**
 
-### 3.5 `amgcl` — fully parallel, and still loses
+### 3.5 `amgcl` — ILU0 loses; AMG was mis-configured and is still untested
 
 AMGCL on its OpenMP `builtin` backend, 16 threads — matvec, smoother and orthogonalization all
 threaded, unlike the SciPy path. Target to beat: **11.46 s** (`bench_amgcl_fixed.log`).
@@ -282,17 +291,48 @@ solve. Design implied by the data:
   to check in Phase 3.
 - Refactorize when the iteration count exceeds a threshold (~15, the break-even).
 
+Use **1e-4** as the forcing tolerance, not 1e-2. 1e-2 looks tempting (a single GMRES iteration) but
+leaves a **15–19% error in the correction** — residual is not error on this system. At 1e-4 the
+deviation from the direct solution is ~5e-4.
+
 **Lead 2 — deterministic pattern + frozen symbolic factorization.** 1.78× on the direct solves that
 remain. Requires building `TᵀKT + C` on a cached pattern and scattering values into it instead of
 running two SciPy SpGEMMs per iteration, which also recovers most of the 2.75 s condensation cost.
-Blocked on [§7](#7-the-open-question).
+The pruning half is already switchable via `pruneCondensedMatrixZeros` (`b0ad20bf`); the pattern
+caching is not written. Blocked on [§7](#7-the-open-question).
 
-**Not a lead — AMGCL.** Tested (§3.5) and rejected. AMG does not converge on this system at any
-tolerance; single-level ILU0 does, but at 1.8× the direct solve. It is fully OpenMP-parallel and
-still loses, because it needs ~35× more iterations than a lagged exact LU. Parallelism was not the
-missing ingredient; preconditioner quality is.
+**Lead 3 — block AMG, if the goal is size rather than speed.** §3.5's AMG rows do *not* rule this out;
+they measured the configuration the literature already calls ineffective. This is the only route that
+removes the memory ceiling, and Alkmim et al. (2026) show it working on 348k–1.95M-dof systems of this
+exact model class. It is also the most work, and the expensive part is not the AMGCL wrapper (~70 lines
+for pointer-valued `nullspace`/`pmask`) but the fact that **rigid body modes need nodal coordinates,
+which `createSolver(opts)` never receives** — a real widening of the linsolver interface.
+
+So prove it offline before plumbing anything:
+
+1. **Cheap partial test, no geometry needed.** The three *translational* near-null-space vectors are
+   constructible from the DOF layout alone (displacement is field-major, node-major, 3 components per
+   node). Translations dominate the elasticity near-null-space; if AMG does not improve at all with 3
+   candidates instead of AMGCL's default 1, rotations will not rescue it. Highest information per hour
+   available on this question.
+2. **If that is promising**, dump nodal coordinates + field slices alongside the matrices (small
+   `matrixdump` extension), build all 6 RBMs offline, add the field-split `pmask`, and re-benchmark
+   against the same 11.46 s target.
+3. Only then consider widening the linsolver interface.
+
+Before any of that, read the iteration counts off Alkmim et al.'s own tables. **Not extracted here** —
+if block AMG needs ~30 V-cycles at ~0.3 s each on a 40M-nnz operator that is ~9 s, i.e. comparable to
+the direct solve rather than clearly better at *this* size. That number should gate step 1.
 
 **Also:** pin threads to one socket (§3.3).
+
+### Suggested order of work
+
+1. **Lead 1** — lagged LU + Eisenstat-Walker forcing. Measured, unblocked, code already present.
+2. **Verify the nonlinear cost of a 1e-4 linear tolerance.** The one unmeasured thing that could eat
+   Lead 1 outright: one run, compare Newton iteration counts against `baseline_omp16.log`.
+3. **Lead 3 step 1** — the ~2 h AMGCL translations test, to settle the AMG question on evidence.
+4. **Lead 2** — pattern caching, together with the drift validation in §7.
 
 ---
 
@@ -310,6 +350,8 @@ missing ingredient; preconditioner quality is.
 | `46cac2c6` | this handoff document |
 | `dca36610` | surface AMGCL's iteration count/error (they were discarded); add the `amgcl` benchmark |
 | `731bb2b3` | fix AMGCL's AMG smoother key (`relax`, not `relaxation`); sweep tolerance |
+| `68f31121` | record the AMGCL result in this document |
+| `b0ad20bf` | `pruneCondensedMatrixZeros` option; correct the AMGCL section's over-broad claim |
 
 New/changed files:
 
@@ -377,6 +419,14 @@ Blocks Lead 2 only. `eliminate_zeros()` is **deliberate** —
 There is also `stash@{0}`, *"fix(solvers): restore eliminate_zeros() on the MPC-transformed
 matrix"* — so this has been fought over once, on **reproducibility** grounds, not correctness.
 
+The pruning is now switchable via the `pruneCondensedMatrixZeros` solver option (`b0ad20bf`),
+**defaulting to True, i.e. unchanged behaviour**. Measured on `TieHexa20Patch` with it off: 6303
+explicit zeros retained, and structurally asymmetric entries fall from 8828 to **494** — the pruning
+was also what destroyed the pattern's near-symmetry, which plausibly hurt the reordering it was meant
+to protect. Convergence histories agree to round-off (residuals 2.05e-13 vs 1.85e-13, identical
+iteration counts). That round-off difference *is* the drift mechanism in miniature: harmless on a patch
+test, unproven over hundreds of softening increments.
+
 **Argument for retrying:** the drift mechanism described is the reordering *changing* in response to
 structural entries. A fixed pattern with a symbolic factorization computed once and frozen for the
 step removes that variability rather than adding to it. §3.2 supports this indirectly (1e-13…1e-15
@@ -417,6 +467,9 @@ it does not care whether the pattern is stable.
 ## 9. Not done
 
 - **Phase 3.** Lead 1 is unblocked and is the place to start; Lead 2 is blocked on §7.
+- **Which goal is meant** — faster at 280k dof, or feasible at 1M+ dof. §1. This decides whether Lead 3
+  is optional or mandatory.
+- **The iteration counts in Alkmim et al. (2026)**, which would gate the AMG work cheaply. Not read.
 - **The nonlinear cost of loose linear tolerances.** Lead 1's headline assumes Newton is unharmed by
   a 1e-4 linear solve. Unverified, and it could eat the gain.
 - **AMG done properly.** §3.5's AMG rows tested the configuration the literature already calls
@@ -425,7 +478,12 @@ it does not care whether the pattern is stable.
   AMGCL wrapper to accept pointer-valued parameters, or using Trilinos as that paper does.
 - **Docs.** `doc/source/documentation/linsolvers.rst` is stale — omits `amgcl` and now `matrixdump`,
   and still claims only `gmres` accepts a config file. Per `CLAUDE.md`, docs gate merging.
-- **Tests.** Nothing covers `matrixdump` or `factorize`/`solveFactorized`.
+- **Tests.** Nothing covers `matrixdump`, `factorize`/`solveFactorized`, or
+  `pruneCondensedMatrixZeros=False`.
+- **Pre-existing, unrelated:** `run_tests_edelweissfe ./testfiles/edelweiss-only/` has one failure,
+  `NodeToDeformableSurfaceContactPullOut`. Verified to fail identically with this branch's changes
+  stashed, so it predates this work — but it is a *contact* test, and this branch's subject matter is
+  adjacent enough that it is worth a look.
 - **Whether this branch should merge as-is.** `matrixdump` and `benchmark_linsolve.py` are
   investigation tooling; the timings and the phase-separated PARDISO methods are worth keeping
   regardless. Decide deliberately.
