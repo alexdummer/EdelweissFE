@@ -48,8 +48,12 @@ def createSolver(opts) -> Callable:
         :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`):
 
         ``outerTol``, ``outerRestart``, ``outerMaxiter``, ``sweeps``, ``symmetric``, ``verbose``
-            The outer GMRES and block Gauss-Seidel knobs. ``outerTol``, if given, fixes the outer
-            tolerance and disables the Eisenstat--Walker forcing described next.
+            The outer GMRES and block Gauss-Seidel knobs. ``outerTol`` defaults to a fixed ``1e-6``;
+            pass the literal string ``"adaptive"`` (JSON has no bare ``null`` in this cast pipeline) to
+            opt into the Eisenstat--Walker forcing described next -- not the default, since a live
+            confirmation run changed the Newton path itself, see
+            :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver` and
+            PERF_LINSOLVE_INVESTIGATION.md §19.2.
         ``etaMin``, ``etaMax``, ``ewGamma``, ``ewAlpha``, ``residualGrowthFactor``,
         ``hierarchyStalenessFactor``
             Knobs for the adaptive outer tolerance and the per-field AMG hierarchy reuse across Newton
@@ -72,8 +76,10 @@ def createSolver(opts) -> Callable:
     optionMap = opts if isinstance(opts, Mapping) else {}
 
     kwargs = {}
+    if "outerTol" in optionMap:
+        value = optionMap["outerTol"]
+        kwargs["outerTol"] = None if value in (None, "adaptive") else float(value)
     for key, cast in (
-        ("outerTol", float),
         ("outerRestart", int),
         ("outerMaxiter", int),
         ("sweeps", int),

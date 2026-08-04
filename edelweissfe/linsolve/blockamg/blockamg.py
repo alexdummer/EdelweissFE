@@ -77,13 +77,18 @@ from scipy.sparse.linalg import LinearOperator, gmres
 
 from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
 
+# "backendPrecision" is not an AMGCL parameter -- it selects the AMGCL wrapper's own backend value
+# type (§19.3). __call__ pops it out of whichever precond dict applies (default or a fieldPreconds
+# override) before forwarding the rest verbatim as the AMGCL JSON parameter tree.
 _DEFAULT_VECTOR_PRECOND = {
+    "backendPrecision": "float",
     "coarsening": {"type": "smoothed_aggregation", "aggr": {"eps_strong": 0.01}},
     "relax": {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01},
     "npre": 1,
     "npost": 1,
 }
 _DEFAULT_SCALAR_PRECOND = {
+    "backendPrecision": "float",
     "coarsening": {"type": "smoothed_aggregation"},
     "relax": {"type": "chebyshev"},
 }
@@ -101,23 +106,35 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     :mod:`~edelweissfe.linsolve.inexactnewton.inexactnewton`, sees only ``(A, b)`` per call and
     reconstructs Newton-loop state from residual jumps rather than being told about them):
 
-    #. **Adaptive outer tolerance** (Eisenstat--Walker forcing, "choice 2"). Most Newton iterates do
-       not need the solve tight; forcing it anyway multiplies the dominant per-application AMG cost by
-       more outer iterations than the nonlinear convergence actually requires. ``outerTol``, if given,
-       overrides this with a fixed tolerance (matching the solver's original, pre-EW behaviour).
-    #. **Per-field AMG hierarchy reuse across Newton iterations.** Building a hierarchy (~3.4 s on the
-       reference model) is a large, avoidable fraction of a solve when the Jacobian has moved only a
-       little since the last one. The outer GMRES always operates on the current, fresh matrix; only
-       the block preconditioner ``M`` may be stale, so correctness is unaffected -- a stale ``M`` only
-       costs a few extra outer iterations. Refreshed on a residual jump (new increment / cutback), on a
-       field-structure change (e.g. AMR), or when the previous solve's outer count grew past
-       ``hierarchyStalenessFactor`` times the one before it.
+    #. **Adaptive outer tolerance** (Eisenstat--Walker forcing, "choice 2"), *opt-in* -- pass
+       ``outerTol=None``. Most Newton iterates do not need the solve tight, and loosening it cuts
+       outer iterations substantially (measured offline: ~36% less wall-clock on the 9 dumped
+       reference systems). **Not the default**: a live confirmation run on the reference Pryout model
+       changed the Newton path itself (15/12/7/14 iterations and 2 cutbacks, vs the fixed-tolerance
+       15/8/5/5 and 3 cutbacks -- a materially different trajectory, not "a few extra iterations",
+       even though total job wall-clock was roughly unchanged). See
+       PERF_LINSOLVE_INVESTIGATION.md §19.2 -- this needs a judgement call on whether that trajectory
+       change is acceptable before it becomes the default, the same kind of call already made for the
+       `pruneCondensedMatrixZeros` reordering sensitivity in §7.
+    #. **Per-field AMG hierarchy reuse across Newton iterations**, on by default. Building a hierarchy
+       (~3.4 s on the reference model) is a large, avoidable fraction of a solve when the Jacobian has
+       moved only a little since the last one. The outer GMRES always operates on the current, fresh
+       matrix; only the block preconditioner ``M`` may be stale, so the *converged solution* is
+       unaffected regardless of ``M`` -- a stale ``M`` only costs a few extra outer iterations at the
+       *same* requested tolerance, so (unlike (a)) it cannot by itself change the Newton path. Refreshed
+       on a residual jump (new increment / cutback), on a field-structure change (e.g. AMR), on any
+       sparsity-pattern change (this class of problem's pattern churns every Newton iteration -- see
+       §3.1 and §19.2 -- so in practice this keeps the hierarchy fresh every call on the reference
+       model, a safe no-op there, not a win; problems without contact/tie condensation may see one), or
+       when the previous solve's outer count grew past ``hierarchyStalenessFactor`` times the one
+       before it.
 
     Parameters
     ----------
     outerTol
-        If given, a fixed outer GMRES relative tolerance, disabling Eisenstat--Walker forcing. If
-        ``None`` (the default), the tolerance is computed per solve, see ``etaMin``/``etaMax`` below.
+        A fixed outer GMRES relative tolerance. Defaults to ``1e-6``, the solver's original behaviour.
+        Pass ``None`` to opt into Eisenstat--Walker forcing instead -- see ``etaMin``/``etaMax`` below,
+        and the caveat above before making that the default anywhere.
     outerRestart, outerMaxiter
         The outer GMRES restart length and maximum restart cycles.
     sweeps
@@ -150,7 +167,7 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     def __init__(
         self,
         *,
-        outerTol: float = None,
+        outerTol: float = 1.0e-6,
         outerRestart: int = 100,
         outerMaxiter: int = 8,
         sweeps: int = 1,
@@ -318,10 +335,13 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
             preconditioners = []
             for i, block in enumerate(blocks):
                 isVectorField = block.dimension > 1
-                precondParams = self._fieldPreconds.get(
-                    block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
+                precondParams = dict(
+                    self._fieldPreconds.get(
+                        block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
+                    )
                 )
-                solver = PyAMGCLSolver({"precond": precondParams})
+                backendPrecision = precondParams.pop("backendPrecision", "double")
+                solver = PyAMGCLSolver({"precond": precondParams, "backendPrecision": backendPrecision})
                 if isVectorField:
                     solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
                 solver.build(diagBlocks[i])
