@@ -60,3 +60,37 @@ cdef extern from "amgcl-wrapper.hpp":
         void build(int n, const int* ptr, const int* col, const float* val) except +
         void applyPreconditioner(int n, const double* rhs, double* x) except +
         string report() except +
+
+    # Block-valued backends (§20.1, B3): the matrix stays a plain scalar CSR at this boundary (val is
+    # double, same layout as LinearSolver) -- the wrapper adapts it to node-major B x B blocks
+    # internally via amgcl::adapter::block_matrix. set_nullspace() always throws (AMGCL's own
+    # tentative-prolongation nullspace path is unimplemented for block value types).
+    cdef cppclass LinearSolverBlock2:
+        LinearSolverBlock2(const char* json_params) except +
+        void solve(int n,
+                   const int* ptr,
+                   const int* col,
+                   const double* val,
+                   const double* rhs,
+                   double* x,
+                   int& iters,
+                   double& error) except +
+        void set_nullspace(const double* B, int rows, int cols) except +
+        void build(int n, const int* ptr, const int* col, const double* val) except +
+        void applyPreconditioner(int n, const double* rhs, double* x) except +
+        string report() except +
+
+    cdef cppclass LinearSolverBlock3:
+        LinearSolverBlock3(const char* json_params) except +
+        void solve(int n,
+                   const int* ptr,
+                   const int* col,
+                   const double* val,
+                   const double* rhs,
+                   double* x,
+                   int& iters,
+                   double& error) except +
+        void set_nullspace(const double* B, int rows, int cols) except +
+        void build(int n, const int* ptr, const int* col, const double* val) except +
+        void applyPreconditioner(int n, const double* rhs, double* x) except +
+        string report() except +

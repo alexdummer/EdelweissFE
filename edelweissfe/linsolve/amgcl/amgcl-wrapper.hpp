@@ -1,11 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <amgcl/adapter/block_matrix.hpp>
 #include <amgcl/adapter/crs_tuple.hpp>
 #include <amgcl/backend/builtin.hpp>
 #include <amgcl/make_solver.hpp>
 #include <amgcl/preconditioner/runtime.hpp>
 #include <amgcl/solver/runtime.hpp>
+#include <amgcl/value_type/static_matrix.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <memory>
@@ -173,6 +175,152 @@ public:
   }
 };
 
+// Block-valued backend (§20.1, B3): the per-field hierarchy stores/operates on B×B nodal blocks
+// (amgcl::static_matrix<double,B,B>) instead of scalar entries. Two motivations, in confidence order:
+// (i) the CSR index arrays shrink by ~B² (one column index per block instead of per scalar entry --
+// §19.3 found index traffic, not values, is the larger share of hierarchy bandwidth, which is exactly
+// what this attacks); (ii) block-aware smoothers (block-ILU0, block-GS) invert each node's B×B
+// coupling exactly, AMGCL's own canonical recipe for vector-PDE (elasticity) operators.
+//
+// This is a *separate* class from LinearSolverT, not another instantiation of it, because the
+// construction/apply pattern genuinely differs: the matrix arrives from Python as a plain scalar CSR
+// (Cython has no reason to know about block layout), so it must be wrapped with
+// amgcl::adapter::block_matrix<BlockType> before reaching the block Backend, and rhs/x must be
+// reinterpreted (amgcl::backend::reinterpret_as_rhs<BlockType>, a zero-copy amgcl::reinterpret_cast
+// over a same-sized contiguous double buffer -- amgcl/backend/builtin.hpp -- not a per-element
+// conversion) rather than element-cast like the float backend's std::vector<ValueType> narrowing.
+// LinearSolverT stays untouched to keep the validated scalar/float paths at zero regression risk.
+//
+// set_nullspace() is not supported here and always throws: AMGCL's own tentative-prolongation
+// nullspace path self-flags as unimplemented for block value types (amgcl/coarsening/
+// tentative_prolongation.hpp: "TODO: this is just a workaround to make non-scalar value types
+// compile. Most probably this won't actually work.") -- not merely undocumented, upstream itself does
+// not trust it. This is an accepted, measured non-loss: rigid-body near-null-space vectors do not help
+// on this operator anyway (§11, §13).
+template < typename BlockType >
+class LinearSolverBlockT {
+public:
+  typedef amgcl::backend::builtin< BlockType > Backend;
+  typedef amgcl::make_solver< amgcl::runtime::preconditioner< Backend >, amgcl::runtime::solver::wrapper< Backend > >
+    Solver;
+
+  static const int BlockSize = amgcl::math::static_rows< BlockType >::value;
+
+  boost::property_tree::ptree prm;
+  std::unique_ptr< Solver >   solver_;
+  int                         cached_n;
+  int                         cached_nnz;
+  std::vector< int >          cached_ptr_;
+  std::vector< int >          cached_col_;
+
+  LinearSolverBlockT( const char* json_params ) : solver_(), cached_n( -1 ), cached_nnz( -1 )
+  {
+    std::string json_str( json_params );
+    if ( !json_str.empty() ) {
+      std::stringstream ss( json_str );
+      boost::property_tree::read_json( ss, prm );
+    }
+  }
+
+  void set_nullspace( const double*, int, int )
+  {
+    throw std::runtime_error(
+      "set_nullspace() is not supported with a block-valued AMGCL backend -- AMGCL's own "
+      "tentative-prolongation nullspace path is an unimplemented, self-flagged 'probably won't work' "
+      "TODO for block value types, not a supported feature. Do not request a near null-space when "
+      "backendBlockSize > 1." );
+  }
+
+  // n must be divisible by BlockSize (node-major DOF layout: BlockSize contiguous scalar DOFs per
+  // node). amgcl::adapter::block_matrix asserts this too, but only via assert(), which -DNDEBUG (this
+  // extension's build flag) compiles out -- so this check is the only one that actually runs.
+  void checkBlockDivisible( int n ) const
+  {
+    if ( n % BlockSize != 0 ) {
+      throw std::runtime_error( "block-valued AMGCL backend: n=" + std::to_string( n ) +
+                                " is not divisible by the block size " + std::to_string( BlockSize ) +
+                                " -- the DOF layout must be node-major with BlockSize contiguous scalar "
+                                "DOFs per node." );
+    }
+  }
+
+  void build( int n, const int* ptr, const int* col, const double* val )
+  {
+    checkBlockDivisible( n );
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    solver_.reset( new Solver( amgcl::adapter::block_matrix< BlockType >( A ), prm ) );
+    cached_n   = n;
+    cached_nnz = nnz;
+    cached_ptr_.assign( ptr, ptr + n + 1 );
+    cached_col_.assign( col, col + nnz );
+  }
+
+  void applyPreconditioner( int n, const double* rhs, double* x )
+  {
+    std::fill( x, x + n, 0.0 );
+    std::vector< double > rhs_v( rhs, rhs + n );
+    std::vector< double > x_v( x, x + n );
+    auto                  rhs_rng = amgcl::backend::reinterpret_as_rhs< BlockType >( rhs_v );
+    auto                  x_rng   = amgcl::backend::reinterpret_as_rhs< BlockType >( x_v );
+    solver_->precond().apply( rhs_rng, x_rng );
+    std::copy( x_v.begin(), x_v.end(), x );
+  }
+
+  std::string report() const
+  {
+    if ( !solver_ ) {
+      throw std::runtime_error( "report(): no hierarchy built yet -- call build() or solve() first" );
+    }
+    std::ostringstream oss;
+    oss << *solver_;
+    return oss.str();
+  }
+
+  void solve( int           n,
+              const int*    ptr,
+              const int*    col,
+              const double* val,
+              const double* rhs,
+              double*       x,
+              int&          iters,
+              double&       error )
+  {
+    checkBlockDivisible( n );
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+
+    if ( !solver_ || n != cached_n || nnz != cached_nnz || !std::equal( ptr, ptr + n + 1, cached_ptr_.begin() ) ||
+         !std::equal( col, col + nnz, cached_col_.begin() ) ) {
+      solver_.reset( new Solver( amgcl::adapter::block_matrix< BlockType >( A ), prm ) );
+      cached_n   = n;
+      cached_nnz = nnz;
+      cached_ptr_.assign( ptr, ptr + n + 1 );
+      cached_col_.assign( col, col + nnz );
+    }
+    else {
+      solver_.reset( new Solver( amgcl::adapter::block_matrix< BlockType >( A ), prm ) );
+    }
+
+    std::vector< double > rhs_v( rhs, rhs + n );
+    std::vector< double > x_v( n, 0.0 );
+    std::tie( iters, error ) = ( *solver_ )( amgcl::backend::reinterpret_as_rhs< BlockType >( rhs_v ),
+                                             amgcl::backend::reinterpret_as_rhs< BlockType >( x_v ) );
+    std::copy( x_v.begin(), x_v.end(), x );
+  }
+};
+
 // The default, unchanged double-precision wrapper, and the new float32 one added for §19.3.
 typedef LinearSolverT< double > LinearSolver;
 typedef LinearSolverT< float >  LinearSolverFloat;
+
+// Block-valued instantiations (§20.1): 3×3 for the pryout's 3D displacement field, 2×2 for the
+// registered 2D CantileverBeamQuad4BlockAMG regression test -- one template parameter apart.
+typedef LinearSolverBlockT< amgcl::static_matrix< double, 2, 2 > > LinearSolverBlock2;
+typedef LinearSolverBlockT< amgcl::static_matrix< double, 3, 3 > > LinearSolverBlock3;

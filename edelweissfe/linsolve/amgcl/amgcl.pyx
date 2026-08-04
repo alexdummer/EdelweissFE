@@ -35,8 +35,12 @@ cimport numpy as np
 cdef class PyAMGCLSolver:
     cdef LinearSolver* solver
     cdef LinearSolverFloat* solverFloat
+    cdef LinearSolverBlock2* solverBlock2
+    cdef LinearSolverBlock3* solverBlock3
     cdef readonly bint isFloat
     """True if this instance runs the mixed-precision (builtin<float>) hierarchy, see §19.3."""
+    cdef readonly int blockSize
+    """1 (scalar, default), 2, or 3 -- the AMGCL backend's block size, see §20.1."""
     cdef readonly int lastIterations
     """The iteration count AMGCL reported for the most recent solve, -1 before the first."""
     cdef readonly double lastError
@@ -56,6 +60,14 @@ cdef class PyAMGCLSolver:
         AMGCL parameter itself, so it is popped out before the rest of ``params`` is forwarded as JSON.
         The near null-space (:meth:`set_nullspace`) always stays double regardless -- AMGCL's own
         ``coarsening::nullspace_params::B`` is hardcoded double, independent of the backend.
+
+        ``backendBlockSize``: ``1`` (default, scalar), ``2``, or ``3``. Selects a block-valued backend
+        (§20.1, B3) operating on node-major B x B nodal blocks instead of scalar entries -- shrinks the
+        CSR index traffic by ~B² and lets block-aware smoothers (block-ILU0, block-GS) invert each
+        node's coupling exactly. The matrix still arrives as a plain scalar CSR; the wrapper adapts it
+        internally. Not yet combinable with ``backendPrecision == "float"`` (raises) -- float-block is
+        a follow-up, not implemented in this pass. :meth:`set_nullspace` always raises on a block
+        backend -- AMGCL's own near-null-space path is unimplemented for block value types.
 
         Example params:
         {
@@ -80,6 +92,16 @@ cdef class PyAMGCLSolver:
             raise ValueError(f"backendPrecision must be 'double' or 'float', got {backendPrecision!r}")
         self.isFloat = backendPrecision == "float"
 
+        blockSize = params.pop("backendBlockSize", 1)
+        if blockSize not in (1, 2, 3):
+            raise ValueError(f"backendBlockSize must be 1, 2, or 3, got {blockSize!r}")
+        self.blockSize = blockSize
+        if self.blockSize > 1 and self.isFloat:
+            raise NotImplementedError(
+                "backendBlockSize > 1 combined with backendPrecision='float' is not implemented "
+                "(§20.1: float-block is a follow-up column, not this pass's target)."
+            )
+
         self.lastIterations = -1
         self.lastError = float("nan")
 
@@ -88,7 +110,13 @@ cdef class PyAMGCLSolver:
         cdef const char* c_json = json_bytes
         self.solver = NULL
         self.solverFloat = NULL
-        if self.isFloat:
+        self.solverBlock2 = NULL
+        self.solverBlock3 = NULL
+        if self.blockSize == 2:
+            self.solverBlock2 = new LinearSolverBlock2(c_json)
+        elif self.blockSize == 3:
+            self.solverBlock3 = new LinearSolverBlock3(c_json)
+        elif self.isFloat:
             self.solverFloat = new LinearSolverFloat(c_json)
         else:
             self.solver = new LinearSolver(c_json)
@@ -98,6 +126,10 @@ cdef class PyAMGCLSolver:
             del self.solver
         if self.solverFloat != NULL:
             del self.solverFloat
+        if self.solverBlock2 != NULL:
+            del self.solverBlock2
+        if self.solverBlock3 != NULL:
+            del self.solverBlock3
 
     def set_nullspace(self, object B):
         """
@@ -111,20 +143,29 @@ cdef class PyAMGCLSolver:
         B: an (n, cols) array-like; column j is the j-th near null-space vector (float64). Copied into
         the C++ solver, so the array need not be kept alive. Must be called before the first solve().
         Passing an (n, 0) array clears any previously set null-space. Always double, regardless of
-        ``backendPrecision`` -- see the class docstring.
+        ``backendPrecision`` -- see the class docstring. Raises on a block backend (``blockSize > 1``)
+        -- AMGCL's own near-null-space path is unimplemented for block value types (§20.1).
         """
         cdef np.ndarray[np.float64_t, ndim=2, mode="c"] B_arr = np.ascontiguousarray(B, dtype=np.float64)
         cdef int rows = B_arr.shape[0]
         cdef int cols = B_arr.shape[1]
         cdef double[:, ::1] B_view
         if cols == 0:
-            if self.isFloat:
+            if self.blockSize == 2:
+                self.solverBlock2.set_nullspace(<const double*> 0, rows, 0)
+            elif self.blockSize == 3:
+                self.solverBlock3.set_nullspace(<const double*> 0, rows, 0)
+            elif self.isFloat:
                 self.solverFloat.set_nullspace(<const double*> 0, rows, 0)
             else:
                 self.solver.set_nullspace(<const double*> 0, rows, 0)
             return
         B_view = B_arr
-        if self.isFloat:
+        if self.blockSize == 2:
+            self.solverBlock2.set_nullspace(&B_view[0, 0], rows, cols)
+        elif self.blockSize == 3:
+            self.solverBlock3.set_nullspace(&B_view[0, 0], rows, cols)
+        elif self.isFloat:
             self.solverFloat.set_nullspace(&B_view[0, 0], rows, cols)
         else:
             self.solver.set_nullspace(&B_view[0, 0], rows, cols)
@@ -135,7 +176,9 @@ cdef class PyAMGCLSolver:
         :meth:`applyPreconditioner` -- the build-once / apply-many split :meth:`solve` fuses.
 
         A: scipy.sparse.csr_matrix. Its values narrow to float32 first if ``backendPrecision ==
-        "float"`` -- cheap here (build() runs once per solve, not once per outer Krylov iteration).
+        "float"`` -- cheap here (build() runs once per solve, not once per outer Krylov iteration). A
+        block backend (``blockSize > 1``) instead takes the plain scalar CSR unchanged and adapts it
+        to node-major blocks inside the C++ wrapper.
         """
         if not scipy.sparse.isspmatrix_csr(A):
             A = A.tocsr()
@@ -151,7 +194,14 @@ cdef class PyAMGCLSolver:
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data
         cdef double[::1] data_
 
-        if self.isFloat:
+        if self.blockSize == 2 or self.blockSize == 3:
+            data = np.ascontiguousarray(A.data, dtype=np.float64)
+            data_ = data
+            if self.blockSize == 2:
+                self.solverBlock2.build(n, &indptr_[0], &indices_[0], &data_[0])
+            else:
+                self.solverBlock3.build(n, &indptr_[0], &indices_[0], &data_[0])
+        elif self.isFloat:
             dataFloat = np.ascontiguousarray(A.data, dtype=np.float32)
             dataFloat_ = dataFloat
             self.solverFloat.build(n, &indptr_[0], &indices_[0], &dataFloat_[0])
@@ -165,8 +215,8 @@ cdef class PyAMGCLSolver:
         Apply one AMG cycle of the hierarchy built by :meth:`build` to rhs: returns M^-1 rhs.
 
         rhs: array-like, converted to 1D float64 (C-contiguous). Always double at this boundary --
-        the narrowing/widening to/from float32 for ``backendPrecision == "float"`` happens inside the
-        C++ wrapper, not here, since this is called once per outer Krylov iteration.
+        any backend-specific narrowing/widening or block reinterpretation happens inside the C++
+        wrapper, not here, since this is called once per outer Krylov iteration.
         """
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
         cdef int n = rhs_arr.shape[0]
@@ -174,7 +224,11 @@ cdef class PyAMGCLSolver:
 
         cdef double[::1] rhs_ = rhs_arr
         cdef double[::1] x_ = x
-        if self.isFloat:
+        if self.blockSize == 2:
+            self.solverBlock2.applyPreconditioner(n, &rhs_[0], &x_[0])
+        elif self.blockSize == 3:
+            self.solverBlock3.applyPreconditioner(n, &rhs_[0], &x_[0])
+        elif self.isFloat:
             self.solverFloat.applyPreconditioner(n, &rhs_[0], &x_[0])
         else:
             self.solver.applyPreconditioner(n, &rhs_[0], &x_[0])
@@ -187,6 +241,10 @@ cdef class PyAMGCLSolver:
 
         Raises RuntimeError if nothing has been built yet.
         """
+        if self.blockSize == 2:
+            return self.solverBlock2.report().decode("utf-8")
+        if self.blockSize == 3:
+            return self.solverBlock3.report().decode("utf-8")
         if self.isFloat:
             return self.solverFloat.report().decode("utf-8")
         return self.solver.report().decode("utf-8")
@@ -245,7 +303,18 @@ cdef class PyAMGCLSolver:
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data
         cdef double[::1] data_
 
-        if self.isFloat:
+        if self.blockSize == 2 or self.blockSize == 3:
+            data = np.ascontiguousarray(A.data, dtype=np.float64)
+            data_ = data
+            if self.blockSize == 2:
+                self.solverBlock2.solve(
+                        n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0], iters, error
+                    )
+            else:
+                self.solverBlock3.solve(
+                        n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0], iters, error
+                    )
+        elif self.isFloat:
             dataFloat = np.ascontiguousarray(A.data, dtype=np.float32)
             dataFloat_ = dataFloat
             self.solverFloat.solve(
