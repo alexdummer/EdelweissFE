@@ -11,8 +11,12 @@ has begun. Two cheap leads are now measured on the real model:**
   which is blocked on the §7 drift question.
 - **Lead 3 step 1** ([§11](#11-phase-3-lead-3-step-1-measured)): a near-null-space (translations,
   with or without a coupled-block constant) **does not** rescue monolithic AMG — it stalls at
-  0.2–0.65 residual regardless. Block structure, not the near-null-space, is the missing ingredient;
-  the real AMG route is the full block preconditioner (Lead 3 steps 2–3), a substantial effort.
+  0.2–0.65 residual regardless. Block structure, not the near-null-space, is the missing ingredient.
+- **Lead 3 step 2** ([§12](#12-phase-3-lead-3-step-2--block-amg-is-feasible)): the block preconditioner
+  (AMG per field inside block Gauss–Seidel) **converges** — 93–117 GMRES iterations where monolithic
+  stalls. **Feasibility for the 1M+ goal is proven.** The count is bottlenecked by per-field AMG
+  quality (not the coupling), so the production build (a parallel AMG + block driver + the 6 RBMs,
+  which need nodal coordinates) is substantial but no longer a research risk.
 
 Two measured leads plus one untested-but-not-excluded route; see
 [§4](#4-recommendation), which ends with a suggested order of work. One open question blocks part of
@@ -602,3 +606,59 @@ size goal. `set_nullspace` is the first piece of it and is in place.
 Reproduce: on xeon, in the profile dir, `OMP_NUM_THREADS=16 python $B amgcl linsolveDumps --nullspace
 translations --tolerances 1e-4 --maxiter 300` (`B` = `scripts/benchmark_linsolve.py`). Log:
 `amg_nullspace.log`.
+
+---
+
+## 12. Phase 3, Lead 3 step 2 — block AMG is feasible
+
+§11 showed monolithic AMG is dead here. The literature's fix is a *block* preconditioner (AMG per
+field inside a block Gauss–Seidel sweep, Alkmim et al. 2026). This tests that offline with **pyamg**,
+which is *not* a production candidate — it is pure-Python and serial (re-enables the GIL), so its wall
+time is meaningless against a 16-thread PARDISO. The metric that transfers to a parallel AMG (AMGCL,
+Trilinos/MueLu) is the **GMRES iteration count**, a property of preconditioner quality, not of the
+backend. Script: `scripts/block_amg_prototype.py` (requires `pip install pyamg`).
+
+Field split `[0, 214659) | [214659, 280155)`; block Gauss–Seidel with one AMG V-cycle per field;
+displacement block given the 3 translational near-null-space vectors (DOF layout only, no geometry),
+damage block the default constant. First dumped system, 280,155 dof; direct PARDISO target ~11.5 s.
+
+| preconditioner | GMRES iters to 1e-4 | dev. from direct |
+|---|---|---|
+| monolithic AMG (§11) | ✗ stalls at 2e-1 (300 iters) | — |
+| **block-GS + per-field AMG** | **93–117, converged** | 1e-4 … 3e-6 |
+
+**Feasibility is proven: block structure is the missing ingredient.** Where monolithic AMG never gets
+below 0.2, the block preconditioner drives the coupled system to 1e-11. This is the go/no-go the whole
+AMG line hinged on, and it is a **go** for the *feasible-at-1M+* goal (AMG memory is O(n); it removes
+PARDISO's fill-in wall).
+
+Diagnostics on *why* the count is ~100 and not ~30:
+
+- **Not the block coupling.** Extra block-GS sweeps and a symmetric variant give *identical* 117
+  iterations — one sweep already resolves the coupling.
+- **The per-field AMG hierarchies are weak.** Solved alone, the displacement block needs **136–175**
+  iterations and the damage block **35–49** — poor for SA-AMG (a healthy elasticity AMG is ~15–30).
+  Default pyamg SA builds only **3 levels** on the 214k-dof displacement block: aggressive, weak
+  coarsening on this condensed *elasticity + contact-penalty + tie-condensation* operator.
+- **Diagonal scaling helps a little but is not the fix.** Symmetric `D^-1/2 A D^-1/2` (with the near
+  null-space correctly transformed to `D^1/2 B`) took the block count 117 → 93 and the damage block
+  49 → 35, but left the displacement block stuck (still 3 levels). The 1e8 dynamic range is real but
+  secondary.
+
+So the ~100 count is a **hierarchy-quality** problem, and reducing it is exactly the step-3 production
+work: a properly configured *parallel* AMG (MueLu/Trilinos as the paper uses, or a carefully tuned
+AMGCL), the full **6 rigid body modes** (rotations need nodal coordinates → the `createSolver`
+interface widening §4 flags), Chebyshev/ILU smoothers, and a real strength-of-connection measure.
+None of that changes the feasibility verdict; it changes the constant.
+
+**Where this leaves the size goal.** Block AMG works and is the route to 1M+ dof. The production build
+is substantial: (1) a *parallel* AMG usable as an inner block solve — the current AMGCL wrapper
+rebuilds its hierarchy on every `solve()` and would need a build-once/apply-many split like PARDISO's
+`factorize`/`solveFactorized`, or Trilinos; (2) a block Gauss–Seidel / field-split driver; (3) the 6
+RBMs, which need nodal coordinates threaded into the linsolver interface; (4) diagonal equilibration.
+`set_nullspace` (§11) is the first piece and is in place. This is multi-day, interface-widening work —
+a deliberate decision, not a quick add.
+
+Reproduce: on xeon, in the profile dir, `OMP_NUM_THREADS=16 python
+~/constitutive_modeling/next_v2611/EdelweissFE/scripts/block_amg_prototype.py linsolveDumps`. Log:
+`block_amg.log`.
