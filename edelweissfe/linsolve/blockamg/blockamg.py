@@ -78,8 +78,8 @@ from scipy.sparse.linalg import LinearOperator, gmres
 from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
 
 _DEFAULT_VECTOR_PRECOND = {
-    "coarsening": {"type": "smoothed_aggregation"},
-    "relax": {"type": "gauss_seidel"},
+    "coarsening": {"type": "smoothed_aggregation", "aggr": {"eps_strong": 0.01}},
+    "relax": {"type": "chebyshev", "degree": 8, "power_iters": 50, "lower": 0.01},
     "npre": 2,
     "npost": 2,
 }
