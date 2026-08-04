@@ -77,16 +77,29 @@ from scipy.sparse.linalg import LinearOperator, gmres
 
 from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
 
-# "backendPrecision" is not an AMGCL parameter -- it selects the AMGCL wrapper's own backend value
-# type (§19.3: "double" (default) or "float"). __call__ pops it out of whichever precond dict applies
-# (default or a fieldPreconds override) before forwarding the rest verbatim as the AMGCL JSON parameter
-# tree. Defaults to "double": measured on all 9 dumped ords, "float" inflated outer GMRES iterations by
-# up to 30% (plan expected <=10%) and only won on wall-clock ~half the time, netting ~3% aggregate, not
-# the ~1.3-1.5x hoped for -- plausibly the chebyshev smoother's power-iteration spectral-radius estimate
-# (§17 B5 already flagged this as sensitive) losing accuracy in float32. Available as an opt-in via
-# fieldPreconds (e.g. {"displacement": {**_DEFAULT_VECTOR_PRECOND, "backendPrecision": "float"}}).
+# "backendPrecision" and "backendBlockSize" are not AMGCL parameters -- they select the AMGCL
+# wrapper's own backend value type (§19.3: "double" (default) or "float"; §20.1: 1 (default, scalar),
+# 2, or 3 for a block-valued backend operating on B x B nodal blocks). __call__ pops both out of
+# whichever precond dict applies (default or a fieldPreconds override) before forwarding the rest
+# verbatim as the AMGCL JSON parameter tree.
+#
+# backendPrecision defaults to "double": measured on all 9 dumped ords, "float" inflated outer GMRES
+# iterations by up to 30% (plan expected <=10%) and only won on wall-clock ~half the time, netting ~3%
+# aggregate, not the ~1.3-1.5x hoped for -- plausibly the chebyshev smoother's power-iteration
+# spectral-radius estimate (§17 B5 already flagged this as sensitive) losing accuracy in float32.
+#
+# backendBlockSize defaults to 1 (scalar, unchanged): kept opt-in via fieldPreconds through the whole
+# §20.1 offline validation phase -- the default only changes if that validation clears its bar. A
+# vector field of nodal dimension d maps to backendBlockSize: d (3 for the pryout displacement field,
+# 2 for the registered 2D CantileverBeamQuad4BlockAMG test). Setting it > 1 skips set_nullspace (see
+# __call__) -- AMGCL's near-null-space path is unimplemented for block value types.
+#
+# Both are available as an opt-in via fieldPreconds, e.g.
+# {"displacement": {**_DEFAULT_VECTOR_PRECOND, "backendPrecision": "float"}} or
+# {"displacement": {**_DEFAULT_VECTOR_PRECOND, "backendBlockSize": 3}}.
 _DEFAULT_VECTOR_PRECOND = {
     "backendPrecision": "double",
+    "backendBlockSize": 1,
     "coarsening": {"type": "smoothed_aggregation", "aggr": {"eps_strong": 0.01}},
     "relax": {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01},
     "npre": 1,
@@ -94,6 +107,7 @@ _DEFAULT_VECTOR_PRECOND = {
 }
 _DEFAULT_SCALAR_PRECOND = {
     "backendPrecision": "double",
+    "backendBlockSize": 1,
     "coarsening": {"type": "smoothed_aggregation"},
     "relax": {"type": "chebyshev"},
 }
@@ -346,8 +360,19 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
                     )
                 )
                 backendPrecision = precondParams.pop("backendPrecision", "double")
-                solver = PyAMGCLSolver({"precond": precondParams, "backendPrecision": backendPrecision})
-                if isVectorField:
+                backendBlockSize = precondParams.pop("backendBlockSize", 1)
+                solver = PyAMGCLSolver(
+                    {
+                        "precond": precondParams,
+                        "backendPrecision": backendPrecision,
+                        "backendBlockSize": backendBlockSize,
+                    }
+                )
+                # set_nullspace() is unsupported (and always raises) on a block backend -- AMGCL's own
+                # near-null-space path is unimplemented for block value types (§20.1). This is an
+                # accepted, measured non-loss: rigid-body translations do not help on this operator
+                # anyway (§11, §13).
+                if isVectorField and backendBlockSize == 1:
                     solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
                 solver.build(diagBlocks[i])
                 preconditioners.append(solver)
