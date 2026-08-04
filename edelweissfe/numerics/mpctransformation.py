@@ -26,10 +26,17 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
+import os
+
 import numpy as np
-from scipy.sparse import csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
 from edelweissfe.utils import performancetiming
+
+#: Set to enable a per-epoch cross-check of :meth:`MultiPointConstraintTransformation.transformSystemMatrix`'s
+#: cached-pattern value scatter against the legacy ``T^T @ K @ T + C`` expression it replaces (§21.2 B2).
+#: Expensive (recomputes the legacy expression every call it fires on) -- development/CI use only.
+_ASSERT_EXACT_ENV_VAR = "EDELWEISS_MPC_ASSERT_EXACT"
 
 """
 Master-slave condensation (Abaqus-style DOF elimination) of linear multi-point constraints
@@ -64,7 +71,7 @@ critical time step untouched.
 
 
 def _flattenChainedRecords(
-    records: list[tuple[int, list[tuple[int, float]]]]
+    records: list[tuple[int, list[tuple[int, float]]]],
 ) -> list[tuple[int, list[tuple[int, float]]]]:
     """Resolve a slave DOF's masters that are themselves slave DOFs of another (or the same) record,
     substituting them recursively until every master is an independent DOF.
@@ -178,6 +185,32 @@ class MultiPointConstraintTransformation:
         cVals = np.concatenate([np.ones(len(self.slaveDofIndices)), -np.array(wVals)])
         self._C = csr_matrix((cVals, (cRows, cCols)), shape=(nDof, nDof))
 
+        # §21.2 B2: T = D + S, D diagonal (1 on independent DOFs, 0 on slaves), S the slave rows only
+        # (T's own entries, minus the independent-DOF identity part -- reuses tRows/tCols/tVals's
+        # already-computed slave-row tail rather than rebuilding it). This lets
+        # transformSystemMatrix() compute the dominant, identity-heavy term (D^T K D) as a cheap
+        # values-only elementwise scale instead of a full nDof x nDof SpGEMM, and restricts the
+        # genuine SpGEMMs to the tiny S operand (~nEliminatedDof rows).
+        self._D = np.ones(nDof)
+        self._D[self.slaveDofIndices] = 0.0
+        nSlaveEntries = len(wVals)
+        self._S = csr_matrix(
+            (tVals[-nSlaveEntries:], (tRows[-nSlaveEntries:], tCols[-nSlaveEntries:])), shape=(nDof, nDof)
+        )
+
+        # transformSystemMatrix()'s cache: identity markers for the K pattern the cache was built for
+        # (K.indices/K.indptr are the csrGenerator's own persistent, in-place-updated arrays when no
+        # further pruning intervenes upstream -- verified directly, not assumed, §21.2 B1), the union
+        # output pattern, per-term scatter positions into it, and C's own contribution pre-scattered
+        # (constant for this object's entire lifetime, since C never changes after __init__).
+        self._cachedKIndices = None
+        self._cachedKIndptr = None
+        self._cachedKRowOfNnz = None
+        self._unionIndices = None
+        self._unionIndptr = None
+        self._scatterMaps = None
+        self._cBaseData = None
+
     @property
     def nEliminatedDof(self) -> int:
         """The number of slave DOFs eliminated from the equation system."""
@@ -202,8 +235,116 @@ class MultiPointConstraintTransformation:
             )
 
     @performancetiming.timeit("mpc transform system matrix")
+    def _transformSystemMatrixLegacy(self, K: csr_matrix) -> csr_matrix:
+        """The original, un-cached ``T^T @ K @ T + C`` expression -- kept only as the reference for
+        :envvar:`EDELWEISS_MPC_ASSERT_EXACT` (§21.2 B2); not on the production hot path."""
+        KT = self._T.T @ K
+        Kt = KT @ self._T
+        Kt = (Kt + self._C).tocsr()
+        Kt.sort_indices()
+        return Kt
+
+    def _buildCacheAndScatter(self, K, kRowOfNnz, dkdData, term2, term3, term4) -> np.ndarray:
+        """Build (and cache) the union output pattern and each term's scatter position into it for
+        the current `K` pattern; return this call's assembled data array. Only runs when `K`'s
+        pattern has changed since the last call (§21.2 B2) -- the expensive part every other call
+        skips.
+        """
+        n = self.nDof
+
+        termRows = [kRowOfNnz]
+        termCols = [K.indices]
+        termData = [dkdData]
+        for term in (term2, term3, term4):
+            termRows.append(np.repeat(np.arange(n), np.diff(term.indptr)))
+            termCols.append(term.indices)
+            termData.append(term.data)
+
+        cRow = np.repeat(np.arange(n), np.diff(self._C.indptr))
+
+        allRows = np.concatenate(termRows + [cRow])
+        allCols = np.concatenate(termCols + [self._C.indices])
+        allData = np.concatenate(termData + [self._C.data])
+
+        # coo_matrix -> tocsr() sums duplicate (row, col) entries and sorts indices canonically in
+        # one pass -- exactly the pattern-construction work the legacy path paid every call via
+        # "+ C, tocsr, sort indices"; here it is paid once per epoch.
+        union = coo_matrix((allData, (allRows, allCols)), shape=(n, n)).tocsr()
+        union.sum_duplicates()
+        union.sort_indices()
+
+        self._unionIndices = union.indices.copy()
+        self._unionIndptr = union.indptr.copy()
+
+        # CSR with sorted-within-row indices, rows visited in increasing order, means row*n + col is
+        # monotonically increasing across the *entire* flattened array -- so a single vectorized
+        # searchsorted (not a per-row loop) locates every term's own entries within the union.
+        unionRowOfNnz = np.repeat(np.arange(n), np.diff(union.indptr))
+        unionKeys = unionRowOfNnz.astype(np.int64) * n + union.indices.astype(np.int64)
+
+        self._scatterMaps = []
+        for row, col in zip(termRows, termCols):
+            keys = row.astype(np.int64) * n + col.astype(np.int64)
+            positions = np.searchsorted(unionKeys, keys)
+            # One-time-per-epoch integrity check (not on the hot path -- this function only runs on a
+            # pattern change): every term's key must be an *exact* match in the union, by construction
+            # (union is the deduplicated superset of all terms). A mismatch here means the scatter
+            # mechanism itself is broken, not a numerical tolerance issue -- fail loudly, always.
+            if not np.array_equal(unionKeys[positions], keys):
+                raise AssertionError(
+                    "mpctransformation: a term's (row, col) key was not found in the union pattern -- "
+                    "the cached-pattern value scatter's own bookkeeping is broken, not a numerical "
+                    "tolerance issue."
+                )
+            self._scatterMaps.append(positions)
+
+        cKeys = cRow.astype(np.int64) * n + self._C.indices.astype(np.int64)
+        cPositions = np.searchsorted(unionKeys, cKeys)
+        self._cBaseData = np.zeros(len(unionKeys), dtype=np.float64)
+        self._cBaseData[cPositions] += self._C.data
+
+        return union.data
+
+    def _assertExact(self, K: csr_matrix, result: csr_matrix) -> None:
+        """:envvar:`EDELWEISS_MPC_ASSERT_EXACT` cross-check: the cached value-scatter result must
+        match the legacy ``T^T K T + C`` expression to within a matrix-norm-relative tolerance
+        (entry-relative fails on cancellation-tiny entries) -- §21.2 B2/B3."""
+        legacy = self._transformSystemMatrixLegacy(K)
+        diff = (result - legacy).tocsr()
+        maxDiff = np.max(np.abs(diff.data)) if diff.nnz else 0.0
+        scale = max(
+            np.max(np.abs(result.data)) if result.nnz else 0.0,
+            np.max(np.abs(legacy.data)) if legacy.nnz else 0.0,
+            1e-300,
+        )
+        if maxDiff > 1e-9 * scale:
+            raise AssertionError(
+                "mpctransformation: EDELWEISS_MPC_ASSERT_EXACT caught a real mismatch between the "
+                "cached value-scatter result and the legacy T^T K T + C expression: max|delta|={:.3e}, "
+                "tolerance={:.3e} (1e-9 x max|data|={:.3e}).".format(maxDiff, 1e-9 * scale, scale)
+            )
+
+    @performancetiming.timeit("mpc transform system matrix")
     def transformSystemMatrix(self, K: csr_matrix) -> csr_matrix:
         """Condense the system matrix: :math:`\\tilde{K} = T^T K \\, T + C`.
+
+        §21.2 B2: computed as a cached-pattern value scatter, not the naive two-SpGEMM expression.
+        With :math:`T = D + S` (:math:`D` diagonal, 1 on independent DOFs, 0 on slaves; :math:`S` the
+        slave rows only, structurally zero elsewhere):
+
+        .. math::
+            T^T K T + C \\;=\\; D K D \\;+\\; D K S \\;+\\; S^T K D \\;+\\; S^T K S \\;+\\; C
+
+        :math:`DKD` is :math:`K`'s own pattern with values masked -- a cheap elementwise operation,
+        no SpGEMM -- and the three :math:`S`-touching terms are SpGEMMs restricted to :math:`S`'s
+        ``nEliminatedDof`` rows rather than the full ``nDof``-row :math:`T`, cheap relative to the two
+        full-size SpGEMMs (``T^T @ K``, then ``@ T``) this replaces. The combined ("union") output
+        pattern and each term's scatter position into it are computed once per epoch -- whenever
+        `K`'s own pattern changes, checked by array *identity*, not equality (§21.2 B1 verified this
+        is a valid check: the csrGenerator returns the same `indices`/`indptr` objects by reference
+        every iteration when no pruning intervenes upstream) -- and reused on every subsequent call;
+        only the term values are recomputed each time, since the *values* change every Newton
+        iteration even when the pattern does not.
 
         Parameters
         ----------
@@ -213,26 +354,52 @@ class MultiPointConstraintTransformation:
         Returns
         -------
         csr_matrix
-            The condensed system matrix, same size, with the constraint equations in the slave
-            rows.
+            The condensed system matrix, same size, with the constraint equations in the slave rows.
+            A fresh, independent array triple every call -- never aliases the cached union pattern,
+            since downstream code (Dirichlet zeroing, ``eliminate_zeros()``) mutates its result in
+            place, and the cache must survive that untouched.
         """
+        n = self.nDof
+        patternChanged = (
+            self._cachedKIndices is None or K.indices is not self._cachedKIndices or K.indptr is not self._cachedKIndptr
+        )
 
-        # Broken into its three steps purely to time them separately: the two sparse-sparse products
-        # are SciPy SpGEMMs, single-threaded and pattern-agnostic (they redo the symbolic phase on
-        # every call), which makes them a serial bottleneck that grows as a share of the increment as
-        # the threaded solver gets more cores. Keeping them attributable is the point; the arithmetic
-        # is identical to the single expression this replaces, since `@` associates to the left.
-        with performancetiming.timeit("T^T K"):
-            KT = self._T.T @ K
+        with performancetiming.timeit("mpc: D K D (values only)"):
+            if patternChanged or self._cachedKRowOfNnz is None:
+                kRowOfNnz = np.repeat(np.arange(n), np.diff(K.indptr))
+            else:
+                kRowOfNnz = self._cachedKRowOfNnz
+            dkdData = K.data * self._D[kRowOfNnz] * self._D[K.indices]
 
-        with performancetiming.timeit("(T^T K) T"):
-            Kt = KT @ self._T
+        with performancetiming.timeit("mpc: S-touching SpGEMMs"):
+            dkData = K.data * self._D[kRowOfNnz]
+            DK = csr_matrix((dkData, K.indices, K.indptr), shape=(n, n))
+            kdData = K.data * self._D[K.indices]
+            KD = csr_matrix((kdData, K.indices, K.indptr), shape=(n, n))
+            term2 = (DK @ self._S).tocsr()
+            term3 = (self._S.T @ KD).tocsr()
+            term4 = (self._S.T @ K @ self._S).tocsr()
 
-        with performancetiming.timeit("+ C, tocsr, sort indices"):
-            Kt = (Kt + self._C).tocsr()
-            Kt.sort_indices()
+        if patternChanged:
+            with performancetiming.timeit("mpc: build union pattern + scatter maps"):
+                freshData = self._buildCacheAndScatter(K, kRowOfNnz, dkdData, term2, term3, term4)
+                self._cachedKIndices = K.indices
+                self._cachedKIndptr = K.indptr
+                self._cachedKRowOfNnz = kRowOfNnz
+        else:
+            with performancetiming.timeit("mpc: value scatter"):
+                freshData = self._cBaseData.copy()
+                freshData[self._scatterMaps[0]] += dkdData
+                freshData[self._scatterMaps[1]] += term2.data
+                freshData[self._scatterMaps[2]] += term3.data
+                freshData[self._scatterMaps[3]] += term4.data
 
-        return Kt
+        result = csr_matrix((freshData, self._unionIndices.copy(), self._unionIndptr.copy()), shape=(n, n))
+
+        if os.environ.get(_ASSERT_EXACT_ENV_VAR):
+            self._assertExact(K, result)
+
+        return result
 
     @performancetiming.timeit("mpc transform residual")
     def transformResidual(self, R: np.ndarray, dU: np.ndarray) -> np.ndarray:
