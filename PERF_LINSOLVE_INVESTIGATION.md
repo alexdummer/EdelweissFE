@@ -1794,6 +1794,78 @@ and proceed to Part 2 against the unchanged scalar default — Part 2 does not d
 outcome, only on its *completion*, because whatever configuration survives Part 1 is the "final
 setup" Part 2 validates against.
 
+**Executed. Result: implemented and correct, but fails step 2's bar — default stays scalar.**
+Commits `854f1be7` (wrapper: `LinearSolverBlockT<BlockType>`, instantiated for `static_matrix<double,
+{2,3},{2,3}>`, verified against the actual AMGCL headers rather than assumed — see the commit message
+for the API details, including that `n % blockSize == 0` must be checked explicitly since AMGCL's own
+precondition is only an `assert()`, compiled out under `-DNDEBUG`) and `38e2ab33` (`blockamg.py`:
+opt-in `backendBlockSize` via `fieldPreconds`, `set_nullspace` skipped for block fields).
+
+**Step 1 (displacement block alone, ord 2, `probe_201_block_isolated.py`).** First pass used the
+wrong outer solver (`bicgstab`) and got numbers ~2–4× off from §17's own references — caught by
+checking a same-session reproduction of §17's "29 iters" config *before* trusting the new sweep
+(confirmed the exact solver config, `gmres(M=100)`, from `scripts/benchmark_linsolve.py`'s
+`runConfiguration`). Corrected (log: `probe_201_block_isolated_v2.log`):
+
+| config | outer iters | wall |
+|---|---|---|
+| scalar: §17's tuned d=8/npre=npost=2, eps_strong=0.01 | 51 | 9.02 s |
+| scalar: current production default (d=5, npre=npost=1) | 96 | 6.37 s |
+| block3, gauss_seidel, eps_strong=default | 199 | 7.58 s |
+| block3, gauss_seidel, eps_strong=0.01 | 188 | 6.98 s |
+| block3, ilu0, eps_strong=default | 500 (did not converge, true res 4.8e-2) | 32.70 s |
+| block3, ilu0, eps_strong=0.01 | 500 (did not converge, true res 5.3e-2) | 31.45 s |
+| **block3, chebyshev(d=5,pi=50,lower=0.01), eps_strong=default** | **90** | **3.44 s** |
+| block3, chebyshev(d=5,pi=50,lower=0.01), eps_strong=0.01 | 93 | 3.56 s |
+
+Block-ILU0 diverges outright — the headline candidate the plan expected did not pan out. Block-GS is
+a clear loser (more iterations *and* slower). **Block-chebyshev with the exact same smoother
+parameters as the shipped scalar default — only `backendBlockSize` changes — wins on wall-clock**
+(3.44 s vs 6.37 s, ~1.85×) with slightly fewer iterations, and even beats §17's more-tuned scalar
+config on wall-clock (3.44 s vs 9.02 s) despite needing more iterations, exactly the B3 hypothesis:
+cheaper per-application bandwidth from smaller CSR index blocks. `eps_strong` barely moves the block
+backend's iteration count (90→93), unlike its ~2× effect on the scalar backend (§17) — coarsening
+behaves differently once it's block-aware. This did **not** trigger the stated failure-handling
+clause (chebyshev clearly does show a wall-clock win at step 1), so the chain continued to step 2.
+
+**Step 2 (full coupled system, all 9 ords, production `fieldPreconds` path, `probe_201_coupled.py`)
+— fails the bar, decisively and for a mechanistic reason worth recording precisely.** Block3 +
+chebyshev(d=5,npre=npost=1) (the step-1 winner) vs the shipped scalar default, both through
+`BlockAMGSolver.__call__`'s actual block-Gauss-Seidel + outer scipy GMRES path:
+
+| ord | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| scalar iters (wall) | 72 (29.5s) | 94 (28.0s) | 50 (17.2s) | 44 (15.5s) | 48 (16.5s) | 45 (15.8s) | 46 (16.1s) | 44 (15.6s) | 44 (15.4s) | **169.5s** |
+| block3 iters (wall) | 98 (24.8s) | 185 (43.1s) | 98 (23.1s) | 85 (20.1s) | 97 (23.1s) | 92 (21.8s) | 93 (22.0s) | 90 (21.2s) | 88 (20.6s) | **219.8s** |
+| speedup | 1.19× | 0.65× | 0.74× | 0.77× | 0.71× | 0.73× | 0.73× | 0.74× | 0.75× | **0.771×** |
+
+**A ~23% aggregate wall-clock *regression*, and every ord but one regresses past the 1.05× ceiling**
+— the opposite of step 1's result on the identical smoother config. Outer iterations roughly double
+almost everywhere (72→98, 94→185, 50→98, ...). This is the key finding, and it generalizes beyond
+this one config: **step 1's `.solve()` probe measures how many *AMGCL-native, Krylov-accelerated*
+V-cycles the block converges in on its own; step 2's actual usage calls `applyPreconditioner()` —
+exactly *one* V-cycle per outer field-split sweep, used as `M` inside a *different*, outer (scipy)
+Krylov loop.** A backend can be a better standalone solver (fewer/comparable iterations to its own
+internal convergence, cheaper per V-cycle) while being a *worse single-shot preconditioner* for
+someone else's outer loop, if its one-cycle error-reduction factor is worse than the scalar backend's
+— evidently the case here. The per-application bandwidth saving (real, confirmed in step 1) is
+overwhelmed by needing roughly twice as many outer applications. True residuals are also looser
+throughout (e.g. `2.68e-06` vs `1.23e-07` on ord 2) at the same requested `outerTol`, consistent with
+a measurably weaker single-cycle preconditioner, not just a slower-but-equivalent one.
+
+**Bar not cleared (needed ≥20% aggregate win, no ord past ~1.05×; got a 23% aggregate loss, 8/9 ords
+past it) — live gate skipped per the plan's own sequencing ("its live gate decides the final
+default"; the decision here is "no change"), optional float+block column skipped ("only if
+double-block wins"). Default stays the shipped scalar `backendBlockSize=1`.** The block-valued
+backend implementation itself is correct, tested, and kept available via `fieldPreconds` (useful as a
+standalone solver via `.solve()`, or for problems whose block-Gauss-Seidel-embedded behaviour differs
+from this one) — only the *default* is unaffected. Part 1 concludes here; the "final setup" Part 2
+validates against is the unchanged scalar default, exactly as it was entering this phase.
+
+Logs (xeon, `Pryout_profile_investigation/`, ad hoc probes, not checked in): `probe_201_block_isolated.log`
+(pre-fix, wrong solver, kept as the record of that mistake), `probe_201_block_isolated_v2.log`,
+`probe_201_coupled.log`.
+
 ### 20.2 Part 2 — the EW rescue experiment, on the final setup from Part 1 (~half day, mostly runs)
 
 **Do not start until Part 1 has concluded** (either outcome). Everything here runs against the
