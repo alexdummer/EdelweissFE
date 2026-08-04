@@ -30,6 +30,7 @@
 # @author: Matthias Neuner
 
 import json
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -275,6 +276,32 @@ class NIST(NonlinearSolverBase):
                         )
 
                     self.journal.printSeperationLine()
+
+                    # Optional one-time dump of nodal coordinates aligned with the DOF vector, for
+                    # offline preconditioner experiments that need geometry (e.g. the rigid body modes
+                    # a block-AMG solver wants as the elasticity near null-space). The condensed system
+                    # keeps the DofManager ordering (MPC transform is size-preserving), so a field's
+                    # node coordinates in `field.nodes` order line up 1:1 with its DOF slice. Gated by
+                    # an environment variable so it never runs in production; overwrites on every
+                    # (re)build so the file reflects the current mesh after any AMR.
+                    coordinateDumpDir = os.environ.get("EDELWEISS_DUMP_COORDS")
+                    if coordinateDumpDir:
+                        os.makedirs(coordinateDumpDir, exist_ok=True)
+                        coordinateData = {}
+                        for fieldName, field in model.nodeFields.items():
+                            coordinateData[fieldName + "_coords"] = np.array(
+                                [node.coordinates for node in field.nodes], dtype=float
+                            )
+                            fieldSlice = self.theDofManager.idcsOfFieldsInDofVector[fieldName]
+                            coordinateData[fieldName + "_slice"] = np.array([fieldSlice.start, fieldSlice.stop])
+                        np.savez(os.path.join(coordinateDumpDir, "coordinates.npz"), **coordinateData)
+                        self.journal.message(
+                            "dumped nodal coordinates ({:} fields) to {:}".format(
+                                len(model.nodeFields), coordinateDumpDir
+                            ),
+                            self.identification,
+                            0,
+                        )
 
                     presentVariableNames = list(self.theDofManager.idcsOfFieldsInDofVector.keys())
 
