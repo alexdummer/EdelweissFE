@@ -100,6 +100,8 @@ import numpy as np
 from scipy.sparse import csc_matrix
 from scipy.sparse.linalg import LinearOperator, gmres, splu
 
+from edelweissfe.linsolve.base import LinearSolver
+
 
 class _SuperLUFactorization:
     """A ``factorize``/``solveFactorized`` factorizing delegate backed by SciPy's SuperLU.
@@ -130,7 +132,7 @@ class _SuperLUFactorization:
         return self.solveFactorized(b)
 
 
-class InexactNewtonSolver:
+class InexactNewtonSolver(LinearSolver):
     """Preconditioned GMRES with a lagged exact-LU preconditioner and Eisenstat--Walker forcing.
 
     See the module docstring for the rationale and the measured numbers. Callable as ``(A, b) -> x``,

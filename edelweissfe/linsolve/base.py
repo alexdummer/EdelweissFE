@@ -26,14 +26,17 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-"""Base classes / mixins for linear solvers that need more context than the ``(A, b) -> x`` call
-carries.
+"""The common base class every registered ``linsolver`` inherits, so the nonlinear solver can treat
+all of them uniformly instead of special-casing per capability.
 
-Most linear solvers need only the matrix and the right hand side. A *field-split* solver additionally
-needs to know which DOFs belong to which physical field -- information the matrix does not carry, but
-the :class:`~edelweissfe.numerics.dofmanager.DofManager` does. Rather than hand-specify it in a
-configuration file (brittle, and it changes with the mesh / adaptivity), the nonlinear solver pushes
-it in through the mixin below once the equation system is (re)built.
+Every ``linsolve/<name>/__init__.py``'s ``createSolver(opts)`` factory returns an instance of a
+:class:`LinearSolver` subclass, callable as ``(A, b) -> x``. Two setters -- :meth:`LinearSolver.setJournal`
+and :meth:`LinearSolver.setFieldStructure` -- are part of that base contract with safe no-op-ish
+defaults, so a caller can call either on *any* registered solver unconditionally, whether or not that
+particular solver actually uses the information. This replaces an earlier design where field-structure
+awareness was an isolated, ``isinstance``-checked opt-in mixin (only ``blockamg`` had it) -- adding a
+second, parallel mixin for Journal awareness would have meant every new cross-cutting capability grows
+its own special case at every call site. One base, grown as needed, avoids that.
 """
 
 from dataclasses import dataclass
@@ -61,17 +64,32 @@ class FieldBlock:
     dimension: int
 
 
-class FieldStructureAwareLinearSolver:
-    """Mixin for linear solvers that require the field-block structure of the DOF vector.
+class LinearSolver:
+    """Common base for every ``linsolver`` registry entry. Callable as ``(A, b) -> x``.
 
-    The nonlinear solver calls :meth:`setFieldStructure` once the ``DofManager`` is built, and again
-    after any rebuild (e.g. adaptive refinement changing the DOF count). Solvers that do not need this
-    simply do not inherit the mixin and are never asked; the nonlinear solver dispatches on
-    ``isinstance``. Subclasses read :attr:`_fieldStructure` (``None`` until set).
+    Subclasses implement :meth:`__call__`. :meth:`setJournal` and :meth:`setFieldStructure` have safe
+    defaults here (store-and-ignore, and a plain no-op respectively) so the nonlinear solver can call
+    both on any solver without asking first which ones care -- a solver that needs one overrides it;
+    everything else inherits a default that does nothing harmful.
     """
 
+    _journal = None
     _fieldStructure: "list[FieldBlock] | None" = None
 
+    def setJournal(self, journal) -> None:
+        """Receive the shared :class:`~edelweissfe.journal.journal.Journal` instance.
+
+        Default just stores it on ``self._journal`` for solvers that want to log through it; solvers
+        with no logging needs simply never read the attribute.
+        """
+        self._journal = journal
+
     def setFieldStructure(self, fields: "list[FieldBlock]") -> None:
-        """Receive the ordered field blocks of the DOF vector (in DOF order)."""
-        self._fieldStructure = list(fields)
+        """Receive the ordered field blocks of the DOF vector (in DOF order).
+
+        Default no-op -- only field-split solvers (e.g. ``blockamg``) need this; every other solver
+        simply ignores the call.
+        """
+
+    def __call__(self, A, b):
+        raise NotImplementedError

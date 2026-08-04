@@ -39,7 +39,7 @@ from scipy.sparse import csr_matrix
 import edelweissfe.utils.performancetiming as performancetiming
 from edelweissfe.config.linsolve import getDefaultLinSolver, getLinSolverByName
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
-from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
+from edelweissfe.linsolve.base import FieldBlock
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.csrgeneratorv2 import CSRGenerator
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
@@ -208,6 +208,9 @@ class NIST(NonlinearSolverBase):
             if "linsolver" in self.options
             else getDefaultLinSolver()
         )
+        # Every registered linsolver inherits LinearSolver's setJournal() (a safe no-op-ish default for
+        # solvers that do not log), so this is unconditional -- no isinstance check needed.
+        self.linSolver.setJournal(self.journal)
 
         maxIter = step.maxIter
         criticalIter = step.criticalIter
@@ -278,22 +281,22 @@ class NIST(NonlinearSolverBase):
 
                     self.journal.printSeperationLine()
 
-                    # Hand a field-split linear solver the block structure it needs but the (A, b)
-                    # interface cannot carry: each field's DOF range and its nodal dimension (from
-                    # which the solver decides the near null-space -- translations for a vector field,
-                    # a constant for a scalar one). Dispatched on the mixin so ordinary solvers are
-                    # never asked; re-pushed here on every (re)build so it tracks the mesh across AMR.
-                    if isinstance(self.linSolver, FieldStructureAwareLinearSolver):
-                        fieldBlocks = [
-                            FieldBlock(
-                                fieldName,
-                                fieldIndices.start,
-                                fieldIndices.stop,
-                                model.nodeFields[fieldName].dimension,
-                            )
-                            for fieldName, fieldIndices in self.theDofManager.idcsOfFieldsInDofVector.items()
-                        ]
-                        self.linSolver.setFieldStructure(fieldBlocks)
+                    # Hand every linear solver the block structure it needs but the (A, b) interface
+                    # cannot carry: each field's DOF range and its nodal dimension (from which a
+                    # field-split solver decides the near null-space -- translations for a vector
+                    # field, a constant for a scalar one). Unconditional -- LinearSolver.setFieldStructure
+                    # defaults to a no-op, so ordinary solvers simply ignore this; re-pushed here on
+                    # every (re)build so it tracks the mesh across AMR.
+                    fieldBlocks = [
+                        FieldBlock(
+                            fieldName,
+                            fieldIndices.start,
+                            fieldIndices.stop,
+                            model.nodeFields[fieldName].dimension,
+                        )
+                        for fieldName, fieldIndices in self.theDofManager.idcsOfFieldsInDofVector.items()
+                    ]
+                    self.linSolver.setFieldStructure(fieldBlocks)
 
                     # Optional one-time dump of nodal coordinates aligned with the DOF vector, for
                     # offline preconditioner experiments that need geometry (e.g. the rigid body modes

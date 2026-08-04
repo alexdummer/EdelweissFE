@@ -45,7 +45,7 @@ for a damage field) is individually AMG-friendly even though their monolithic co
 
 The field structure -- which DOFs belong to which field, and each field's nodal dimension -- is not
 carried by the matrix; it is pushed in from the DofManager by the nonlinear solver (via
-:class:`~edelweissfe.linsolve.base.FieldStructureAwareLinearSolver`), so nothing about the block layout
+:class:`~edelweissfe.linsolve.base.LinearSolver`), so nothing about the block layout
 has to be specified by hand.
 
 What it does per solve
@@ -75,7 +75,18 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import LinearOperator, gmres
 
-from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
+import edelweissfe.utils.performancetiming as performancetiming
+from edelweissfe.linsolve.base import FieldBlock, LinearSolver
+
+# Ordered low-to-high; index comparison decides whether a message at a given level should print.
+# "warning": only abnormal conditions (excessive outer iterations, unmet true-residual tolerance,
+# non-convergence) -- the default, so a normal run stays quiet. "info": one compact line per solve.
+# "debug": full detail, including every true-residual continuation attempt. Independent of, and does
+# not affect, the Journal instance's own message-level suppression (see _log()) -- this gate decides
+# whether blockamg attempts to log at all; Journal's own level decides whether the attempt is shown.
+_VERBOSITY_LEVELS = ("silent", "warning", "info", "debug")
+_JOURNAL_LEVEL = {"warning": 0, "info": 1, "debug": 2}
+_IDENTIFICATION = "BlockAMGSolver"
 
 # "backendPrecision" and "backendBlockSize" are not AMGCL parameters -- they select the AMGCL
 # wrapper's own backend value type (§19.3: "double" (default) or "float"; §20.1: 1 (default, scalar),
@@ -113,11 +124,11 @@ _DEFAULT_SCALAR_PRECOND = {
 }
 
 
-class BlockAMGSolver(FieldStructureAwareLinearSolver):
+class BlockAMGSolver(LinearSolver):
     """Field-split block-AMG preconditioned GMRES. Callable as ``(A, b) -> x``.
 
     The block structure is not configured here -- it is supplied by the nonlinear solver through
-    :meth:`~edelweissfe.linsolve.base.FieldStructureAwareLinearSolver.setFieldStructure`. A field's
+    :meth:`~edelweissfe.linsolve.base.LinearSolver.setFieldStructure`. A field's
     near null-space is decided from its nodal dimension: a vector field (dimension > 1) gets its
     per-component rigid-body translations, a scalar field the default constant.
 
@@ -125,16 +136,17 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     :mod:`~edelweissfe.linsolve.inexactnewton.inexactnewton`, sees only ``(A, b)`` per call and
     reconstructs Newton-loop state from residual jumps rather than being told about them):
 
-    #. **Adaptive outer tolerance** (Eisenstat--Walker forcing, "choice 2"), *opt-in* -- pass
-       ``outerTol=None``. Most Newton iterates do not need the solve tight, and loosening it cuts
-       outer iterations substantially (measured offline: ~36% less wall-clock on the 9 dumped
-       reference systems). **Not the default**: a live confirmation run on the reference Pryout model
-       changed the Newton path itself (15/12/7/14 iterations and 2 cutbacks, vs the fixed-tolerance
-       15/8/5/5 and 3 cutbacks -- a materially different trajectory, not "a few extra iterations",
-       even though total job wall-clock was roughly unchanged). See
-       PERF_LINSOLVE_INVESTIGATION.md §19.2 -- this needs a judgement call on whether that trajectory
-       change is acceptable before it becomes the default, the same kind of call already made for the
-       `pruneCondensedMatrixZeros` reordering sensitivity in §7.
+    #. **Adaptive outer tolerance** (Eisenstat--Walker forcing, "choice 2"), the default since §20.2.
+       Most Newton iterates do not need the solve tight, and loosening it cuts outer iterations
+       substantially. §19.2 first tried this and it changed the live Newton path (15/12/7/14 iterations
+       and 2 cutbacks, vs the fixed-tolerance 15/8/5/5 and 3 cutbacks) -- root-caused to GMRES's
+       preconditioned-residual stopping check letting the *true* residual run looser than `eta`
+       actually asked for, so `etaMax=1e-3` was never really `1e-3` on this preconditioner. Once the
+       true-residual enforcement above closed that gap, a live `etaMax` ladder (`1e-4`, then `3e-4`)
+       both reproduced the fixed-tolerance trajectory *exactly* (identical 15/8/5/5, identical cutbacks,
+       identical final load), so `etaMax=3e-4` (the looser, marginally faster rung) shipped as the
+       default. Pass ``outerTol=<a float>`` to pin a fixed tolerance instead (the solver's original,
+       pre-§20.2 behaviour) if a specific model needs that guarantee.
     #. **Per-field AMG hierarchy reuse across Newton iterations**, on by default. Building a hierarchy
        (~3.4 s on the reference model) is a large, avoidable fraction of a solve when the Jacobian has
        moved only a little since the last one. The outer GMRES always operates on the current, fresh
@@ -158,9 +170,8 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     Parameters
     ----------
     outerTol
-        A fixed outer GMRES relative tolerance. Defaults to ``1e-6``, the solver's original behaviour.
-        Pass ``None`` to opt into Eisenstat--Walker forcing instead -- see ``etaMin``/``etaMax`` below,
-        and the caveat above before making that the default anywhere.
+        A fixed outer GMRES relative tolerance, overriding Eisenstat--Walker forcing. ``None`` (the
+        default since §20.2) uses adaptive forcing instead -- see ``etaMin``/``etaMax`` below.
     outerRestart, outerMaxiter
         The outer GMRES restart length and maximum restart cycles.
     sweeps
@@ -190,9 +201,22 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         /``eta``) if the true relative residual still exceeds ``eta`` after GMRES itself reports
         convergence. ``0`` disables this and restores the original preconditioned-residual-only
         behaviour.
-    verbose
-        If True, print the outer iteration count, residual, forcing tolerance, and hierarchy
-        reuse/refresh decision per solve.
+    verbosity
+        One of ``"silent"``, ``"warning"`` (default), ``"info"``, ``"debug"``. Messages go through the
+        injected Journal (:meth:`~edelweissfe.linsolve.base.LinearSolver.setJournal`), falling back to
+        ``print`` if none was set. ``"warning"`` emits nothing on a normal solve and only speaks up on
+        an abnormal one: outer iterations past ``warnOuterIterationsThreshold``, the true-residual
+        tolerance still unmet after every continuation, or GMRES itself reporting non-convergence.
+        ``"info"`` adds one compact line per solve; ``"debug"`` adds one line per true-residual
+        continuation attempt too. Per-stage wall-clock (equilibration, off-diagonal split, hierarchy
+        build, outer GMRES, continuations) is recorded via
+        :mod:`edelweissfe.utils.performancetiming` regardless of verbosity, nested under "linear solve"
+        in the job's own performance table -- note PERF_LINSOLVE_INVESTIGATION.md §19.1's caveat that
+        this global mechanism's accumulated figures are not reliable under ``PYTHON_GIL=0`` on a live,
+        multi-threaded run (a pre-existing, general-infrastructure bug, not specific to blockamg).
+    warnOuterIterationsThreshold
+        A solve needing more outer GMRES iterations than this triggers a ``"warning"``-level message
+        (a preconditioner-quality red flag), even when ``verbosity="silent"`` is not set to suppress it.
     """
 
     def __init__(
@@ -211,7 +235,8 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         residualGrowthFactor: float = 4.0,
         hierarchyStalenessFactor: float = 1.5,
         trueResidualMaxContinuations: int = 2,
-        verbose: bool = False,
+        verbosity: str = "warning",
+        warnOuterIterationsThreshold: int = 100,
     ):
         self._outerTol = outerTol
         self._outerRestart = outerRestart
@@ -226,7 +251,13 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         self._residualGrowthFactor = residualGrowthFactor
         self._hierarchyStalenessFactor = hierarchyStalenessFactor
         self._trueResidualMaxContinuations = trueResidualMaxContinuations
-        self._verbose = verbose
+        if verbosity not in _VERBOSITY_LEVELS:
+            raise ValueError("verbosity must be one of {:}, got {:!r}".format(_VERBOSITY_LEVELS, verbosity))
+        self._verbosityIndex = _VERBOSITY_LEVELS.index(verbosity)
+        self._warnOuterIterationsThreshold = warnOuterIterationsThreshold
+
+        self._solveCount = 0
+        self._fieldsAnnounced = None
 
         # Eisenstat-Walker forcing state.
         self._lastResidualNorm = None
@@ -241,6 +272,19 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         self._lastNnz = None
         self._lastOuterIters = None
         self._refreshNext = False
+
+    def _log(self, level: str, message: str) -> None:
+        """Emit ``message`` through the injected Journal (see ``setJournal``, inherited from
+        :class:`~edelweissfe.linsolve.base.LinearSolver`) if this instance's verbosity is at least
+        ``level`` -- falls back to a plain ``print`` if no Journal has been set (e.g. an offline probe
+        script driving this solver directly, outside the full nonlinear-solver/driver stack).
+        """
+        if self._verbosityIndex < _VERBOSITY_LEVELS.index(level):
+            return
+        if self._journal is not None:
+            self._journal.message(message, _IDENTIFICATION, level=_JOURNAL_LEVEL[level])
+        else:
+            print(message, flush=True)
 
     def _forcingTolerance(self, residualNorm: float, newIncrement: bool) -> float:
         """The Eisenstat--Walker "choice 2" forcing tolerance for this solve, clamped and safeguarded.
@@ -262,6 +306,15 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
             eta = max(eta, safeguard)
 
         return min(self._etaMax, max(self._etaMin, eta))
+
+    def setFieldStructure(self, fields: list) -> None:
+        """Receive the ordered field blocks of the DOF vector (in DOF order).
+
+        Overrides :meth:`~edelweissfe.linsolve.base.LinearSolver.setFieldStructure`'s no-op default --
+        this is the one solver in the registry that actually needs the field-block structure, to
+        split the equation system per field.
+        """
+        self._fieldStructure = list(fields)
 
     def _resolveBlocks(self, n: int) -> list:
         """The field blocks tiling ``[0, n)``, in DOF order, with any trailing DOFs not covered by a
@@ -305,11 +358,17 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
     def __call__(self, A, b):
         from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLSolver
 
+        self._solveCount += 1
         A = A.tocsr()
         n = A.shape[0]
         blocks = self._resolveBlocks(n)
         slices = [slice(block.start, block.stop) for block in blocks]
         b = np.asarray(b).reshape(n)
+
+        fieldNames = [block.name for block in blocks]
+        if fieldNames != self._fieldsAnnounced:
+            self._log("info", "blockamg: fields = {:}".format(fieldNames))
+            self._fieldsAnnounced = fieldNames
 
         residualNorm = float(np.linalg.norm(b))
         newIncrement = (
@@ -339,62 +398,66 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         )
         self._refreshNext = False
 
-        if mustRefresh:
-            # Symmetric diagonal equilibration. Solve A x = b as (D A D)(D^-1 x) = D b, i.e. As z = bs
-            # with x = D z; D = diag(dinv), dinv = 1/sqrt(|diag A|).
-            dinv = 1.0 / np.sqrt(np.abs(A.diagonal()))
-        else:
-            # Reuse the equilibration the standing hierarchies were built for. This stays a valid
-            # diagonal similarity scaling of the *current* A x = b regardless of how it was chosen, so
-            # correctness (the outer GMRES converges on the true, fresh As/bs) is unaffected; only the
-            # preconditioner's quality can drift, which costs outer iterations, never a wrong answer.
-            dinv = self._dinv
+        with performancetiming.timeit("blockamg: equilibration"):
+            if mustRefresh:
+                # Symmetric diagonal equilibration. Solve A x = b as (D A D)(D^-1 x) = D b, i.e.
+                # As z = bs with x = D z; D = diag(dinv), dinv = 1/sqrt(|diag A|).
+                dinv = 1.0 / np.sqrt(np.abs(A.diagonal()))
+            else:
+                # Reuse the equilibration the standing hierarchies were built for. This stays a valid
+                # diagonal similarity scaling of the *current* A x = b regardless of how it was chosen,
+                # so correctness (the outer GMRES converges on the true, fresh As/bs) is unaffected;
+                # only the preconditioner's quality can drift, which costs outer iterations, never a
+                # wrong answer.
+                dinv = self._dinv
 
-        As = (sp.diags(dinv) @ A @ sp.diags(dinv)).tocsr()
-        bs = dinv * b
+            As = (sp.diags(dinv) @ A @ sp.diags(dinv)).tocsr()
+            bs = dinv * b
 
         # Off-diagonal couplings (for the sweep) are needed every solve regardless of refresh/reuse.
-        offBlocks = {}
-        for i in range(len(slices)):
-            rowBlock = As[slices[i], :]
-            for j in range(len(slices)):
-                if i != j:
-                    offBlocks[(i, j)] = rowBlock[:, slices[j]].tocsr()
+        with performancetiming.timeit("blockamg: off-diagonal split"):
+            offBlocks = {}
+            for i in range(len(slices)):
+                rowBlock = As[slices[i], :]
+                for j in range(len(slices)):
+                    if i != j:
+                        offBlocks[(i, j)] = rowBlock[:, slices[j]].tocsr()
 
         if mustRefresh:
-            # One AMG hierarchy per field, built fresh. A vector field gets its translations as the
-            # near null-space; a scalar field the default constant.
-            diagBlocks = [As[sl, :][:, sl].tocsr() for sl in slices]
-            preconditioners = []
-            for i, block in enumerate(blocks):
-                isVectorField = block.dimension > 1
-                precondParams = dict(
-                    self._fieldPreconds.get(
-                        block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
+            with performancetiming.timeit("blockamg: hierarchy build"):
+                # One AMG hierarchy per field, built fresh. A vector field gets its translations as the
+                # near null-space; a scalar field the default constant.
+                diagBlocks = [As[sl, :][:, sl].tocsr() for sl in slices]
+                preconditioners = []
+                for i, block in enumerate(blocks):
+                    isVectorField = block.dimension > 1
+                    precondParams = dict(
+                        self._fieldPreconds.get(
+                            block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
+                        )
                     )
-                )
-                backendPrecision = precondParams.pop("backendPrecision", "double")
-                backendBlockSize = precondParams.pop("backendBlockSize", 1)
-                solver = PyAMGCLSolver(
-                    {
-                        "precond": precondParams,
-                        "backendPrecision": backendPrecision,
-                        "backendBlockSize": backendBlockSize,
-                    }
-                )
-                # set_nullspace() is unsupported (and always raises) on a block backend -- AMGCL's own
-                # near-null-space path is unimplemented for block value types (§20.1). This is an
-                # accepted, measured non-loss: rigid-body translations do not help on this operator
-                # anyway (§11, §13).
-                if isVectorField and backendBlockSize == 1:
-                    solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
-                solver.build(diagBlocks[i])
-                preconditioners.append(solver)
-            self._preconditioners = preconditioners
-            self._dinv = dinv
-            self._blocks = blocks
-            self._n = n
-            self._lastNnz = A.nnz
+                    backendPrecision = precondParams.pop("backendPrecision", "double")
+                    backendBlockSize = precondParams.pop("backendBlockSize", 1)
+                    solver = PyAMGCLSolver(
+                        {
+                            "precond": precondParams,
+                            "backendPrecision": backendPrecision,
+                            "backendBlockSize": backendBlockSize,
+                        }
+                    )
+                    # set_nullspace() is unsupported (and always raises) on a block backend -- AMGCL's
+                    # own near-null-space path is unimplemented for block value types (§20.1). This is
+                    # an accepted, measured non-loss: rigid-body translations do not help on this
+                    # operator anyway (§11, §13).
+                    if isVectorField and backendBlockSize == 1:
+                        solver.set_nullspace(self._translationNullspace(block, dinv[slices[i]]))
+                    solver.build(diagBlocks[i])
+                    preconditioners.append(solver)
+                self._preconditioners = preconditioners
+                self._dinv = dinv
+                self._blocks = blocks
+                self._n = n
+                self._lastNnz = A.nnz
         preconditioners = self._preconditioners
 
         nFields = len(slices)
@@ -423,20 +486,21 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         else:
             eta = self._forcingTolerance(residualNorm, newIncrement)
 
-        history = []
-        z, info = gmres(
-            As,
-            bs,
-            M=preconditioner,
-            rtol=eta,
-            atol=0.0,
-            restart=self._outerRestart,
-            maxiter=self._outerMaxiter,
-            callback=lambda residualNorm: history.append(residualNorm),
-            callback_type="pr_norm",
-        )
-        x = dinv * z
-        trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
+        with performancetiming.timeit("blockamg: outer GMRES"):
+            history = []
+            z, info = gmres(
+                As,
+                bs,
+                M=preconditioner,
+                rtol=eta,
+                atol=0.0,
+                restart=self._outerRestart,
+                maxiter=self._outerMaxiter,
+                callback=lambda residualNorm: history.append(residualNorm),
+                callback_type="pr_norm",
+            )
+            x = dinv * z
+            trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
 
         # GMRES's own stopping check (callback_type="pr_norm") is on the *preconditioned* residual,
         # not the true one -- with an imperfect preconditioner (this one, by design, §17) the two can
@@ -458,39 +522,37 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         # Fix: geometrically tighten the *requested* rtol itself by a fixed factor each continuation
         # (0.01x), guaranteeing a strictly smaller, dimensionally-consistent target with no dependency
         # on the callback's residual scale.
-        continuationEta = eta
-        continuations = 0
-        while trueResidual > eta and continuations < self._trueResidualMaxContinuations:
-            continuations += 1
-            continuationEta *= 0.01
-            continuationHistory = []
-            z, info = gmres(
-                As,
-                bs,
-                x0=z,
-                M=preconditioner,
-                rtol=continuationEta,
-                atol=0.0,
-                restart=self._outerRestart,
-                maxiter=self._outerMaxiter,
-                callback=lambda residualNorm: continuationHistory.append(residualNorm),
-                callback_type="pr_norm",
-            )
-            x = dinv * z
-            trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
-            history.extend(continuationHistory)
-            if self._verbose:
-                print(
-                    "blockamg: true-residual continuation {:}/{:} | target eta={:.1e} | {:} more outer "
-                    "GMRES iters, info={:}, true rel.res={:.2e}".format(
+        with performancetiming.timeit("blockamg: true-residual continuations"):
+            continuationEta = eta
+            continuations = 0
+            while trueResidual > eta and continuations < self._trueResidualMaxContinuations:
+                continuations += 1
+                continuationEta *= 0.01
+                continuationHistory = []
+                z, info = gmres(
+                    As,
+                    bs,
+                    x0=z,
+                    M=preconditioner,
+                    rtol=continuationEta,
+                    atol=0.0,
+                    restart=self._outerRestart,
+                    maxiter=self._outerMaxiter,
+                    callback=lambda residualNorm: continuationHistory.append(residualNorm),
+                    callback_type="pr_norm",
+                )
+                x = dinv * z
+                trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
+                history.extend(continuationHistory)
+                self._log(
+                    "debug",
+                    "blockamg:   continuation {:}/{:} eta={:.1e} +{:}it res={:.1e}".format(
                         continuations,
                         self._trueResidualMaxContinuations,
                         continuationEta,
                         len(continuationHistory),
-                        info,
                         trueResidual,
                     ),
-                    flush=True,
                 )
 
         outerIters = len(history)
@@ -500,19 +562,38 @@ class BlockAMGSolver(FieldStructureAwareLinearSolver):
         self._lastResidualNorm = residualNorm
         self._lastEta = eta
 
-        if self._verbose:
-            print(
-                "blockamg: fields {:} | {:} outer GMRES iters, info={:}, true rel.res={:.2e}, "
-                "eta={:.1e}, {:}, continuations={:}".format(
-                    [block.name for block in blocks],
-                    outerIters,
-                    info,
-                    trueResidual,
-                    eta,
-                    "REFRESH" if mustRefresh else "reuse",
-                    continuations,
+        self._log(
+            "info",
+            "blockamg: solve #{:<4d} {:7s} {:3d}it eta={:.1e} res={:.1e} cont={:}".format(
+                self._solveCount,
+                "REFRESH" if mustRefresh else "reuse",
+                outerIters,
+                eta,
+                trueResidual,
+                continuations,
+            ),
+        )
+        if outerIters > self._warnOuterIterationsThreshold:
+            self._log(
+                "warning",
+                "blockamg: WARNING solve #{:} needed {:} outer GMRES iterations (> threshold {:}) -- "
+                "possible preconditioner degradation".format(
+                    self._solveCount, outerIters, self._warnOuterIterationsThreshold
                 ),
-                flush=True,
+            )
+        if trueResidual > eta:
+            self._log(
+                "warning",
+                "blockamg: WARNING solve #{:} true residual {:.2e} still exceeds requested eta={:.2e} "
+                "after {:} continuation(s) -- did not fully converge".format(
+                    self._solveCount, trueResidual, eta, continuations
+                ),
+            )
+        if info != 0:
+            self._log(
+                "warning",
+                "blockamg: WARNING solve #{:} GMRES reported info={:} (did not converge within "
+                "maxiter on its own preconditioned-residual criterion)".format(self._solveCount, info),
             )
 
         return x

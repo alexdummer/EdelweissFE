@@ -53,8 +53,10 @@ import os
 import numpy as np
 from scipy.sparse import csr_matrix, save_npz
 
+from edelweissfe.linsolve.base import LinearSolver
 
-class MatrixDumpSolver:
+
+class MatrixDumpSolver(LinearSolver):
     """Write selected equation systems to disk, then solve them with a delegate solver.
 
     A note on instances, because it determines what ``dumpAt`` ordinals mean: the nonlinear solvers
@@ -120,6 +122,17 @@ class MatrixDumpSolver:
 
         os.makedirs(self._directory, exist_ok=True)
         self._manifestPath = os.path.join(self._directory, "manifest.jsonl")
+
+    def setJournal(self, journal) -> None:
+        """Store the Journal, and forward it to the delegate too -- this solver is a transparent
+        wrapper, so the delegate should get whatever the nonlinear solver would otherwise have given
+        it directly."""
+        super().setJournal(journal)
+        self._delegate.setJournal(journal)
+
+    def setFieldStructure(self, fields) -> None:
+        """Forward the field structure to the delegate -- see :meth:`setJournal`."""
+        self._delegate.setFieldStructure(fields)
 
     def _shouldDump(self, ordinal: int) -> bool:
         """Decide whether the solve with this ordinal gets dumped."""

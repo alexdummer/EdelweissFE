@@ -39,7 +39,7 @@ def createSolver(opts) -> Callable:
 
     The factory the ``linsolver`` registry category resolves for the name ``blockamg``. No field
     structure is configured here: it is discovered from the model and pushed in by the nonlinear
-    solver (see :class:`~edelweissfe.linsolve.base.FieldStructureAwareLinearSolver`).
+    solver (see :class:`~edelweissfe.linsolve.base.LinearSolver`).
 
     Parameters
     ----------
@@ -47,7 +47,7 @@ def createSolver(opts) -> Callable:
         The linear-solver options parsed from the solver's ``linsolverConfigFile``. All optional (see
         :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`):
 
-        ``outerTol``, ``outerRestart``, ``outerMaxiter``, ``sweeps``, ``symmetric``, ``verbose``
+        ``outerTol``, ``outerRestart``, ``outerMaxiter``, ``sweeps``, ``symmetric``
             The outer GMRES and block Gauss-Seidel knobs. ``outerTol`` defaults to a fixed ``1e-6``;
             pass the literal string ``"adaptive"`` (JSON has no bare ``null`` in this cast pipeline) to
             opt into the Eisenstat--Walker forcing described next -- not the default, since a live
@@ -62,6 +62,13 @@ def createSolver(opts) -> Callable:
             How many warm-restart continuations enforce the requested tolerance on the true residual,
             not just GMRES's own preconditioned stopping check (§20.2). Defaults to ``2``; ``0``
             restores the original preconditioned-residual-only behaviour.
+        ``verbosity``
+            ``"silent"``, ``"warning"`` (default), ``"info"``, or ``"debug"`` -- see
+            :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`. Replaces the old boolean
+            ``verbose`` option entirely; existing configs setting ``verbose`` should switch to this.
+        ``warnOuterIterationsThreshold``
+            Outer-iteration count past which a solve prints a ``"warning"``-level message even at the
+            default verbosity.
         ``fieldPreconds``
             Optional mapping of field name (e.g. ``"displacement"``) to an AMGCL preconditioner
             parameter tree, overriding the dimension-based default for that field.
@@ -88,7 +95,6 @@ def createSolver(opts) -> Callable:
         ("outerMaxiter", int),
         ("sweeps", int),
         ("symmetric", bool),
-        ("verbose", bool),
         ("etaMin", float),
         ("etaMax", float),
         ("ewGamma", float),
@@ -96,6 +102,8 @@ def createSolver(opts) -> Callable:
         ("residualGrowthFactor", float),
         ("hierarchyStalenessFactor", float),
         ("trueResidualMaxContinuations", int),
+        ("verbosity", str),
+        ("warnOuterIterationsThreshold", int),
     ):
         if key in optionMap:
             kwargs[key] = cast(optionMap[key])

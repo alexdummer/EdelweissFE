@@ -35,6 +35,35 @@ is optional -- it needs MKL at build time. The factory below therefore imports i
 
 from collections.abc import Callable, Mapping
 
+from edelweissfe.linsolve.base import LinearSolver
+
+
+class PardisoLinearSolver(LinearSolver):
+    """Thin wrapper giving the Cython :class:`~edelweissfe.linsolve.pardiso.pardiso.PardisoSolver`
+    extension type the common :class:`~edelweissfe.linsolve.base.LinearSolver` interface
+    (``setJournal``/``setFieldStructure``) without touching the ``.pyx`` itself -- a plain Python
+    subclass keeps the Cython extension's build untouched and this wrapper trivially testable without
+    a rebuild.
+
+    Also forwards ``factorize``/``solveFactorized`` (the two-method contract
+    :class:`~edelweissfe.linsolve.inexactnewton.inexactnewton.InexactNewtonSolver` uses instead of the
+    plain ``(A, b) -> x`` call) -- ``inexactnewton``'s factory resolves its PARDISO delegate through
+    this same registry seam (deliberately, so there is exactly one place that knows how a pardiso
+    solver is built), so this wrapper must satisfy both contracts, not just the ``LinearSolver`` one.
+    """
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+
+    def __call__(self, A, b):
+        return self._delegate(A, b)
+
+    def factorize(self, A):
+        return self._delegate.factorize(A)
+
+    def solveFactorized(self, b):
+        return self._delegate.solveFactorized(b)
+
 
 def createSolver(opts) -> Callable:
     """Create a PARDISO-backed linear solver.
@@ -54,8 +83,9 @@ def createSolver(opts) -> Callable:
     Returns
     -------
     Callable
-        A :class:`~edelweissfe.linsolve.pardiso.pardiso.PardisoSolver` instance, which is callable
-        as ``(A, b) -> x``.
+        A :class:`PardisoLinearSolver` wrapping a
+        :class:`~edelweissfe.linsolve.pardiso.pardiso.PardisoSolver` instance, callable as
+        ``(A, b) -> x``.
 
     Raises
     ------
@@ -81,4 +111,4 @@ def createSolver(opts) -> Callable:
         bool(opts.get("reuseSymbolicFactorization", False)) if isinstance(opts, Mapping) else False
     )
 
-    return PardisoSolver(reuseSymbolicFactorization=reuseSymbolicFactorization)
+    return PardisoLinearSolver(PardisoSolver(reuseSymbolicFactorization=reuseSymbolicFactorization))
