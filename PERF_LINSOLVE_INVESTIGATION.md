@@ -1,7 +1,10 @@
 # Linear-solver performance investigation — handoff
 
 Branch `perf/linsolve-investigation`, based on `feat/amr-recovery-marker` (`d495e90b`).
-Local, remote `mn` and xeon in sync. Working tree clean.
+Working tree clean. **16 commits sit on top of `d83728ba`, all local — NOT pushed to `mn`.** xeon has
+the changed files rsynced into its working tree for the experiments (its git is untouched and behind);
+`setuptools` was `pip install`ed into xeon's `next_v2611` env (it was missing, which had been silently
+blocking every extension rebuild there). See [§15](#15-what-remains) for the full state and next steps.
 
 **Status: Phases 1 (instrument + capture) and 2 (offline benchmark) are complete. Phase 3 (implement)
 has begun. Two cheap leads are now measured on the real model:**
@@ -16,16 +19,19 @@ has begun. Two cheap leads are now measured on the real model:**
   (AMG per field inside block Gauss–Seidel) **converges** — 93–117 GMRES iterations where monolithic
   stalls. **Feasibility for the 1M+ goal is proven.** The count is bottlenecked by per-field AMG
   quality (not the coupling).
-- **Lead 3 step 3, started** ([§13](#13-phase-3-lead-3-step-3-started--the-amgcl-backend-hits-the-displacement-block)):
-  backend = AMGCL (chosen). Coordinate-dump enabler committed. But AMGCL's SA-AMG **caps at ~120
-  iterations on the displacement block** and the **6 RBMs do not help** — the ~52% non-symmetric
-  condensed elasticity operator defeats it. AMGCL gives a *feasibility-grade* block solver (converges,
-  O(n) memory) but not an *efficient* one; efficient needs MueLu/Trilinos. **Backend decision now
-  pending.**
+- **Lead 3 step 3** ([§13](#13-phase-3-lead-3-step-3-started--the-amgcl-backend-hits-the-displacement-block),
+  [§14](#14-phase-3-lead-3-step-3--feasibility-grade-blockamg-delivered)): backend = AMGCL (chosen).
+  AMGCL's SA-AMG **caps at ~120 iterations on the displacement block** and the **6 RBMs do not help** —
+  the ~52% non-symmetric condensed elasticity operator defeats it (efficient convergence would need
+  MueLu/Trilinos). But it *converges*, so a **feasibility-grade `linsolver=blockamg` is delivered**:
+  field-split, per-field AMGCL hierarchies, block Gauss–Seidel, outer GMRES, with the field structure
+  discovered from the DofManager (not hand-configured). Offline it solves the 280k-dof coupled system
+  in **68 outer iterations** matching the direct solve to 4e-4; a registered test passes end-to-end.
+  This is the O(n)-memory route to 1M+ dof.
 
-Two measured leads plus one untested-but-not-excluded route; see
-[§4](#4-recommendation), which ends with a suggested order of work. One open question blocks part of
-it, see [§7](#7-the-open-question).
+Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
+tested. What is left is validation and the two bigger swings (Lead 2 for speed, MueLu for AMG
+efficiency) — see [§15](#15-what-remains).
 
 > **A verdict was reversed during this investigation.** An earlier version of this document
 > concluded the iterative route was dead. That was an artefact of benchmarking GMRES at
@@ -770,3 +776,59 @@ knobs and is optional.
 **Not done (future):** rotations for the vector-field null-space still need nodal coordinates
 (`EDELWEISS_DUMP_COORDS` shows the path — they would ride the same `setFieldStructure` channel); and a
 parallel outer Krylov (AMGCL's own, or a threaded matvec) would cut the serial GMRES overhead.
+
+---
+
+## 15. What remains
+
+State at session end: both Phase-3 solvers (`inexactnewton`, `blockamg`) are implemented, documented,
+tested, and committed — **16 commits on `d83728ba`, all local, nothing pushed to `mn`**. What is left:
+
+### Validation (small, do first)
+
+- **`blockamg` on the real *multi-field* model, new inferred-structure interface.** The registered
+  test (`CantileverBeamQuad4BlockAMG`) passes end-to-end but is *single-field*. The 2-field inference
+  is unit-checked and the numerics are unchanged from the hand-config run that reached 10 step-2 solves
+  cleanly, but a full `blockamg.inp` run on the pryout with the *new* code was killed before step 2, so
+  the "`blockamg: fields ['displacement', 'nonlocal damage']`" path and the full 15/8/5/5 Newton
+  sequence under `blockamg` were **not** captured. One run confirms it (on xeon:
+  `Pryout_profile_investigation`, `edelweissfe blockamg.inp`; ~35 min). Low risk.
+- **`inexactnewton` full-run Newton cost** is done (§10): 15/8/5/5, unchanged. No action.
+- **The pre-existing `NodeToDeformableSurfaceContactPullOut` failure** (edelweiss-only) is unrelated to
+  this branch but is a contact test — still worth a look (§9).
+- **Marmot testfiles suite** was not run with these changes.
+
+### The two bigger swings (each its own effort)
+
+- **Lead 2 — freeze the symbolic factorization.** The reliable *speed* lever for the 280k model
+  (~1.78×, §3.2), because phase 11 (reordering) is ~35–38% of every direct solve and is recomputed
+  every iteration only because the pruned pattern churns (§3.1). Not implemented. **Blocked on the §7
+  drift question — needs Matthias's judgement** (you hit reference-path drift with a frozen pattern; the
+  offline bench cannot test multi-increment drift). The pruning is already switchable
+  (`pruneCondensedMatrixZeros`); what is missing is building `TᵀKT + C` on a cached pattern and
+  scattering values into it, plus a solver that then freezes its reordering.
+- **`blockamg` efficiency — a stronger vector-field AMG.** Today ~100 outer iterations, bottlenecked by
+  AMGCL's smoothed aggregation on the non-symmetric displacement block (RBMs do not help, §13). To get
+  to the literature's ~20–40: (a) **MueLu/Trilinos** (nonsymmetric-aware elasticity AMG, the paper's
+  stack) as an alternative backend behind the same `blockamg` field-split machinery; or (b) **rotations**
+  in the near null-space — they need nodal coordinates, which would ride the same `setFieldStructure`
+  channel (`FieldBlock` gains a coordinates field; `EDELWEISS_DUMP_COORDS` already proves the extraction,
+  and the offline test showed rotations alone did *not* rescue AMGCL, so this only helps with a better
+  AMG); or (c) a **parallel outer Krylov** (AMGCL's own or a threaded matvec) to cut the serial scipy
+  GMRES overhead — this addresses wall time, not iteration count.
+
+### Housekeeping / merge
+
+- **Push decision.** 16 local commits, nothing on `mn`. Push when ready (only to `mn`, per repo
+  convention), and bring xeon's git up to date (it is on `731bb2b` in git terms, with newer files
+  rsynced on top).
+- **What merges vs stays tooling.** Keepers: `inexactnewton`, `blockamg` + its `FieldStructureAware`
+  interface, the AMGCL `set_nullspace` / `build` / `applyPreconditioner` additions, the PARDISO phase
+  timings and `factorize`/`solveFactorized`, the MPC/phase timings, `EDELWEISS_DUMP_COORDS`. Investigation
+  tooling (decide deliberately): `matrixdump`, `scripts/benchmark_linsolve.py`,
+  `scripts/block_amg_prototype.py`.
+- **Docs**: `linsolvers.rst` is current (documents `inexactnewton`, `blockamg`, `amgcl`, `matrixdump`).
+  A Sphinx build was not run.
+- **`edelweissfe/linsolve/klu/klu.c`** is still not gitignored (§8) — the `git add`/clang-format trap
+  bit twice this session on `.json` files instead; worth gitignoring `klu.c` and adding `*.json` to the
+  clang-format exclude.
