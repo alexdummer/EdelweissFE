@@ -1966,6 +1966,103 @@ Regression test `CantileverBeamQuad4BlockAMG` still passes.
 **This closes a real, previously-shipped-but-undocumented-as-such accuracy gap**, independent of
 whatever step 2 decides on EW forcing.
 
+**Step 2 — the `etaMax` ladder, live. Both rungs pass strictly; `3e-4` ships as the default.**
+
+With step 1 in place, `outerTol="adaptive"` was enabled and run against the 19.1 gate's exact pass
+criteria (increments 15/8/5/5, identical cutbacks, identical final `U_loading` — a *trajectory* match,
+not just an iteration-count one, since §19.2's failure mode was a changed trajectory that still
+happened to cost roughly the same wall-clock):
+
+| rung | increments | cutbacks | final `U_loading` | outer iters (min/mean/max) | continuations | `Job computation time` |
+|---|---|---|---|---|---|---|
+| `etaMax=1e-4` (`blockamg_live_202_etamax1e-4.log`) | 15/8/5/5 ✓ | 3, identical ✓ | 0.021875 ✓ | 17/65.5/165 | 34 | 81.5s |
+| `etaMax=3e-4` (`blockamg_live_202_etamax3e-4.log`) | 15/8/5/5 ✓ | 3, identical ✓ | 0.021875 ✓ | 14/61.7/165 | 34 | **81.3s** |
+
+**Both rungs are a strict pass** — unlike §19.2's original attempt, EW forcing no longer changes the
+Newton trajectory now that step 1 enforces the true residual regardless of what GMRES's own
+preconditioned-residual check would have accepted. This confirms the diagnosis in §19.2 exactly: the
+trajectory change there was a symptom of the true-residual gap, not of adaptive forcing itself. `3e-4`
+edges out `1e-4` on every metric that moved (lower mean outer iterations, marginally better job time)
+so it is the winning clamp, per the plan's "optionally try `etaMax=3e-4` to find the edge" — no further
+rungs attempted (`1e-3`, the pre-fix value that failed in §19.2, was not retried; the ladder's scope was
+`1e-4` then optionally `3e-4`, both of which passed, so there was no failure to escalate past).
+
+**A real bug caught before it shipped: the constructor defaults were never actually flipped.** After
+declaring `3e-4` the winner, a routine check of `BlockAMGSolver.__init__`'s actual parameter defaults
+found `outerTol: float = 1.0e-6` and `etaMax: float = 1.0e-3` still in the signature — the class
+docstring already claimed EW forcing "shipped as the default" (written in anticipation, before the
+ladder even ran), but nothing had actually changed the code that makes that true. Fixed: `outerTol`
+now defaults to `None`, `etaMax` to `3.0e-4` (commit `76cb09da`). `blockamg.json` on xeon was
+simplified to drop the now-redundant explicit `outerTol`/`"adaptive"` and `etaMax` overrides entirely,
+to prove the shipped defaults need no config help. Live-reconfirmed with this corrected default and no
+explicit overrides at all (`blockamg_live_202_final.log`) — see the final summary below.
+
+### Infrastructure done alongside this phase: a common `LinearSolver` base class, and blockamg's
+### output overhauled
+
+Two related but separate requests came in mid-phase, both addressing real friction:
+
+- **blockamg's console output** was reformatted: a graded `verbosity` (`"silent"`/`"warning"`
+  (default)/`"info"`/`"debug"`, replacing the old boolean `verbose`) so a normal run stays quiet and
+  only speaks up on an abnormal solve (outer iterations past `warnOuterIterationsThreshold`, the
+  true-residual tolerance still unmet after every continuation, or GMRES reporting non-convergence);
+  messages route through the solver's injected Journal (falling back to `print` if none was set, e.g.
+  an offline probe script); and per-stage timing (equilibration, off-diagonal split, hierarchy build,
+  outer GMRES, true-residual continuations) now goes through
+  `edelweissfe.utils.performancetiming.timeit`, nested under "linear solve" in the job's own
+  performance table — **with the caveat, already on record in §19.1, that this global mechanism's
+  accumulated figures are not reliable under `PYTHON_GIL=0` on a live, multi-threaded run** (a
+  pre-existing, general-infrastructure bug, unrelated to and not fixed by this work).
+- **A common `LinearSolver` base class** (`edelweissfe/linsolve/base.py`) replaces the old
+  isinstance-checked `FieldStructureAwareLinearSolver` mixin (blockamg only) with one base every
+  registered linsolver now inherits, with safe-default `setJournal()`/`setFieldStructure()` so the
+  nonlinear solver calls both unconditionally instead of special-casing per capability. All 11
+  registered linsolvers (`superlu`, `umfpack`, `pardiso`, `panuapardiso`, `klu`, `petsclu`, `mumps`,
+  `gmres`, `amgcl`, `inexactnewton`, `blockamg`, `matrixdump`) were retrofitted via thin Python wrapper
+  classes, without touching any `.pyx` internals. Found and fixed one real hazard this way:
+  `inexactnewton` resolves its PARDISO delegate through this same registry seam and needs
+  `factorize()`/`solveFactorized()`, not just `(A, b) -> x`, so `PardisoLinearSolver` forwards both.
+  Validated: `CantileverBeamQuad4BlockAMG`, `WallShearHexa8GMRES`, and `AMGCL` (full end-to-end tests)
+  all pass; `pardiso` (both call contracts), `superlu`, `umfpack`, and `matrixdump` (delegate
+  forwarding) smoke-tested directly. `klu`/`panuapardiso`/`mumps`/`petsclu` could not be exercised at
+  all on xeon — their optional backends are not installed/built there, a pre-existing environment gap
+  (§8), not a regression from this change.
+
+Commits: `fb57ea1e` (true-residual stopping), `76cb09da` (ship EW forcing as default), `62e30f82`
+(common `LinearSolver` base class + all 11 wrappers), plus the doc-only `be9f4232`.
+
+### Summary of Phase 5, Part 2 — measured wall-clock vs. the §18/§19.1 references
+
+**The EW-rescue hypothesis was correct.** §19.2's live failure (a changed Newton trajectory) was a
+symptom of GMRES's preconditioned-residual stopping check letting the true residual run looser than
+requested, not a fundamental incompatibility between adaptive forcing and this preconditioner. Fixing
+that gap (step 1) made adaptive forcing reproduce the fixed-tolerance trajectory exactly, on two
+separate live rungs (`1e-4`, `3e-4`) — the trajectory risk that blocked §19.2 is resolved, not just
+worked around.
+
+**`Job computation time`, all measured on the same live model, same investigative window:**
+
+| run | `Job computation time` |
+|---|---|
+| PARDISO baseline (§19.1) | 83.9s |
+| blockamg, fixed `outerTol=1e-6` (§19.1's gate) | 82.4s |
+| blockamg, true-residual stopping added, still fixed `outerTol=1e-6` (§20.2 step 1) | 81.8s |
+| blockamg, EW forcing `etaMax=1e-4` (§20.2 step 2) | 81.5s |
+| **blockamg, EW forcing `etaMax=3e-4` (shipped default)** | **81.3s** |
+
+**Every row is within ~3% of every other row.** This is the headline finding of Phase 5, and it cuts
+against the ~1.56× offline win §19.2 originally measured: on the *live* model, wall-clock is dominated
+by the fixed per-solve costs (assembly, AMR, MPC transforms, hierarchy builds) that neither
+true-residual stopping nor EW forcing touch, not by the outer-GMRES iteration count these two levers
+actually move. The offline 9-dumped-ord benchmarks measure the linear solve in isolation and
+extrapolate; the live number is what the whole job actually costs, and it barely moves no matter which
+of these levers is on. **Net result of this entire phase: the trajectory-safety problem is fixed
+(genuinely valuable — it closes a real accuracy gap and de-risks EW forcing for future use), but it
+delivers negligible additional live wall-clock beyond the parity §19.1 already established.** blockamg
+remains at parity with PARDISO; reaching meaningfully past parity on this model would need to attack
+the fixed per-solve overhead (assembly/MPC transform, ~21% of a solve per §18), not the outer iteration
+count, which is where every lever in §19 and §20 has been aimed.
+
 ### Sequencing, and what is explicitly out of scope for this phase
 
 1. 20.1 step by step; its live gate decides the final default.
