@@ -1571,6 +1571,42 @@ of machine time. If sweeping anyway, add one column re-examining the damage bloc
 chebyshev (low priority, small share). Run with the RSS self-abort guard (§17's gotcha) and
 `OMP_NUM_THREADS=MKL_NUM_THREADS=16` (§17's oversubscription gotcha).
 
+**Done** — `probe_194_sweep.py` (xeon, `Pryout_profile_investigation/`, ad hoc, not checked in),
+double backend, fixed `outerTol=1e-6`, RSS-guarded (24 GB cap; observed 6.3–6.4 GB throughout, nowhere
+close). Log: `probe_194_sweep.log`.
+
+| config | d=4,np=1 | d=4,np=2 | **d=5,np=1 (current default)** | d=5,np=2 | d=6,np=1 | d=6,np=2 |
+|---|---|---|---|---|---|---|
+| total wall (9 ords) | 166.1s | 163.1s | **160.7s** | 168.8s | **156.7s** | 176.8s |
+| total outer iters | 551 | 406 | 487 | 373 | 416 | 346 |
+
+`degree=6, npre=npost=1` edges out the current default by **~2.5%** (156.7s vs 160.7s) — inside the
+"diminishing returns... not confirmed" margin the plan itself anticipated, and small enough that
+run-to-run noise (see the caveat below) could plausibly explain it rather than a real optimum shift.
+Not swapped in as the new default: a ~2.5% offline margin does not clear the bar this document has
+otherwise used all along (every prior default change, §17/§18, cleared 20%+ before being adopted, and
+even those got a live re-check). Recorded as a candidate for a future pass with more repeats, not
+acted on.
+
+**Damage-block quick check** (displacement fixed at the current default `d=5,npre=npost=1`):
+default chebyshev (AMGCL's own defaults, no explicit degree/npre/npost) totals **159.8s**; adding an
+explicit `degree=2,npre=npost=1` totals **155.7s**, a similarly modest ~2.6%. Same verdict: real
+enough to note, too small to act on given the field's already-small share of the per-solve cost (§18).
+
+**Gotcha, worth recording precisely because it could otherwise look like a regression:** this sweep's
+`d=5,npre=npost=1` figure (160.7s) and the same config's total in the 19.3 probe run earlier this
+session (`probe_193_precision.log`: 164.1s) both disagree with §18's originally-recorded total for the
+identical config (125.2s) by roughly +28–31%. `uptime` on xeon showed a 15-minute load average of 5.99
+right after this sweep (a shared, multi-user box, `htop`/Firefox/tmux sessions also present) against a
+1-minute average of 0.09 once idle -- i.e. contention on this shared machine, not a code regression:
+this session's own repeated measurements of the same config (19.3's probe and this one) agree with each
+other to ~2%, just not with a different session's number recorded under different load. **All
+relative comparisons in §19.2/19.3/19.4 remain valid** (each was measured within one session, configs
+interleaved back-to-back under the same contention), but absolute totals should not be compared
+across sessions without accounting for this -- prefer whole-job `Job computation time` deltas measured
+in the same live run (as §19.1's gate and §19.2's live confirmation did) for any claim that needs to
+survive scrutiny.
+
 ### 19.5 Stretch — B3, the 3×3 block-valued backend (~half day, only if 19.2+19.3 aren't enough)
 
 No longer *needed* (§17 killed the "needs MueLu" argument), but it has a second benefit beyond
