@@ -78,17 +78,22 @@ from scipy.sparse.linalg import LinearOperator, gmres
 from edelweissfe.linsolve.base import FieldBlock, FieldStructureAwareLinearSolver
 
 # "backendPrecision" is not an AMGCL parameter -- it selects the AMGCL wrapper's own backend value
-# type (§19.3). __call__ pops it out of whichever precond dict applies (default or a fieldPreconds
-# override) before forwarding the rest verbatim as the AMGCL JSON parameter tree.
+# type (§19.3: "double" (default) or "float"). __call__ pops it out of whichever precond dict applies
+# (default or a fieldPreconds override) before forwarding the rest verbatim as the AMGCL JSON parameter
+# tree. Defaults to "double": measured on all 9 dumped ords, "float" inflated outer GMRES iterations by
+# up to 30% (plan expected <=10%) and only won on wall-clock ~half the time, netting ~3% aggregate, not
+# the ~1.3-1.5x hoped for -- plausibly the chebyshev smoother's power-iteration spectral-radius estimate
+# (§17 B5 already flagged this as sensitive) losing accuracy in float32. Available as an opt-in via
+# fieldPreconds (e.g. {"displacement": {**_DEFAULT_VECTOR_PRECOND, "backendPrecision": "float"}}).
 _DEFAULT_VECTOR_PRECOND = {
-    "backendPrecision": "float",
+    "backendPrecision": "double",
     "coarsening": {"type": "smoothed_aggregation", "aggr": {"eps_strong": 0.01}},
     "relax": {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01},
     "npre": 1,
     "npost": 1,
 }
 _DEFAULT_SCALAR_PRECOND = {
-    "backendPrecision": "float",
+    "backendPrecision": "double",
     "coarsening": {"type": "smoothed_aggregation"},
     "relax": {"type": "chebyshev"},
 }

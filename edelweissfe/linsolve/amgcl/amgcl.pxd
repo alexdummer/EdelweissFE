@@ -42,3 +42,21 @@ cdef extern from "amgcl-wrapper.hpp":
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void applyPreconditioner(int n, const double* rhs, double* x) except +
         string report() except +
+
+    # Same interface, backed by amgcl::backend::builtin<float> -- half the memory traffic in the
+    # smoother apply (§19.3), at the cost of matrix/hierarchy precision. rhs/x stay double at this
+    # boundary too; the narrowing/widening happens inside the C++ wrapper.
+    cdef cppclass LinearSolverFloat:
+        LinearSolverFloat(const char* json_params) except +
+        void solve(int n,
+                   const int* ptr,
+                   const int* col,
+                   const float* val,
+                   const double* rhs,
+                   double* x,
+                   int& iters,
+                   double& error) except +
+        void set_nullspace(const double* B, int rows, int cols) except +
+        void build(int n, const int* ptr, const int* col, const float* val) except +
+        void applyPreconditioner(int n, const double* rhs, double* x) except +
+        string report() except +

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <amgcl/adapter/crs_tuple.hpp>
 #include <amgcl/backend/builtin.hpp>
 #include <amgcl/make_solver.hpp>
@@ -14,13 +15,21 @@
 #include <tuple>
 #include <vector>
 
-typedef amgcl::backend::builtin< double > Backend;
-
-typedef amgcl::make_solver< amgcl::runtime::preconditioner< Backend >, amgcl::runtime::solver::wrapper< Backend > >
-  Solver;
-
-class LinearSolver {
+// Templated on the AMGCL backend's value type, so the same wrapper serves both the default
+// double-precision hierarchy and a float32 one (half the memory traffic in the smoother apply, the
+// dominant cost on large coupled solves -- see PERF_LINSOLVE_INVESTIGATION.md §18/§19.3). The outer
+// Krylov solve (blockamg's GMRES) always stays double; only the preconditioner's own storage and
+// arithmetic narrow. rhs/x at the applyPreconditioner()/solve() boundary are always double -- the
+// value-type-dependent scratch conversion happens inside this class, not at the Cython/Python
+// boundary, since applyPreconditioner() is called once per outer Krylov iteration (hot path) while
+// build() is not.
+template < typename ValueType >
+class LinearSolverT {
 public:
+  typedef amgcl::backend::builtin< ValueType > Backend;
+  typedef amgcl::make_solver< amgcl::runtime::preconditioner< Backend >, amgcl::runtime::solver::wrapper< Backend > >
+    Solver;
+
   boost::property_tree::ptree prm;
 
   // Cached solver and matrix structure information
@@ -32,10 +41,14 @@ public:
 
   // Near null-space vectors, kept alive here because the property tree only stores a raw pointer to
   // them (AMGCL copies from it when the hierarchy is built). Must outlive every solver construction.
+  // Always double, independent of ValueType/Backend: AMGCL's coarsening::nullspace_params::B is
+  // hardcoded std::vector<double> (amgcl/coarsening/tentative_prolongation.hpp) -- the tentative
+  // prolongation's QR factorization stays double-precision regardless of backend, since it runs once
+  // at hierarchy build time, not in the per-iteration smoother apply this backend split targets.
   std::vector< double > nullspace_;
 
   // Constructor: Just stores the parameters
-  LinearSolver( const char* json_params ) : solver_(), cached_n( -1 ), cached_nnz( -1 )
+  LinearSolverT( const char* json_params ) : solver_(), cached_n( -1 ), cached_nnz( -1 )
   {
     std::string json_str( json_params );
     if ( !json_str.empty() ) {
@@ -70,7 +83,7 @@ public:
   // fuses: :meth:`solve` reconstructs the hierarchy on every call, which is fine for a one-shot solve
   // but ruinous for an inner block preconditioner applied on every outer Krylov iteration. Uses the
   // current property tree (including any near null-space set via set_nullspace).
-  void build( int n, const int* ptr, const int* col, const double* val )
+  void build( int n, const int* ptr, const int* col, const ValueType* val )
   {
     int  nnz = ptr[n];
     auto A   = std::make_tuple( n,
@@ -86,13 +99,17 @@ public:
 
   // Apply one preconditioner (AMG) cycle to rhs: x <- M^-1 rhs, where M is the hierarchy built by
   // :meth:`build`. This is the operation a block Gauss-Seidel / field-split preconditioner performs on
-  // each field per outer iteration. Cheap relative to the build.
+  // each field per outer iteration. Cheap relative to the build. rhs/x are double regardless of
+  // ValueType -- for the float backend this narrows on the way in and widens on the way out; for the
+  // (default) double backend the extra copy is a no-op-equivalent memcpy, not a behaviour change.
   void applyPreconditioner( int n, const double* rhs, double* x )
   {
-    std::fill( x, x + n, 0.0 );
-    auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
-    auto x_rng   = amgcl::make_iterator_range( x, x + n );
+    std::vector< ValueType > rhs_v( rhs, rhs + n );
+    std::vector< ValueType > x_v( n, ValueType( 0 ) );
+    auto                     rhs_rng = amgcl::make_iterator_range( rhs_v.data(), rhs_v.data() + n );
+    auto                     x_rng   = amgcl::make_iterator_range( x_v.data(), x_v.data() + n );
     solver_->precond().apply( rhs_rng, x_rng );
+    std::copy( x_v.begin(), x_v.end(), x );
   }
 
   // Human-readable hierarchy report (levels, operator complexity, coarse size) for the AMG built by
@@ -108,14 +125,14 @@ public:
     return oss.str();
   }
 
-  void solve( int           n,
-              const int*    ptr,
-              const int*    col,
-              const double* val,
-              const double* rhs,
-              double*       x,
-              int&          iters,
-              double&       error )
+  void solve( int              n,
+              const int*       ptr,
+              const int*       col,
+              const ValueType* val,
+              const double*    rhs,
+              double*          x,
+              int&             iters,
+              double&          error )
   {
 
     int nnz = ptr[n];
@@ -148,7 +165,14 @@ public:
       solver_.reset( new Solver( A, prm ) );
     }
 
-    std::tie( iters, error ) = ( *solver_ )( amgcl::make_iterator_range( rhs, rhs + n ),
-                                             amgcl::make_iterator_range( x, x + n ) );
+    std::vector< ValueType > rhs_v( rhs, rhs + n );
+    std::vector< ValueType > x_v( n, ValueType( 0 ) );
+    std::tie( iters, error ) = ( *solver_ )( amgcl::make_iterator_range( rhs_v.data(), rhs_v.data() + n ),
+                                             amgcl::make_iterator_range( x_v.data(), x_v.data() + n ) );
+    std::copy( x_v.begin(), x_v.end(), x );
   }
 };
+
+// The default, unchanged double-precision wrapper, and the new float32 one added for §19.3.
+typedef LinearSolverT< double > LinearSolver;
+typedef LinearSolverT< float >  LinearSolverFloat;
