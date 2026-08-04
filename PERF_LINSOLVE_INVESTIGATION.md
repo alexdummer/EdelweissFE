@@ -1607,6 +1607,49 @@ across sessions without accounting for this -- prefer whole-job `Job computation
 in the same live run (as §19.1's gate and §19.2's live confirmation did) for any claim that needs to
 survive scrutiny.
 
+### Summary of this session's Phase 4 work — measured speedups vs. the §18 baseline and PARDISO
+
+**What actually shipped (the default, no opt-in required):** 19.1's gate passed as-is; 19.2's
+hierarchy-reuse half landed but is provably a no-op on this reference model (its own safety guard
+forces a refresh every call, §19.2); everything else stayed opt-in. **So the shipped default's
+wall-clock is unchanged from before this session** — the two mechanisms with a real measured win
+(EW forcing, mixed precision) both failed their bar (a live Newton-path change; an offline iteration
+inflation that ate the bandwidth saving) and were kept available but off. This is itself the main
+finding of the session: two independently-plausible, individually-implemented-and-validated levers
+both turned out not to be free lunches on this specific problem, and the plan's own "record, don't
+improvise" rule is what caught both before either became a silent default-behaviour change.
+
+**Speedups, where they exist, are opt-in and measured within one session (same-session relative
+comparisons are unaffected by the cross-session load variance recorded above):**
+
+- **EW forcing (opt-in, `outerTol=None`): ~1.56× offline** on the 9 dumped ords, measured head-to-head
+  in one script run (`probe_192_sequence_v2.log`: 160.4 s fixed-tolerance vs 103.0 s EW-forced,
+  fresh-hierarchy-every-call baseline in both). Not shipped because the live confirmation run changed
+  the Newton trajectory (§19.2) — this is the biggest available lever if that trade-off is judged
+  acceptable.
+- **Mixed precision (opt-in, `backendPrecision="float"`): ~1.03× offline**, i.e. essentially no
+  aggregate win and an outright regression on 4 of 9 ords (`probe_193_precision.log`). Not worth
+  enabling as-is.
+- **Smoother micro-sweep (informational only, default unchanged): ~1.025×** best case
+  (`degree=6,npre=npost=1` vs the shipped `degree=5,npre=npost=1`), inside the plan's own
+  diminishing-returns margin — not acted on (§19.4).
+
+**Vs. the §18 baseline (125.2 s offline total / ~13.9 s per solve, that session's load) and the
+long-standing PARDISO reference (~11.5 s/solve, §3/§10/§12):** this session's own repeated
+measurements of the unchanged shipped config land at 160–164 s / ~17.8–18.2 s per solve, not because
+the default regressed but because of the shared-machine contention documented in §19.4 — the §18
+number and this session's number are not directly comparable in absolute terms, only in the
+same-session relative comparisons made above. The **one number immune to that variance** is the live,
+whole-job `Job computation time`, measured start-to-finish within a single run, unaffected by both the
+offline/live gap and the cross-session load gap: **82.4 s for the shipped blockamg default vs. 83.9 s
+for the PARDISO baseline, on the identical live model, in the same investigative window (§19.1)** — the
+current default was already at PARDISO parity (not "close to", *at* parity, marginally ahead) before
+this session started, and this session did not move that number, because nothing it validated as a net
+win was safe enough to ship. Reaching meaningfully *past* PARDISO on wall-clock — not just parity —
+remains gated on the EW-forcing trade-off decision (§19.2), which is the right next step once that
+judgement call is made; blockamg's real, structural advantage at this point is O(n) memory (§19.6),
+not wall-clock, which is where it should be pointed next regardless of that decision.
+
 ### 19.5 Stretch — B3, the 3×3 block-valued backend (~half day, only if 19.2+19.3 aren't enough)
 
 No longer *needed* (§17 killed the "needs MueLu" argument), but it has a second benefit beyond
