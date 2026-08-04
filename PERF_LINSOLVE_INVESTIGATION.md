@@ -1,7 +1,7 @@
 # Linear-solver performance investigation — handoff
 
 Branch `perf/linsolve-investigation`, based on `feat/amr-recovery-marker` (`d495e90b`).
-Working tree clean. **16 commits sit on top of `d83728ba`, all local — NOT pushed to `mn`.** xeon has
+Working tree clean. **22 commits sit on top of `d83728ba`, all local — NOT pushed to `mn`.** xeon has
 the changed files rsynced into its working tree for the experiments (its git is untouched and behind);
 `setuptools` was `pip install`ed into xeon's `next_v2611` env (it was missing, which had been silently
 blocking every extension rebuild there). See [§15](#15-what-remains) for the full state and next steps.
@@ -42,6 +42,11 @@ has begun. Two cheap leads are now measured on the real model:**
   (chebyshev degree=5, npre=npost=1, needing *more* outer iterations) cuts real wall-clock by
   **~23%** across all 9 dumped ords despite a looser (but still acceptable) true residual. Default
   updated again; offline-only so far, live re-validation still owed.
+- **Phase 4 is planned but not started** ([§19](#19-phase-4-plan--wall-clock-to-parity-and-beyond)):
+  the AMGCL apply path is verified threaded (so the dominant 68% smoother cost is bandwidth-bound,
+  not thread-starved), and the prioritized plan is: live validation gate → D3 (Eisenstat–Walker
+  forcing + lagged hierarchy) → D2 (mixed-precision `builtin<float>` hierarchy) → smoother
+  micro-sweep → B3 as stretch. D1 and rotational RBMs are explicitly deprioritized.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -1235,8 +1240,8 @@ isn't a new problem specific to the candidate, but it's worth knowing the margin
 
 `blockamg.py`: `{coarsening: smoothed_aggregation with aggr.eps_strong=0.01, relax: chebyshev(degree=5,
 power_iters=50, lower=0.01), npre=npost=1}` — supersedes §17's `degree=8, npre=npost=2`. Synced to
-xeon, **not yet committed** (§17's config *was* committed as `533f4d6f`; this is a further, uncommitted
-change on top).
+xeon and since **committed as `3209a98a`** (§17's config was `533f4d6f`; this section's profiling is
+`db0c0274`).
 
 **Live validation status:** the §17 default (`degree=8, npre=npost=2`) *was* validated live on the
 real pryout model (`blockamg.inp`, this session) — 32–40 outer iterations observed, matching the
@@ -1262,3 +1267,155 @@ numbers suggest it won't.
 - **The scalar (damage) field's smoother was never re-examined for the same trade-off** — it's
   cheap by construction (default chebyshev, no tuning applied in §17) and is a small fraction of
   the per-field-apply cost dominated by the much larger displacement field, so this is low priority.
+
+---
+
+## 19. Phase 4 plan — wall-clock to parity and beyond
+
+Planned (this session), not started. Everything below is scoped for hand-off execution; each task
+names its files, its validation gate, and its expected win. Read §18 first — its stage breakdown
+(68% smoother apply / 21% per-solve fixed cost / ~9% outer-loop overhead) is what this plan attacks.
+
+### 19.0 Pre-verified this session: the smoother apply is threaded — no free serial win exists
+
+Before planning, the one "cheap explanation" was ruled out: could the dominant 68% smoother-apply
+cost simply be running single-threaded?  No:
+
+- `setup.py:210-219` builds the `linsolve/amgcl` extension with `-fopenmp` in both
+  `extra_compile_args` and `extra_link_args`.
+- AMGCL's `builtin` backend header on xeon (`$CONDA_PREFIX/include/amgcl/backend/builtin.hpp`)
+  contains **45 `#pragma omp` sites** — the matvec/smoother kernels behind `applyPreconditioner`
+  are OpenMP-parallel. (The AMGCL headers are installed on **xeon only**, not on the laptop env —
+  do not conclude "AMGCL missing" from a local `find`.)
+
+Consequence: the smoother apply saturates memory bandwidth at 16 threads. The only levers on it are
+**fewer outer iterations** (19.2), **less bandwidth per application** (19.3), and **cheaper
+smoothers** (19.4). More threads or moving orchestration to C++ (D1) will not touch it.
+
+Side observation, unrelated to blockamg but recorded before it surprises someone: neither
+`numerics/csrgenerator.pyx` nor `csrgeneratorv2.pyx` contains a `prange` — the assembly CSR
+generators are serial Cython despite their OpenMP build flags. At 0.078 s/call this is irrelevant
+here; just know the "OpenMP" label on those extensions is aspirational.
+
+### 19.1 GATE — the owed live validation run (~35 min, do before anything else)
+
+The current default (`degree=5, npre=npost=1`, committed `3209a98a`) is validated **offline only**.
+Its looser true residuals (1e-4–3e-4 vs ~5e-5, §18) could plausibly cost a Newton iteration, which
+would eat the 23% win. Confirm before building on it:
+
+- On xeon, `~/constitutive_modeling/next_v2611/Pryout_profile_investigation/` (**never** the real
+  project dir, §6): `PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHON_GIL=0
+  edelweissfe blockamg.inp > blockamg_d5.log 2>&1`.
+- Pass criteria: Newton path unchanged (15, 8, 5, 5 iterations, identical cutbacks vs
+  `baseline_omp16.log`); outer counts ≈ the offline 20–46 range; per-solve wall ≤ the §18 offline
+  numbers + overheads. The §17 default's live run showed 32–40 outer iters, so 35–50 with the
+  cheaper smoother is expected, not alarming — wall-clock is the metric, not the count.
+- If a Newton iteration IS lost: revert the default to §17's `degree=8, npre=npost=2` (one dict in
+  `blockamg.py`) and proceed with the plan anyway — 19.2 and 19.3 are independent of which smoother
+  wins.
+
+### 19.2 D3 — Eisenstat–Walker forcing + lagged hierarchy (highest expected value, ~1 day, pure Python)
+
+Iteration count multiplies the dominant 68% cost, so this is the biggest lever. Two independent
+halves, both in `edelweissfe/linsolve/blockamg/blockamg.py`:
+
+**(a) Adaptive outer tolerance.** `blockamg` currently solves every system to a fixed
+`outerTol=1e-6`. §10 already proved EW forcing clamped to `[1e-6, 1e-3]` reproduces the Newton path
+*exactly* on this model, and `inexactnewton` (`edelweissfe/linsolve/inexactnewton/`) already
+contains the signal reconstruction — a solver sees only `(A, b)`, so it infers new-increment /
+staleness state from `‖b‖` jumps. Lift that logic (or extract it into a shared helper). Most Newton
+iterates only need 1e-3–1e-4; at 1e-4 the offline counts are 20–41, and the *live* 1e-6 run in §14
+needed 115 — the tolerance is worth an outright ~2× on outer iterations for most solves.
+
+**(b) Hierarchy reuse across Newton iterations.** Today `__call__` rebuilds everything per solve:
+equilibration + block split (~2.1 s) + AMG hierarchy build (~3.4 s) ≈ 21% of a solve. Keep the
+built per-field hierarchies (and the split/equilibration arrays) on the instance and reuse them for
+subsequent solves. The §10 lagged-LU break-even does **not** transfer, because the economics are
+inverted: a stale AMG *preconditioner* costs a few extra outer iterations at ~0.3–0.4 s each, while
+the refresh it avoids costs only ~5.5 s — and correctness is untouched because the outer GMRES
+always operates on the **fresh** matrix (`As`); only `M` is stale. Refresh policy: rebuild on
+`‖b‖`-jump (new increment / post-cutback — reuse (a)'s signal), or when the outer count exceeds
+~1.5× the previous solve's. Keep it simple; the failure mode is just extra iterations, never a
+wrong answer (GMRES converges on the true residual regardless of `M`).
+
+Caveat for (b): the preconditioner was built for the *old* equilibration `D`. Either reuse the old
+`dinv` for scaling the new system too (self-consistent, simplest — the diagonal drifts slowly), or
+rebuild whenever `max |dinv_new/dinv_old − 1|` exceeds ~10%. Do not mix old hierarchies with new
+scaling.
+
+Validation: offline first — extend `scripts/benchmark_linsolve.py`'s blockamg path (or a small new
+probe) to replay all 9 dumped ords *as a sequence* through one solver instance, confirming (i) the
+reused-hierarchy counts stay near the fresh-build counts (the §3.4 staleness data says they will),
+(ii) `ord 3` triggers the refresh. Then one live run as in 19.1; Newton path must stay 15/8/5/5.
+Expected combined win: ~1.5–2× on most solves (fewer iterations × amortized fixed cost).
+
+### 19.3 D2 — mixed-precision hierarchy, `builtin<float>` (~half day C++/Cython, ~1.3–1.5×)
+
+The direct attack on bandwidth-bound smoother cost: a float hierarchy halves memory traffic on an
+already-saturated bus, and a preconditioner does not need double (the outer Krylov stays double).
+Also halves preconditioner memory — the one wall-clock item that directly serves the 1M+ goal.
+
+- Files: `edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp` / `.pxd` / `.pyx`. Add a second solver
+  instantiation on `amgcl::backend::builtin<float>`, selected by a constructor/JSON option (e.g.
+  `"backendPrecision": "float"`), same additive pattern as `set_nullspace`/`build`/`report`. The
+  matrix and null-space arrays must be converted to `float32` on the way in; `applyPreconditioner`
+  takes/returns double at the Python boundary and converts internally.
+- Wire it as the default for `blockamg`'s per-field hierarchies in `blockamg.py`, overridable via
+  `fieldPreconds`.
+- Rebuild on xeon (remember §1: xeon runs from rsynced files; `pip install -e .` there — setuptools
+  is now present).
+- Validation: offline, all 9 ords, iteration counts must not inflate by more than ~10% (literature
+  and AMGCL's own docs say ~0 is typical); wall-clock target is ~1.3× on the §18 totals. Check
+  `report()` still works on the float variant. One NaN sanity check on `applyPreconditioner`
+  output (§17's gotcha: a NaN preconditioner silently defeats GMRES's stopping check).
+
+### 19.4 Smoother micro-sweep on wall-clock (cheap, do alongside 19.3)
+
+§18 found `degree=5, npre=npost=1` by a coarse sweep and explicitly did not refine it. Offline, all
+9 ords, wall-clock as the metric (never iteration count, §18's lesson): `degree ∈ {4, 5, 6}` ×
+`npre=npost ∈ {1, 2}` via `fieldPreconds` on the production code path. ±10% is plausible for ~30 min
+of machine time. If sweeping anyway, add one column re-examining the damage block's default
+chebyshev (low priority, small share). Run with the RSS self-abort guard (§17's gotcha) and
+`OMP_NUM_THREADS=MKL_NUM_THREADS=16` (§17's oversubscription gotcha).
+
+### 19.5 Stretch — B3, the 3×3 block-valued backend (~half day, only if 19.2+19.3 aren't enough)
+
+No longer *needed* (§17 killed the "needs MueLu" argument), but it has a second benefit beyond
+iteration count: `static_matrix<double,3,3>` storage improves cache locality and SIMD in exactly
+the smoother matvecs that dominate the profile, and block-ILU0 (which inverts nodal 3×3 couplings
+exactly) may finally make ILU-class smoothers viable here. Known caveats from §16: AMGCL's
+`coarsening.nullspace` does not combine with block value types (acceptable — RBMs measurably don't
+help, §13); try 3×3 block-Jacobi equilibration in place of point-Jacobi. Decide *after* 19.2/19.3
+land — if those reach PARDISO parity, skip straight to 19.6.
+
+### 19.6 Endgame — D4, the ≥1M-dof scale demonstration
+
+The original feasibility question closes with data, not extrapolation: a uniformly refined pryout
+(or boxgen at scale) run with `blockamg` vs PARDISO, recording peak RSS and wall. This is where
+blockamg's O(n) memory becomes a structural advantage rather than an incremental one. Prerequisite:
+19.1 green and at least one of 19.2/19.3 landed.
+
+### Explicitly deprioritized (do not pick these up first)
+
+- **D1 (Schur pressure correction / native AMGCL outer solve):** measured ceiling ~7% (§18).
+  Revisit only after 19.2+19.3 shrink the smoother share and the outer loop's relative cost grows.
+- **Rotational RBMs / coordinates in the null-space:** measured twice as not helping (§11, §13);
+  the B2/B5 wins were orthogonal to the near-null-space. Leave it.
+- **Lead 2 (frozen symbolic factorization):** still the reliable lever for the *direct*-solver
+  path, still blocked on the §7 drift judgement (Matthias). Independent of everything above.
+
+### Execution notes for the hand-off agent
+
+- All benchmarking happens on **xeon** in `~/constitutive_modeling/next_v2611/
+  Pryout_profile_investigation/` against the existing `linsolveDumps/` (9 systems); prefer the
+  offline bench over FE re-runs (§6 sizing). The laptop env has no AMGCL headers and does not build
+  the extension — code edits happen here, measurement there (rsync the changed files, as this whole
+  branch has been doing).
+- Always: `PYTHONUNBUFFERED=1`, `OMP_NUM_THREADS=16 MKL_NUM_THREADS=16`, `PYTHON_GIL=0` for full
+  runs, output redirected to a log file (§8: ssh-captured stdout comes back empty).
+- Re-read §8 and §17's gotcha lists before touching AMGCL parameters — unknown keys are silently
+  ignored (check stderr), NaN preconditioners run forever, and `eps_strong` sweeps can blow up
+  memory.
+- Commit per change with conventional-commit messages, as the branch has been doing; nothing is
+  pushed to `mn` yet (22 local commits on `d83728ba`), and pushing remains a deliberate decision
+  (§15).
