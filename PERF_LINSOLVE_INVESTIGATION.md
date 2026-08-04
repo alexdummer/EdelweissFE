@@ -35,6 +35,13 @@ has begun. Two cheap leads are now measured on the real model:**
   **20–34** across all 9 dumped Newton iterates (only the known-hard `ord 3` iterate reaches 41).
   AMGCL stays the backend; MueLu/Trilinos and the block-valued 3×3 backend (B3) are no longer
   required for the feasibility goal, only possible further wins.
+- **A third finding** ([§18](#18-iteration-count-and-wall-clock-are-not-the-same-metric--the-17-default-was-re-tuned)):
+  §17's iteration-count-optimal config was not wall-clock optimal — 68% of a `blockamg` solve's time
+  turned out to be the per-field AMG smoother *application* itself, not GMRES orchestration (that's
+  only ~7%), so D1 (§16) is now a minor lever, not the primary one. A cheaper smoother
+  (chebyshev degree=5, npre=npost=1, needing *more* outer iterations) cuts real wall-clock by
+  **~23%** across all 9 dumped ords despite a looser (but still acceptable) true residual. Default
+  updated again; offline-only so far, live re-validation still owed.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -1155,3 +1162,103 @@ iterations, not a requirement for feasibility.
   precond was checked against all 9 ords, but the *diagnostic* sweeps (eps_strong values,
   chebyshev bounds) were not repeated across ords. Given the consistent 20–34 range on the final
   config, this is low-risk, but worth knowing if a future ord behaves anomalously.
+
+---
+
+## 18. Iteration count and wall-clock are not the same metric — the §17 default was re-tuned
+
+§17 optimized purely for outer GMRES iteration count, deliberately (pyamg, used for the earlier
+feasibility check, is serial, so iteration count was the only metric that transfers to a parallel
+backend). AMGCL *is* parallel, so once §17's config went live, wall-clock became directly
+measurable and worth checking against. It wasn't optimal.
+
+### Where the time actually goes
+
+Instrumented a real `blockamg` solve on the dumped 280k-dof coupled system (ord 2, §17's tuned
+default: chebyshev degree=8, npre=npost=2, eps_strong=0.01), timing every stage of
+`BlockAMGSolver.__call__` directly (equilibration, block split, hierarchy build, and — inside the
+outer GMRES loop — the full-system matvec, the per-field AMG apply, the off-diagonal coupling
+matvec, and Python glue, with the remainder attributed to GMRES's own Arnoldi/Givens orchestration):
+
+| stage | time | share |
+|---|---|---|
+| equilibration + block split | 2.1 s | 8% |
+| AMG hierarchy build (once per solve) | 3.4 s | 13% |
+| **per-field AMG smoother apply** | **17.4 s** | **68%** |
+| full-system matvec (scipy CSR, serial) | 1.6 s | 6% |
+| off-diagonal coupling matvec (scipy, serial) | 0.75 s | 3% |
+| GMRES orchestration (Arnoldi/Givens) | 0.3 s | 1% |
+| Python loop glue | 0.05 s | ~0% |
+
+**D1 (moving the outer solve into AMGCL's own runtime via `schur_pressure_correction`, §16) has at
+most a ~7% ceiling here** — GMRES orchestration and the serial matvecs it was meant to eliminate are
+a small fraction of the total. The dominant cost (68%) is the per-field smoother *application*
+itself: chebyshev degree=8 with npre=npost=2 is a genuinely expensive smoother per V-cycle (an
+8-term polynomial ≈ 8 matvec-equivalents, times 4 sweeps — 2 pre, 2 post — times multiple levels).
+§17 chose it purely because it minimized outer iterations; nothing in that phase priced the
+per-application cost.
+
+### A wall-clock sweep finds a materially better default
+
+Compared the §17 default against cheaper-smoother candidates on the real coupled solve (via
+`blockamg`'s own `fieldPreconds` override — the actual production code path, not a stand-in),
+first on ord 2:
+
+| config | outer iters | wall |
+|---|---|---|
+| §17 default: cheby d=8, npre=npost=2 | 34 | 20.6 s |
+| cheby d=3, npre=npost=1 | 74 | 20.0 s (wash — too few sweeps to compensate for more iters) |
+| **cheby d=5, npre=npost=1** | **40** | **14.1 s** |
+| Gauss-Seidel, npre=npost=1 | 106 | 35.8 s |
+| Gauss-Seidel, npre=npost=2 | 42 | 23.7 s |
+
+`degree=5, npre=npost=1` needs *more* outer iterations (40 vs 34) but is markedly cheaper per
+application, netting a clear wall-clock win. Confirmed across all 9 dumped ords, not a one-off:
+
+| ord | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| §17 default wall | 21.2s | 24.2s | 18.5s | 13.8s | 15.4s | 15.0s | 16.3s | 14.9s | 14.3s | **153.5s** |
+| new candidate wall | 14.5s | 21.8s | 13.5s | 12.3s | 13.5s | 12.8s | 13.5s | 11.6s | 11.9s | **125.2s** |
+| speedup | 1.47× | 1.11× | 1.37× | 1.13× | 1.14× | 1.17× | 1.21× | 1.29× | 1.20× | **1.23×** |
+
+**~23% aggregate wall-clock reduction, winning on every single tested iterate** including the
+known-hard `ord 3` (where the margin is smallest, as expected — it's the iterate that needs the
+most outer iterations regardless of smoother).
+
+**Trade-off:** the candidate's true residuals are looser (typically 1e-4–3e-4 vs ~5e-5 for the §17
+default) — a smaller npre/npost gives GMRES's internal (preconditioned) residual estimate more room
+to diverge from the true residual before the outer tolerance triggers. `ord 3` reaches 3.1e-3 for
+the candidate — still *tighter* than the §17 default's own 1.6e-2 on that same hard iterate, so this
+isn't a new problem specific to the candidate, but it's worth knowing the margin narrows.
+
+### `_DEFAULT_VECTOR_PRECOND` updated again
+
+`blockamg.py`: `{coarsening: smoothed_aggregation with aggr.eps_strong=0.01, relax: chebyshev(degree=5,
+power_iters=50, lower=0.01), npre=npost=1}` — supersedes §17's `degree=8, npre=npost=2`. Synced to
+xeon, **not yet committed** (§17's config *was* committed as `533f4d6f`; this is a further, uncommitted
+change on top).
+
+**Live validation status:** the §17 default (`degree=8, npre=npost=2`) *was* validated live on the
+real pryout model (`blockamg.inp`, this session) — 32–40 outer iterations observed, matching the
+offline range, Newton path unaffected (normal 5-iteration convergence per increment), run ended only
+because it hit the deliberate `maxNumInc` test cap (§6), not a real failure. **The new
+degree=5/npre=npost=1 default has only been validated offline (all 9 dumped ords, above) — the
+equivalent live re-run is still owed** before treating this as settled, given the looser-residual
+trade-off could plausibly cost a Newton iteration or two even though the offline true-residual
+numbers suggest it won't.
+
+### Revised priority for the remaining wall-time work (supersedes §16's Phase D ordering)
+
+- **D1 (Schur-pressure-correction / native AMGCL outer solve) is now a minor lever (~7% ceiling
+  here), not the primary one.** Still worth doing eventually (it also removes the Python-level
+  block-GS glue as system size grows), but it is no longer the first thing to reach for.
+  D2/D3 (mixed precision, lagged hierarchy + Eisenstat–Walker) are unaffected by this reordering.
+- **The real lever is smoother cost-per-application vs. outer iteration count, and it needs to be
+  swept on WALL-CLOCK, not iteration count**, for any further tuning — §17's sweeps (which produced
+  the degree=8/npre=npost=2 "winner") cannot be trusted for wall-time conclusions on AMGCL, only on
+  the serial-pyamg feasibility question they were originally scoped for. A finer sweep around
+  degree ∈ {4, 5, 6} × npre/npost ∈ {1, 2} was not done — diminishing returns are plausible this
+  close to the found optimum, but not confirmed.
+- **The scalar (damage) field's smoother was never re-examined for the same trade-off** — it's
+  cheap by construction (default chebyshev, no tuning applied in §17) and is a small fraction of
+  the per-field-apply cost dominated by the much larger displacement field, so this is low priority.
