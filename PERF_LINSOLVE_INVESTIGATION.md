@@ -10,7 +10,7 @@ question blocks part of it, see [§7](#7-the-open-question).
 > **A verdict was reversed during this investigation.** An earlier version of this document
 > concluded the iterative route was dead. That was an artefact of benchmarking GMRES at
 > `rtol=1e-8`, far tighter than a Newton step needs. At an inexact-Newton tolerance the same data
-> says the opposite. The retracted reasoning is kept in [§3.5](#35-what-the-first-reading-got-wrong)
+> says the opposite. The retracted reasoning is kept in [§3.6](#36-what-the-first-reading-got-wrong)
 > because the failure mode is easy to repeat.
 
 ---
@@ -157,7 +157,60 @@ it is a single iteration.
 iterate right after the large first correction, it has the largest amplification (below), and the
 smallest `‖b‖` (4.1e-2). **The first solve after a big state change should stay direct.**
 
-### 3.5 What the first reading got wrong
+### 3.5 `amgcl` — fully parallel, and still loses
+
+AMGCL on its OpenMP `builtin` backend, 16 threads — matvec, smoother and orthogonalization all
+threaded, unlike the SciPy path. Target to beat: **11.46 s** (`bench_amgcl_fixed.log`).
+
+| configuration | rtol | iters | true rel. res | wall | dev. from direct |
+|---|---|---|---|---|---|
+| bicgstab + AMG(SA, ilu0) *(wrapper default)* | 1e-2 | 500 ✗ | 5.03e+00 | 133.2 s | 3.6e+00 |
+| gmres(100) + AMG(SA, ilu0) | 1e-2 | 500 ✗ | 1.95e-01 | 72.6 s | 7.1e-01 |
+| fgmres(100) + AMG(SA, spai0) | 1e-2 | 500 ✗ | 6.53e-01 | 18.8 s | 9.5e-01 |
+| gmres(100) + ILU0 only | 1e-2 | 150 | 9.78e-03 | 13.7 s | 1.9e-01 |
+| gmres(100) + ILU0 only | 1e-4 | 474 | 9.91e-05 | 31.7 s | 1.9e-03 |
+| gmres(100) + ILU0 only | 1e-8 | 500 ✗ | 7.53e-05 | 33.1 s | 1.3e-03 |
+| **idrs(4) + ILU0 only** | 1e-2 | 180 | 9.94e-03 | 14.8 s | 1.5e-01 |
+| **idrs(4) + ILU0 only** | 1e-4 | 298 | 8.21e-05 | 20.6 s | 4.9e-04 |
+| **idrs(4) + ILU0 only** | 1e-8 | 425 | 6.28e-09 | 27.2 s | 7.5e-09 |
+
+✗ = hit maxiter (500) without converging.
+
+**AMG does not work on this system at all** — not at any tolerance, and *worse* with the correct
+ILU0 smoother than with the default weak one, because ILU0 smoothing is expensive per iteration and
+still does not fix the convergence. This is the expected outcome for an operator that is 52%
+structurally asymmetric, couples two fields with no constant nodal block size, carries a ~1e8
+dynamic range, and has constraint-equation rows that are not an elliptic operator.
+
+**Single-level ILU0 works but is not competitive.** The best configuration, IDR(s=4) + ILU0, is
+slower than the direct solve at every usable tolerance: 20.6 s at 1e-4 versus 11.46 s, i.e. **1.8×
+slower**. The 1e-2 rows look close on wall time but are useless as Newton corrections — a 1e-2
+residual leaves a **15–19% error** in the solution, another consequence of the conditioning
+(residual is not error here).
+
+**This refutes the "it just needs to be properly parallel" hypothesis directly.** AMGCL *is*
+properly parallel and it still loses. Compare at the same 1e-4 tolerance:
+
+| | iterations to 1e-4 | wall |
+|---|---|---|
+| lagged exact LU + SciPy GMRES (partly serial) | **4–9** | 3–7 s |
+| AMGCL ILU0 + IDR(s), fully threaded | **298** | 20.6 s |
+
+~35× more iterations. Preconditioner *quality* dominates, and parallelism cannot make up the
+difference. On this system only an exact factorization — even a stale one — is a good enough
+preconditioner.
+
+Two defects found and fixed along the way (`dca36610`, `731bb2b3`): AMGCL's iteration count and
+error were computed and discarded, so an unconverged solve was indistinguishable from a converged
+one (a finite wrong answer passes the nonlinear solvers' NaN check); and the AMG smoother key is
+`relax`, not `relaxation`, so the wrapper's shipped "BiCGStab + ILU0" default had never actually used
+ILU0 — AMGCL warns on stderr about the unknown key and silently substitutes its default.
+
+Still untried: AMGCL's `schur_pressure_correction` / field-split preconditioners against the
+`[0, 214659) | [214659, 280155)` block structure, and a scaling/equilibration pass to attack the 1e8
+dynamic range. Given the margin above, neither looks likely to close a 35× iteration gap.
+
+### 3.6 What the first reading got wrong
 
 Two mistakes, recorded so they are not repeated:
 
@@ -209,13 +262,10 @@ remain. Requires building `TᵀKT + C` on a cached pattern and scattering values
 running two SciPy SpGEMMs per iteration, which also recovers most of the 2.75 s condensation cost.
 Blocked on [§7](#7-the-open-question).
 
-**Lead 3 — AMGCL.** Untested as of this writing. AMGCL is already built on xeon, has its own
-OpenMP-parallel Krylov solvers, and unlike the SciPy path would parallelize the matvec and
-orthogonalization too. Note from §3.4 that this buys at most ~7% on the *lagged* scheme, since the
-serial fraction there is small — its interest is as a route to a genuinely matrix-free/AMG-
-preconditioned solver, not as a speedup of Lead 1. Whether AMG can precondition a coupled
-displacement + nonlocal-damage system with penalty contact and MPC-replaced rows is an open
-empirical question; the 52% structural asymmetry and the 1e8 dynamic range are both unfavourable.
+**Not a lead — AMGCL.** Tested (§3.5) and rejected. AMG does not converge on this system at any
+tolerance; single-level ILU0 does, but at 1.8× the direct solve. It is fully OpenMP-parallel and
+still loses, because it needs ~35× more iterations than a lagged exact LU. Parallelism was not the
+missing ingredient; preconditioner quality is.
 
 **Also:** pin threads to one socket (§3.3).
 
@@ -232,6 +282,9 @@ empirical question; the 52% structural asymmetry and the 1e8 dynamic range are b
 | `81d52193` | `PardisoSolver.factorize()` / `.solveFactorized()` — phase-separated entry points |
 | `eb7af6bd` | time the lagged GMRES runs and record the thread count |
 | `3fd4bc90` | per-tolerance iteration counts + the `‖A₂⁻¹ΔA‖` diagnostic — **this reversed the verdict** |
+| `46cac2c6` | this handoff document |
+| `dca36610` | surface AMGCL's iteration count/error (they were discarded); add the `amgcl` benchmark |
+| `731bb2b3` | fix AMGCL's AMG smoother key (`relax`, not `relaxation`); sweep tolerance |
 
 New/changed files:
 
@@ -267,13 +320,15 @@ B=~/constitutive_modeling/next_v2611/EdelweissFE/scripts/benchmark_linsolve.py
 python $B pattern linsolveDumps                                    # seconds
 python $B reuse   linsolveDumps --unifyPattern                     # ~7 min
 python $B threads linsolveDumps --threads 1,4,8,16,36              # ~15 min
+OMP_NUM_THREADS=16 python $B amgcl linsolveDumps                   # ~20 min
 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 python $B lagged linsolveDumps --backend pardiso  # ~14 min
 ```
 
 Read `bench_lagged_tolerances.log` for the lagged result — the earlier `bench_lagged.log` (SuperLU,
 never finished) and `bench_lagged_pardiso.log` / `bench_lagged_timed.log` (tight tolerance only)
 are superseded. Other artefacts: `capture.log`, `bench_reuse_unified.log`, `bench_threads.log`,
-`bench_drift.log`, `baseline_omp16.log`, `linsolveDumps/` (4.2 GB, 9 systems + `manifest.jsonl`).
+`bench_drift.log`, `bench_amgcl_fixed.log` (the AMGCL result; `bench_amgcl.log` predates the
+smoother-key fix), `baseline_omp16.log`, `linsolveDumps/` (4.2 GB, 9 systems + `manifest.jsonl`).
 
 `capture.inp` = `profile.inp` + `linsolver=matrixdump, linsolverConfigFile=linsolveDumpConfig.json`
 on step 2's `>>options` line. Step 2 `maxNumInc=3` yields **exactly 5 time-advancing increments** —
@@ -328,7 +383,9 @@ it does not care whether the pattern is stable.
   optional, unrelated.
 - SuperLU is unusable at this size: >10 min and 15.5 GB on a matrix PARDISO factorizes in 8 s. Use
   `--backend pardiso`.
-- **Benchmark the tolerance the application actually needs.** §3.5.
+- **Benchmark the tolerance the application actually needs.** §3.6.
+- **AMGCL ignores unknown parameter keys** with only a warning on stderr, then silently uses its
+  default. Check its stderr when a configuration behaves unexpectedly.
 
 ---
 
@@ -337,7 +394,9 @@ it does not care whether the pattern is stable.
 - **Phase 3.** Lead 1 is unblocked and is the place to start; Lead 2 is blocked on §7.
 - **The nonlinear cost of loose linear tolerances.** Lead 1's headline assumes Newton is unharmed by
   a 1e-4 linear solve. Unverified, and it could eat the gain.
-- **AMGCL** (Lead 3). Untested.
+- **AMGCL field-split / equilibration.** §3.5 rejected AMGCL as configured; `schur_pressure_correction`
+  against the two-field block structure and a scaling pass against the 1e8 dynamic range remain
+  untried, but face a 35× iteration gap.
 - **Docs.** `doc/source/documentation/linsolvers.rst` is stale — omits `amgcl` and now `matrixdump`,
   and still claims only `gmres` accepts a config file. Per `CLAUDE.md`, docs gate merging.
 - **Tests.** Nothing covers `matrixdump` or `factorize`/`solveFactorized`.
