@@ -1508,6 +1508,60 @@ Also halves preconditioner memory — the one wall-clock item that directly serv
   `report()` still works on the float variant. One NaN sanity check on `applyPreconditioner`
   output (§17's gotcha: a NaN preconditioner silently defeats GMRES's stopping check).
 
+**Implemented** — `amgcl-wrapper.hpp`/`.pxd`/`.pyx` (commit `741b81c2`). The wrapper is templated on
+the backend's value type (`LinearSolverT<ValueType>`, instantiated as the existing `LinearSolver`
+(double, unchanged behaviour) and a new `LinearSolverFloat`); `PyAMGCLSolver` holds one or the other
+per instance, selected by `"backendPrecision": "double"|"float"` in the params dict (default
+`"double"`), and dispatches every method call to whichever is live. `build()`/`solve()` narrow the
+matrix values to `float32` in `.pyx` (cheap, once per solve); `applyPreconditioner()` stays double at
+the Cython boundary and converts internally in C++ (the hot path, once per outer Krylov iteration).
+
+**Plan-vs-library correction found while implementing:** the plan's text above says "matrix and
+null-space arrays must be converted to float32" — checked against AMGCL's own header
+(`amgcl/coarsening/tentative_prolongation.hpp`): `nullspace_params::B` is hardcoded
+`std::vector<double>`, read via `p.get<double*>("B", ...)`, **independent of the backend's value
+type**. The tentative-prolongation QR factorization that consumes it runs once at hierarchy build
+time, not in the per-iteration smoother apply this backend split targets, so AMGCL deliberately keeps
+it double-precision regardless. `set_nullspace()` therefore stays `const double*` on both backend
+instantiations — narrowing it would have been wrong, not just unnecessary. Confirmed the fix compiles
+and runs correctly on xeon before treating this as settled.
+
+**Smoke-tested first:** built a float hierarchy directly on the ord-2 displacement block (214659
+dofs, 28.1M nnz) — `applyPreconditioner()` returns no NaN/Inf, `report()` works on the float variant.
+Memory: double `474.91 M` vs float `353.80 M` (level-0 hierarchy) — a **~25% reduction, not ~50%**:
+the CSR index arrays (`int32` col indices + row ptr) are the same size regardless of backend value
+type, so only the *values* array actually halves (`nnz × 8B → nnz × 4B`); for this operator's
+nnz-to-unknowns ratio, indices are a large enough share of hierarchy storage that halving values alone
+caps the total reduction well under 2×.
+
+**Offline validation, all 9 ords, production `fieldPreconds` path, double vs. float — contradicts the
+plan's `<=10%` inflation / `~1.3×` wall-clock expectations:**
+
+| ord | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | **total** |
+|---|---|---|---|---|---|---|---|---|---|---|
+| double iters (wall) | 72 (26.5s) | 94 (28.9s) | 50 (16.6s) | 44 (15.0s) | 48 (16.0s) | 45 (15.5s) | 46 (15.4s) | 44 (15.1s) | 44 (15.0s) | **164.1s** |
+| float iters (wall) | 79 (21.9s) | 94 (27.2s) | 65 (18.8s) | 50 (15.7s) | 55 (16.7s) | 45 (14.4s) | 53 (16.3s) | 44 (14.3s) | 44 (14.2s) | **159.5s** |
+| iteration inflation | +9.7% | 0% | **+30.0%** | +13.6% | +14.6% | 0% | +15.2% | 0% | 0% | |
+| speedup | 1.21× | 1.06× | **0.88×** | 0.96× | 0.96× | 1.07× | 0.95× | 1.06× | 1.05× | **1.03×** |
+
+No NaN/Inf on either backend (log: `probe_193_precision.log`, reproduce with
+`python probe_193_precision.py linsolveDumps` in `Pryout_profile_investigation/` on xeon). Inflation
+reaches 3× the plan's anticipated ceiling on `ord 4`, and float is an outright wall-clock *regression*
+on 4 of 9 ords (more iterations costing more than the per-iteration bandwidth saving buys back) —
+aggregate speedup is **1.03×**, nowhere near the ~1.3–1.5× hoped for. Plausible mechanism (not chased
+further, per the "record, don't improvise" rule): the chebyshev smoother's spectral-radius estimate
+comes from a 50-step power iteration (§17 B5 already flagged this bound's sensitivity) — accumulated
+rounding error over 50 float32 steps plausibly produces a worse bound than double does, degrading the
+smoother enough on some Jacobians to erase the bandwidth win.
+
+**Not wired as the default** — reverted `_DEFAULT_VECTOR_PRECOND`/`_DEFAULT_SCALAR_PRECOND`'s
+`"backendPrecision"` back to `"double"` before this ever left the offline probe. The mechanism is
+correct, tested, and available per-field via `fieldPreconds` (e.g.
+`{"displacement": {**_DEFAULT_VECTOR_PRECOND, "backendPrecision": "float"}}`) for problems where the
+smoother's spectral estimate might be less sensitive, but it is not a general win on this reference
+model. Halved preconditioner memory (confirmed above) remains relevant to the §19.6 scale
+demonstration independent of whether it wins on wall-clock at this size.
+
 ### 19.4 Smoother micro-sweep on wall-clock (cheap, do alongside 19.3)
 
 §18 found `degree=5, npre=npost=1` by a coarse sweep and explicitly did not refine it. Offline, all
