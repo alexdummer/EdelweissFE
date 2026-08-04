@@ -3,8 +3,11 @@
 Branch `perf/linsolve-investigation`, based on `feat/amr-recovery-marker` (`d495e90b`).
 Local, remote `mn` and xeon in sync. Working tree clean.
 
-**Status: Phases 1 (instrument + capture) and 2 (offline benchmark) are complete. Phase 3
-(implement) has not started.** Two measured leads plus one untested-but-not-excluded route; see
+**Status: Phases 1 (instrument + capture) and 2 (offline benchmark) are complete. Phase 3 (implement)
+has begun: Lead 1 is implemented, and measured on the real model — see [§10](#10-phase-3-lead-1-measured).
+The headline: it is safe and preserves the Newton path exactly, but on this thrashing contact+damage
+model it is break-even, not the 2–3× the offline benchmark projected. Lead 2 now looks like the more
+reliable lever.** Two measured leads plus one untested-but-not-excluded route; see
 [§4](#4-recommendation), which ends with a suggested order of work. One open question blocks part of
 it, see [§7](#7-the-open-question).
 
@@ -466,20 +469,22 @@ it does not care whether the pattern is stable.
 
 ## 9. Not done
 
-- **Phase 3.** Lead 1 is unblocked and is the place to start; Lead 2 is blocked on §7.
-- **Which goal is meant** — faster at 280k dof, or feasible at 1M+ dof. §1. This decides whether Lead 3
-  is optional or mandatory.
+- **Phase 3, Lead 1: DONE and measured** — see [§10](#10-phase-3-lead-1-measured). Lead 2 is blocked on §7.
+- **The goal is settled**: *both, faster-at-280k first then feasible-at-1M+* (Matthias, this session).
+  With Lead 1 turning out break-even on this model (§10), the "faster" half now rests on Lead 2.
 - **The iteration counts in Alkmim et al. (2026)**, which would gate the AMG work cheaply. Not read.
-- **The nonlinear cost of loose linear tolerances.** Lead 1's headline assumes Newton is unharmed by
-  a 1e-4 linear solve. Unverified, and it could eat the gain.
+- **The nonlinear cost of loose linear tolerances: VERIFIED harmless** (§10). EW forcing reproduces the
+  direct-solve Newton path exactly (15, 8, 5, 5 iterations, identical cutbacks).
 - **AMG done properly.** §3.5's AMG rows tested the configuration the literature already calls
   ineffective (monolithic, block-unaware, no near-null-space). Rigid body modes + a block
   preconditioner, per Alkmim et al. (2026), are the real test and are untried. Requires extending the
   AMGCL wrapper to accept pointer-valued parameters, or using Trilinos as that paper does.
-- **Docs.** `doc/source/documentation/linsolvers.rst` is stale — omits `amgcl` and now `matrixdump`,
-  and still claims only `gmres` accepts a config file. Per `CLAUDE.md`, docs gate merging.
-- **Tests.** Nothing covers `matrixdump`, `factorize`/`solveFactorized`, or
-  `pruneCondensedMatrixZeros=False`.
+- **Docs.** `doc/source/documentation/linsolvers.rst` now documents `inexactnewton`, `amgcl` and
+  `matrixdump` and the corrected config-file claim (`8c01a7d3`). Still no Doxygen-equivalent needed
+  (Python).
+- **Tests.** `inexactnewton` now has a registered edelweiss-only regression test (`CantileverBeamQuad8-
+  NeoHookeInexactNewton`, SuperLU delegate, dependency-free). Still nothing covers `matrixdump`,
+  `factorize`/`solveFactorized`, or `pruneCondensedMatrixZeros=False`.
 - **Pre-existing, unrelated:** `run_tests_edelweissfe ./testfiles/edelweiss-only/` has one failure,
   `NodeToDeformableSurfaceContactPullOut`. Verified to fail identically with this branch's changes
   stashed, so it predates this work — but it is a *contact* test, and this branch's subject matter is
@@ -487,3 +492,57 @@ it does not care whether the pattern is stable.
 - **Whether this branch should merge as-is.** `matrixdump` and `benchmark_linsolve.py` are
   investigation tooling; the timings and the phase-separated PARDISO methods are worth keeping
   regardless. Decide deliberately.
+
+---
+
+## 10. Phase 3, Lead 1 — measured
+
+Lead 1 is implemented as `linsolver=inexactnewton` (`edelweissfe/linsolve/inexactnewton/`, commits
+`2e3ce198`/`8c01a7d3`/`3a833817`). It is a self-contained `(A, b) → x` solver — **no change to the
+Newton loop** — that keeps an exact PARDISO LU of one iterate and reuses it as a GMRES preconditioner
+under an Eisenstat–Walker forcing sequence, reconstructing the signals it needs (`‖b‖` = the condensed
+Newton residual drives the forcing and flags new increments; GMRES iteration counts flag staleness).
+The delegate factorizing backend is PARDISO in production, SuperLU for a dependency-free path.
+
+**Verified on the same pryout model, step 2, OMP=MKL=16** (`inexact.inp` = `profile.inp` +
+`linsolver=inexactnewton` on step 2's `>>options`). Three policy variants were run to completion:
+
+| variant | policy | step-2 linear solve | vs baseline 695.3 s |
+|---|---|---|---|
+| v1 | naive reuse, no cap | slower (stale reuses ground to 31–65 GMRES iters) | worse |
+| v2 | cap 20 + backoff (mis-derived break-even 15) | 695.6 s | wash |
+| v3 | cap 25 + backoff (break-even ~22, skip GMRES on exact solves) | 719.4 s | ~wash |
+
+**Two firm conclusions:**
+
+1. **The nonlinear cost is not inflated — the §9 risk is closed.** Every variant reproduced the
+   direct-solve Newton path *exactly*: 15, 8, 5, 5 iterations with identical cutbacks. Eisenstat–Walker
+   forcing (clamped to `[1e-6, 1e-3]`) does not cost Newton iterations here.
+
+2. **Lead 1 is break-even on this model, not the 2–3× the offline benchmark projected.** Only **4–7 of
+   44 solves** reuse cheaply; the rest refactorize or bail. The factorization saved by a reuse (~15 s of
+   phase 11+22) is cancelled by the GMRES apply overhead (0.66 s × the iterations needed, which on this
+   model is often 15–30 because the preconditioner is poor). Root cause is physical: contact + damage
+   **active-set thrashing** changes the Jacobian enough between Newton iterations that a lagged
+   factorization preconditions badly. §3.4's "4–9 iterations" was measured on a *converging tail*
+   (dumped ords 2–10 of one increment) — more favorable than the full nonlinear path, which is
+   dominated by the thrashing heads of the 15- and 8-iteration increments.
+
+**What this implies for the plan.** The break-even is
+`(reorder + factorization) / (one back-substitution)` ≈ 22 iters — and **phase 11 (reorder) alone is
+38 % of every solve** (272 s of the 719 s), a reordering recomputed every iteration because the
+condensed pattern churns (§3.1). So the reliable lever on *this* model is **Lead 2 (freeze the symbolic
+factorization)**, which cuts that 38 % on *every direct solve* — where the time actually goes — rather
+than trying to avoid the factorization entirely. Lead 2 is blocked on the §7 drift question (needs
+Matthias's judgement). Note Lead 2 also *lowers* Lead 1's ceiling further: with phase 11 frozen, a
+direct solve is cheaper, so even fewer reuses clear the (now lower) break-even.
+
+`inexactnewton` is worth keeping regardless: it is correct, safe (robustly ≈ the direct baseline, never
+the runaway v1 was), and should pay on problems with a slowly varying Jacobian (smooth plasticity,
+stable propagation stages) rather than this damage-onset + contact window. It is **not** the win for
+this model.
+
+Reproduce: on xeon, `~/constitutive_modeling/next_v2611/Pryout_profile_investigation/`,
+`PYTHONUNBUFFERED=1 OMP_NUM_THREADS=16 MKL_NUM_THREADS=16 PYTHON_GIL=0 edelweissfe inexact.inp >
+inexact.log 2>&1`. Per-solve trace is on (`inexact.json` has `"verbose": true`); baseline is
+`baseline_omp16.log`.
