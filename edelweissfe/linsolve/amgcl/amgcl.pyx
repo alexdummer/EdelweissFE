@@ -133,6 +133,15 @@ cdef class PyAMGCLSolver:
         self.solver.applyPreconditioner(n, &rhs_[0], &x_[0])
         return x
 
+    def report(self):
+        """
+        Human-readable AMGCL hierarchy report (levels, operator complexity, coarse size) for the most
+        recently built() or solve()'d hierarchy.
+
+        Raises RuntimeError if nothing has been built yet.
+        """
+        return self.solver.report().decode("utf-8")
+
     def solve(self, object A, object rhs):
         """
         A: scipy.sparse.csr_matrix

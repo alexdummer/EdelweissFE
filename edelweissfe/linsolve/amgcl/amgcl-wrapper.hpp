@@ -9,6 +9,7 @@
 #include <boost/property_tree/ptree.hpp>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -92,6 +93,19 @@ public:
     auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
     auto x_rng   = amgcl::make_iterator_range( x, x + n );
     solver_->precond().apply( rhs_rng, x_rng );
+  }
+
+  // Human-readable hierarchy report (levels, operator complexity, coarse size) for the AMG built by
+  // build() or solve(). Streams AMGCL's own operator<< for the preconditioner + solver. Must be
+  // called after a successful build()/solve() -- throws otherwise.
+  std::string report() const
+  {
+    if ( !solver_ ) {
+      throw std::runtime_error( "report(): no hierarchy built yet -- call build() or solve() first" );
+    }
+    std::ostringstream oss;
+    oss << *solver_;
+    return oss.str();
   }
 
   void solve( int           n,
