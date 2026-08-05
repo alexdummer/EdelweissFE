@@ -91,15 +91,26 @@ class LinearSolver:
         simply ignores the call.
         """
 
-    def setP1Maps(self, p1Maps: dict) -> None:
-        """Receive every vector field's P1 corner/midside topology map (§22.1,
-        :func:`edelweissfe.numerics.p1topology.buildP1Map`), computed unconditionally by the nonlinear
-        solver alongside :meth:`setFieldStructure` -- the same "push it to everyone, let the ones that
-        care opt in" convention, since the computation itself is cheap topology-only classification,
-        not a solve.
+    requestedP1FieldNames: frozenset = frozenset()
+    """Vector field names this solver actually wants a P1 topology map for (§22.1), queried by the
+    nonlinear solver *before* computing anything, via this attribute -- unlike
+    :meth:`setFieldStructure`, computing a P1 map is not always safe to run unconditionally: it hard-
+    errors on an element topology it cannot classify (found the hard way -- an unrelated model using a
+    rigid-body-contact discretization crashed once this was briefly made unconditional for every
+    solver). Default empty -- most solvers never need this and the nonlinear solver skips the
+    computation entirely when this is empty, rather than computing it and hoping it happens to
+    succeed on a model that never asked for it.
+    """
 
-        Default no-op -- only a solver that has separately opted a field into p-multigrid (e.g.
-        ``blockamg``'s ``p1FieldNames`` option) reads this; every other solver simply ignores the call.
+    def setP1Maps(self, p1Maps: dict) -> None:
+        """Receive the P1 corner/midside topology map (§22.1,
+        :func:`edelweissfe.numerics.p1topology.buildP1Map`) for every field named in
+        :attr:`requestedP1FieldNames`, computed by the nonlinear solver alongside
+        :meth:`setFieldStructure`.
+
+        Default no-op -- only a solver that has populated :attr:`requestedP1FieldNames` (e.g.
+        ``blockamg``'s ``p1FieldNames`` option) ever has this called with a non-empty ``p1Maps``;
+        every other solver simply ignores the call.
 
         Parameters
         ----------

@@ -345,27 +345,37 @@ class NIST(NonlinearSolverBase):
                     # corners, 1/2-1/2 on each exclusive midside from its two edge-endpoint corners),
                     # in the same field-node order the coords dump above already uses. Scalar fields
                     # (e.g. nonlocal damage) have no P1-vs-quadratic story of their own and are
-                    # skipped. Computed unconditionally on every (re)build -- cheap topology-only
-                    # classification, no matrix operations -- and pushed to every linear solver via
-                    # setP1Maps() (§22.5's NIST plumbing), the same "push it to everyone, let the ones
-                    # that care opt in" convention setFieldStructure already follows; ordinary solvers
-                    # simply ignore the call. The optional EDELWEISS_DUMP_P1MAP env var additionally
-                    # writes it to disk for offline preconditioner experiments, reusing the same
-                    # computation rather than doing it twice.
+                    # skipped.
+                    #
+                    # NOT computed unconditionally, unlike setFieldStructure -- found the hard way
+                    # (a previously-passing test regressed): buildP1Map hard-errors on an element
+                    # topology it cannot classify (by design, §22.1 -- "never silently pick a
+                    # heuristic"), and an unrelated model using a rigid-body-contact discretization
+                    # crashed once this ran for every solver regardless of need. Only computed for a
+                    # field the linear solver actually asked for via requestedP1FieldNames (§22.5's
+                    # NIST plumbing: query first, then push, rather than push-and-hope), or
+                    # unconditionally for every vector field when EDELWEISS_DUMP_P1MAP is set (an
+                    # explicit, opt-in diagnostic dump -- accepting that risk is the whole point of
+                    # asking for it by name).
                     p1MapDumpDir = os.environ.get("EDELWEISS_DUMP_P1MAP")
+                    requestedP1FieldNames = self.linSolver.requestedP1FieldNames
                     p1MapsForSolver = {}
                     p1MapData = {}
-                    for fieldName, field in model.nodeFields.items():
-                        if field.dimension <= 1:
-                            continue
-                        isCorner, edgeEndpoints, p1Warnings = buildP1Map(model, fieldName)
-                        p1MapsForSolver[fieldName] = (isCorner, edgeEndpoints)
-                        if p1MapDumpDir:
-                            p1MapData[fieldName + "_isCorner"] = isCorner
-                            p1MapData[fieldName + "_edgeEndpoints"] = edgeEndpoints
-                        for w in p1Warnings:
-                            self.journal.message(w, self.identification, 1)
-                    self.linSolver.setP1Maps(p1MapsForSolver)
+                    if p1MapDumpDir or requestedP1FieldNames:
+                        for fieldName, field in model.nodeFields.items():
+                            if field.dimension <= 1:
+                                continue
+                            if not p1MapDumpDir and fieldName not in requestedP1FieldNames:
+                                continue
+                            isCorner, edgeEndpoints, p1Warnings = buildP1Map(model, fieldName)
+                            p1MapsForSolver[fieldName] = (isCorner, edgeEndpoints)
+                            if p1MapDumpDir:
+                                p1MapData[fieldName + "_isCorner"] = isCorner
+                                p1MapData[fieldName + "_edgeEndpoints"] = edgeEndpoints
+                            for w in p1Warnings:
+                                self.journal.message(w, self.identification, 1)
+                        if requestedP1FieldNames:
+                            self.linSolver.setP1Maps(p1MapsForSolver)
                     if p1MapDumpDir:
                         os.makedirs(p1MapDumpDir, exist_ok=True)
                         np.savez(os.path.join(p1MapDumpDir, "p1map.npz"), **p1MapData)
