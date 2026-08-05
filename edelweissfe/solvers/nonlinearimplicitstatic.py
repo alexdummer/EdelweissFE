@@ -43,6 +43,7 @@ from edelweissfe.linsolve.base import FieldBlock
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.numerics.csrgeneratorv2 import CSRGenerator
 from edelweissfe.numerics.dofmanager import DofManager, DofVector, VIJSystemMatrix
+from edelweissfe.numerics.p1topology import buildP1Map
 from edelweissfe.outputmanagers.base.outputmanagerbase import OutputManagerBase
 from edelweissfe.solvers.base.dirichlet import applyDirichletK
 from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
@@ -334,6 +335,32 @@ class NIST(NonlinearSolverBase):
                         self.journal.message(
                             "dumped nodal coordinates ({:} fields) to {:}".format(
                                 len(model.nodeFields), coordinateDumpDir
+                            ),
+                            self.identification,
+                            0,
+                        )
+
+                    # Optional one-time dump of the corner/midside topology of every vector field
+                    # (§22.1, the p-multigrid enabler): the classification a P1 restriction operator
+                    # needs (identity on corners, 1/2-1/2 on each exclusive midside from its two
+                    # edge-endpoint corners), in the same field-node order the coords dump above
+                    # already uses. Scalar fields (e.g. nonlocal damage) have no P1-vs-quadratic
+                    # story of their own and are skipped. Gated and overwritten exactly like the
+                    # coords dump, for the same reasons.
+                    p1MapDumpDir = os.environ.get("EDELWEISS_DUMP_P1MAP")
+                    if p1MapDumpDir:
+                        os.makedirs(p1MapDumpDir, exist_ok=True)
+                        p1MapData = {}
+                        for fieldName, field in model.nodeFields.items():
+                            if field.dimension <= 1:
+                                continue
+                            isCorner, edgeEndpoints = buildP1Map(model, fieldName)
+                            p1MapData[fieldName + "_isCorner"] = isCorner
+                            p1MapData[fieldName + "_edgeEndpoints"] = edgeEndpoints
+                        np.savez(os.path.join(p1MapDumpDir, "p1map.npz"), **p1MapData)
+                        self.journal.message(
+                            "dumped P1 topology map ({:} vector field(s)) to {:}".format(
+                                len(p1MapData) // 2, p1MapDumpDir
                             ),
                             self.identification,
                             0,
