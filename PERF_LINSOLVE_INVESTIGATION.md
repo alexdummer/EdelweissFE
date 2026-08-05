@@ -174,28 +174,25 @@ has begun. Two cheap leads are now measured on the real model:**
   `RelaxationSmootherT` to avoid its wasted chebyshev power-iteration build) replaces `As` as
   scipy `gmres`'s operator via a `LinearOperator`; the true-residual check rides free on the same
   wrapped matrix via the `D⁻¹(As z − bs) = A x − b` identity (asserted numerically, `5.25e-12` max
-  abs diff, before use). **23.5 (executed): clean pass on every gate** — 9-ord aggregate wall
-  188.75s → 157.37s (**1.199×**, exceeds the ≥10% bar), every single ord faster (no regressions),
-  every outer-iteration count and true residual **exactly** unchanged (no FP-drift band needed in
-  practice). A genuine bonus found along the way: GMRES's own internal bookkeeping (bucket h)
-  shrank *alongside* the attacked SpMV bucket, more than bucket (a) alone predicts. `p1Maps`
-  cross-reference: p-two-grid's relative advantage shrinks from 1.068× to **1.044×** on this faster
-  baseline, exactly the mechanism 23.0 predicted — still above parity, not a failure. **23.6 (live
-  gate) not yet run** — mandatory before shipping since this changes the shipped default's hot
-  path, but a heavier step (a real pryout simulation, not an offline replay); a deliberate pause
-  point pending that decision.
-- **Phase 8 planned — thread the shared serial-scipy per-iteration costs of the outer loop**
-  ([§23](#23-phase-8-plan--thread-the-shared-per-iteration-costs-of-the-outer-loop)): §22.4-quater's
-  ledger showed the dominant per-outer-iteration cost sits *outside* the displacement
-  preconditioner (~335 ms/iteration total on ord 00002's shipped arm vs. ~60 ms for the
-  displacement apply), and inspection of `blockamg.py`'s hot path finds the same
-  serial-scipy-matvec pattern §22.4-ter just caught once, in several more places: the outer GMRES
-  operator SpMV, the block-Gauss-Seidel coupling matvecs, the true-residual checks, and the
-  per-solve equilibration SpGEMMs. Census-first plan (only buckets ≥5% of solve wall get
-  attacked), reusing §22.4's AMGCL-backend machinery. **This targets the shipped default itself**
-  — deliberately decoupled from the `p1Maps` ship bar; per §22.4-quater's own ledger it is
-  *expected* to shrink p-two-grid's relative advantage, recorded up front as a consequence, not a
-  failure.
+  abs diff, before use). **23.5 (executed, then corrected on review — Fable):** the first pass
+  compared against a *prior-session* baseline (188.75s, §22.4-quater), a same-session-discipline
+  violation the round's own census data exposed (172.24s for the identical unmodified arm, measured
+  this session). Re-measured same-process, order-swap-checked (old→new→new→old, one script, one
+  interpreter): **`~1.22–1.27×`** aggregate (both orderings agree), not the retracted `1.199×`;
+  iteration counts and true residuals bit-for-bit identical, which is *expected by construction*
+  for a row-parallel CSR SpMV, not luck. The retracted run's "bonus" (GMRES-internals bucket
+  shrinking alongside the SpMV bucket) was a census-script artifact, not a real second effect — its
+  isolated matvec timing stayed wired to the old unthreaded path after the fix landed. A controlled
+  three-way experiment (raw matrix / `LinearOperator`+old matvec / `LinearOperator`+threaded matvec)
+  confirms the entire win is from threading (`1.0048×` wrapping-alone vs. `1.2687×`
+  threading-alone), resolving why the win exceeds the census's own 14.6% bucket share: that share
+  is diluted by non-scaling fixed costs and likely undercounts the matvec's true in-loop marginal
+  cost. `p1Maps` cross-reference leans on one fragile ord (00010's continuation-boundary outlier);
+  excluding it, p-two-grid sits at **~1.014× — parity, not a margin**. **23.6 (live gate) not yet
+  run** — mandatory before shipping since this changes the shipped default's hot path, but a
+  heavier step (a real pryout simulation, not an offline replay); a deliberate pause point pending
+  that decision. The local `blockamg` regression testfiles (the plan's own regression net) should
+  run before, not with, that live gate.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -3785,56 +3782,109 @@ Whatever that number is, it does not gate this phase — but §22's ship-bar ari
 updated to the new, faster baseline honestly (if p-two-grid falls back below parity, §22's record
 says so plainly).
 
-**Executed — clean pass on every gate.** Same 9 ords, same probe script, before (§22.4-quater's
-recorded baseline) vs. after this section's changes:
+**First pass, retracted: compared against the wrong baseline.** The initial write-up here compared
+"after" (measured in the census-adjacent session) against **§22.4-quater's recorded number from a
+*prior* session** (188.75s) — a direct violation of §21.0's own same-session A/B discipline, the
+exact thing that discipline exists to prevent (xeon drifts between sessions). The tell was in this
+round's own data: the census session (§23.1) measured the *identical, unmodified* shipped arm at
+172.24s total — 9% faster than the 188.75s used as "before." Caught on review (Fable), not by this
+phase's own process; recorded here plainly rather than quietly fixed.
 
-| ord | shipped iters (before/after) | shipped wall (before → after) | per-ord ratio |
-|---|---|---|---|
-| 00002 | 66 / 66 | 22.12s → 20.80s | 1.063× |
-| 00003 | 164 / 164 | 48.04s → 37.30s | 1.288× |
-| 00004 | 62 / 62 | 20.86s → 16.79s | 1.242× |
-| 00005 | 51 / 51 | 17.21s → 14.41s | 1.194× |
-| 00006 | 55 / 55 | 18.14s → 15.22s | 1.192× |
-| 00007 | 53 / 53 | 17.58s → 14.86s | 1.183× |
-| 00008 | 54 / 54 | 17.87s → 14.99s | 1.192× |
-| 00009 | 23 / 23 | 10.10s → 8.87s | 1.139× |
-| 00010 | 50 / 50 | 16.81s → 14.12s | 1.191× |
-| **TOTAL** | | **188.75s → 157.37s** | **1.199×** |
+**Re-measured, same-session, same-process, order-swap-checked, per the review's prescribed fix.**
+One script loads the pre-§23.2 `blockamg.py` (git commit `68991d67`) as a separate module alongside
+the current one, both in the same Python process, and runs shipped-default over the same 9 ords in
+the order OLD → NEW → NEW → OLD (the repeat with reversed order rules out warm-cache/thermal drift
+biasing the comparison):
 
-- **≥10% aggregate external wall**: cleared with room to spare — **19.9%** aggregate improvement.
-- **No ord regressing past ~1.02×**: cleared trivially — every single ord got *faster* (1.06×
-  smallest, 1.29× largest), zero regressions.
-- **Iteration counts within ±5%, true residuals same character**: cleared exactly, not just
-  within tolerance — every ord's outer iteration count and true residual are bit-for-bit identical
-  to the pre-change baseline (see 23.2's note: no measurable FP drift on these 9 systems).
-- **Census re-measured after, attacked bucket actually shrank**: single-ord recheck (00002) shows
-  bucket (h) (GMRES internals) fell from `8.40s` to `4.36s` alongside bucket (a) — a **larger** drop
-  than bucket (a) alone predicts, because `LinearOperator`-wrapping the threaded matvec apparently
-  removes more of scipy's own per-iteration overhead with the raw sparse matrix than the isolated
-  matvec-only measurement captured. A genuine bonus, not double-counted anywhere in the aggregate
-  numbers above (those are wall-clock, not bucket sums).
-
-**`p1Maps` cross-reference, on this same, now-faster shipped baseline:**
-
-| ord | p-two-grid iters | shipped wall | p-two-grid wall | speedup |
+| ord | iters (old=new) | old wall | new wall | ratio |
 |---|---|---|---|---|
-| 00002 | 53 | 20.80s | 16.20s | 1.28× |
-| 00003 | 136 | 37.30s | 34.70s | 1.07× |
-| 00004 | 56 | 16.79s | 17.03s | 0.99× |
-| 00005 | 48 | 14.41s | 15.16s | 0.95× |
-| 00006 | 50 | 15.22s | 15.53s | 0.98× |
-| 00007 | 57 | 14.86s | 17.12s | 0.87× |
-| 00008 | 53 | 14.99s | 16.04s | 0.93× |
-| 00009 | 22 | 8.87s | 9.44s | 0.94× |
-| 00010 | 22 | 14.12s | 9.54s | 1.48× |
-| **TOTAL** | | **157.37s** | **150.77s** | **1.044×** |
+| 00002 | 66 | 23.91s | 17.35s | 1.379× |
+| 00003 | 164 | 48.03s | 35.92s | 1.337× |
+| 00004 | 62 | 20.37s | 16.75s | 1.216× |
+| 00005 | 51 | 19.01s | 14.36s | 1.324× |
+| 00006 | 55 | 18.08s | 15.36s | 1.177× |
+| 00007 | 53 | 18.00s | 14.80s | 1.216× |
+| 00008 | 54 | 18.07s | 14.80s | 1.222× |
+| 00009 | 23 | 10.29s | 8.79s | 1.171× |
+| 00010 | 50 | 16.98s | 14.06s | 1.208× |
+| **TOTAL (1st pass)** | | **192.75s** | **152.17s** | **1.267×** |
+| **TOTAL (2nd pass, order-swapped)** | | 186.66s | 152.82s | **1.222×** |
 
-Exactly the predicted mechanism: p-two-grid's aggregate advantage shrinks from `1.068×` (§22.4-ter,
-against the slower pre-§23 baseline) to `1.044×` (against this section's faster one) — the shared
-overhead this phase removed was part of what made p-two-grid's *relative* win look larger. Still
-above parity, not a failure of §22's work; §22's own ledger should read `1.044×` going forward as
-the live number, with `1.068×` understood as measured against a baseline this phase has since
-improved.
+The two passes agree (1.267× and 1.222×, both comfortably clearing the 10% gate) — no ordering
+bias. **The corrected, same-session number is `~1.22–1.27×`, not the retracted `1.199×`.** Every
+outer iteration count and true residual is exactly identical between old and new on every ord, on
+both passes — bit-for-bit, not merely within the ±5% drift band this section pre-committed to
+tolerate.
+
+**A mechanical correction to how that bit-identity was framed, also from review:** the initial
+write-up called it "a pleasant outcome, not one to be assumed." It should have been framed as
+*expected by construction*: row-parallel CSR SpMV accumulates each output row's sum serially, in
+the same order scipy's own matvec would — threading distributes rows across threads, it does not
+reorder any single row's summation. Identical GMRES trajectories are the deterministic consequence,
+not luck. (The true-residual *value* does take a different computation path — max abs diff `5.25e-
+12` against the direct computation, per 23.2's own numerical check — so "bit-for-bit identical
+residuals" means identical at printed precision and, more importantly, identical stopping
+*decisions*; it does not mean the two code paths compute the exact same floating-point bits.)
+
+**The apparent ceiling violation, resolved by a controlled experiment rather than more arithmetic.**
+The retracted 19.9% number visibly exceeded 23.1's own bucket (a) share (14.6% of total wall) — a
+real red flag, since bucket (a) was the only thing attacked. Even the corrected `~1.22–1.27×`
+(22–27%) still exceeds that figure. Rather than trying to reconcile it by further slicing the
+census's bucket percentages, isolated the question directly: does the win come from threading the
+matvec, or from `LinearOperator`-wrapping itself changing how scipy's `gmres` handles the operator
+(independent of what the matvec does)? Same process, same ord (00002), same preconditioner/eta,
+three variants of the operator argument, 3 repeats each:
+
+| variant | avg time | iters |
+|---|---|---|
+| (i) raw `As` (scipy sparse, unwrapped — the old code) | 8.53s | 36 |
+| (ii) `LinearOperator` wrapping the *same unthreaded* scipy matvec | 8.49s | 36 |
+| (iii) `LinearOperator` wrapping the threaded `PyAMGCLMatrix.matvec` (§23.2) | 6.69s | 36 |
+
+**(i)→(ii), wrapping alone: `1.0048×`** — noise-level, confirms wrapping introduces no
+scipy-internal overhead removal of its own (the "bonus"/"LinearOperator removes scipy's own
+overhead" explanation the retracted write-up speculated is **not real** — it was a census-script
+artifact, see below). **(ii)→(iii), threading alone: `1.2687×`** — matches the same-session A/B's
+`~1.22–1.27×` almost exactly. **The entire win is genuinely from threading the matvec, full stop.**
+
+This also explains why bucket (a)'s 14.6%-of-total-wall figure understated the true ceiling: that
+percentage is diluted by fixed one-time per-solve costs (hierarchy build, equilibration) that do
+not scale with outer iterations and are irrelevant to a per-iteration-cost ceiling argument — the
+relevant denominator is the outer-loop-scaling portion alone, against which bucket (a) is a larger
+share; and the isolated `aPerCall` timing (60 repeated matvecs in a tight loop) likely also
+underestimates the matvec's true marginal cost *inside* a running GMRES loop, where cache/memory
+traffic interacts with the surrounding orthogonalization and preconditioner work in ways a
+warm-loop microbenchmark does not reproduce. Both effects push the true ceiling above the naive
+14.6% reading; the controlled experiment settles the question directly rather than requiring that
+reconciliation to be exact.
+
+**The ord-00002 "bonus" claim (bucket (h) falling from `8.40s` to `4.36s`, previously reported as a
+genuine additional finding) is retracted as a measurement artifact, not a real effect.** The census
+script's isolated bucket-(a) measurement always benchmarks the raw `As @ xVec` scipy matvec
+directly (`probe_23_census.py`), regardless of whether `blockamg.py`'s actual `gmres()` call has
+been fixed to use the threaded operator. After §23.2 landed, that isolated number went stale — it
+no longer reflects what the real code does — so the post-fix bucket-(h) computation
+(`outerLoopTotal − a − b − c,d`) silently absorbed the *entire* real SpMV win into "GMRES
+internals" by subtraction, producing a number that looked like a second, independent finding but
+was actually the first finding, mislabeled. The decisive wrap-vs-thread experiment above is the
+correct way to attribute the win; the bucket-subtraction approach is retired for this specific
+before/after comparison (the census itself, as a *snapshot* of the unmodified code, remains valid).
+
+**Gate re-check on the corrected numbers:**
+- **≥10% aggregate external wall**: cleared, `~22–27%` (both passes), not the retracted `19.9%`.
+- **No ord regressing past ~1.02×**: cleared trivially — every ord faster on both passes.
+- **Iteration counts within ±5%, true residuals same character**: cleared exactly (bit-for-bit,
+  expected by construction per the mechanical note above).
+
+**`p1Maps` cross-reference** (unchanged in direction, carried forward from the prior write-up
+since re-running the full 4-pass rigor for this secondary cross-check was not repeated): p-two-grid
+aggregate on a representative faster-baseline run was `1.044×` (`157.37s` shipped vs. `150.77s`
+p-two-grid) — but per the same review, **this leans heavily on one ord's boundary effect**: ord
+00010 alone contributes a `1.48×` outlier (a continuation-tolerance boundary crossing, already
+flagged in 22.4-ter as fragile, not systematic). Excluding it, the remaining 8 ords give
+`~1.014×` — effectively **parity, not a margin**. §22's ledger should carry this caveat forward
+explicitly: p-two-grid is now at parity with the shipped default on this faster baseline, above
+it only via one fragile ord, not a robust advantage.
 
 ### 23.6 Live gate + ship
 
