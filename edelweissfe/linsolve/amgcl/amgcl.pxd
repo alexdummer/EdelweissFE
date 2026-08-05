@@ -102,3 +102,4 @@ cdef extern from "amgcl-wrapper.hpp":
         RelaxationSmoother(const char* json_params) except +
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void applyStep(int n, const double* rhs, double* x) except +
+        void residual(int n, const double* rhs, const double* x, double* r) except +

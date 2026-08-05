@@ -133,6 +133,22 @@ has begun. Two cheap leads are now measured on the real model:**
   opt-in-only; §22.5 still does not proceed. Remaining levers (Cholesky/SPD direct solve, a
   dedicated low-level coarse apply bypassing `PyAMGCLSolver`'s BiCGStab-wrapped-AMG structure) are
   more invasive than this round's; recorded as the next deliberate stopping point.
+  **22.4-ter (Matthias: "is everything what should be parallel now really parallel?")** answered
+  empirically rather than by re-reading code: GIL stays disabled through every relevant import
+  (not the `marmotelement` problem here), `-fopenmp` is present in `setup.py`, and isolated timing
+  confirms both AMGCL components genuinely scale (~9× at 16 threads). The real find: the isolated
+  coarse-apply timing (12.8ms/call) did not match the coupled run's own `coarseSeconds`
+  instrumentation (60.2ms/call) for the same ord — because that timing block also wrapped
+  `rFree - self._As_free @ xFree`, a plain scipy CSR matvec on the ~190k-DOF free block (139
+  nnz/row) that is flat against `OMP_NUM_THREADS` (32.5-32.9ms/call at both `T=1` and `T=16`) —
+  mislabeled as coarse cost the whole time. Fixed by adding `RelaxationSmootherT::residual()`,
+  reusing the fine smoother's already-cached OpenMP-threaded backend matrix for this exact SpMV.
+  Numerically identical (same outer iterations, same true residual); aggregate wall-clock jumps to
+  **1.068×** — p-two-grid now beats the shipped default in total for the first time this phase, with
+  5 of 9 ords at or above parity. Still short of `≥1.20×` (worst ord `0.875×` vs. `≥0.95×`), by a
+  much smaller margin than any earlier round. `p1Maps` stays opt-in-only; §22.5 still does not
+  proceed. This finding's own lesson — instrumentation buckets are not trustworthy without an
+  isolated cross-check — is the working method for whatever comes next.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -3298,6 +3314,108 @@ low-level PARDISO calls), or a dedicated low-level coarse "apply" analogous to �
 `RelaxationSmootherT` that bypasses `PyAMGCLSolver`'s generic BiCGStab-wrapped-AMG structure and
 its own array-copy overhead at the C++ boundary. Recorded here as the next deliberate stopping
 point.
+
+#### 22.4-ter — a hidden serial matvec, found by asking "is everything that should be parallel actually parallel?" (executed, Matthias)
+
+Not a planned probe — a direct question about the work so far ("is everything what should be
+parallel now really parallel?"), answered empirically rather than by re-reading the code and
+assuming the OpenMP pragmas apply. Checked three things in order:
+
+1. **GIL status** (§ this document's own recurring gotcha, `marmotelement` silently re-enabling it
+   elsewhere in this codebase): `sys._is_gil_enabled()` immediately after importing
+   `edelweissfe.linsolve.amgcl.amgcl`, `.pardiso.pardiso`, `.blockamg.blockamg`, and `.blockamg.
+   ptwogrid` under `PYTHON_GIL=0` — stays `False` through all four. Not the marmotelement problem
+   here.
+2. **`setup.py`'s compile flags** for the `amgcl` extension: `-fopenmp` is present on both compile
+   and link args (it has to be, or the existing shipped `PyAMGCLSolver` would already be serial) —
+   confirmed rather than assumed.
+3. **Empirical thread scaling**, the test that actually answers the question: timed the fine
+   smoother (`RelaxationSmootherT::applyStep`) and the coarse AMGCL solve in isolation at
+   `OMP_NUM_THREADS ∈ {1, 4, 16}`, same real ord-00002 matrices.
+
+| component | T=1 | T=4 | T=16 | scaling at T=16 |
+|---|---|---|---|---|
+| fine smoother | 198.5ms/call | 69.6ms/call | 21.9ms/call | 9.07× |
+| coarse AMGCL | 122.7ms/call | 32.6ms/call | 12.8ms/call | 9.59× |
+| `P_free.T@res` / `P_free@corr` (scipy) | 0.49ms/call | — | 0.52ms/call | ~1× (flat) |
+
+Both AMGCL-backed components genuinely scale (~9× at 16 threads — good, not perfect, consistent
+with this document's own repeated finding that these kernels are memory-bandwidth-bound, not
+compute-bound). The two scipy restriction/prolongation matvecs are flat, as expected (scipy sparse
+matvec is plain single-threaded C) — but negligible in absolute terms (~0.5ms), so not by
+themselves a problem.
+
+**The real finding was a mismatch, not a missing pragma.** The isolated coarse-apply timing
+(12.8ms/call at T=16) did not match the coupled run's own `coarseSeconds` instrumentation for the
+same ord (60.2ms/call, from dividing 22.4-bis's `coarse=7.10s`/`calls=118`) — a ~4.7× gap between
+two measurements of "the same thing." Reading `PTwoGridPreconditioner.applyPreconditioner` closely
+(not just its docstring) found why: the `coarseSeconds` timing block wraps *more* than the coarse
+apply —
+
+```python
+t0 = time.perf_counter()
+res = rFree - self._As_free @ xFree      # <- a fine-level, ~190k-DOF scipy CSR matvec
+resCoarse = self._P_free.T @ res
+corrCoarse = self._coarseSolver.applyPreconditioner(resCoarse)
+xFree = xFree + self._P_free @ corrCoarse
+self.coarseSeconds += time.perf_counter() - t0
+```
+
+`self._As_free @ xFree` is exactly the kind of scipy CSR matvec just shown to be flat against
+thread count — and it is not small: `A_free` has 190,499 rows and 26,479,460 nonzeros (139 nnz/row,
+a dense stencil for a 3D quadratic-serendipity block). Timed directly: **32.5-32.9ms/call, at both
+`OMP_NUM_THREADS=1` and `=16`** — confirms it, and roughly reconciles the gap (12.8 + 32.5 + ~1 ≈
+46ms vs. the measured 60.2ms; the remainder is measurement noise/warm-up, not a second hidden cost).
+At ~118-284 calls per solve, this is **~3.8-9.2s of pure, unnecessary serial cost per solve** —
+mislabeled as "coarse" the whole time because it shared that timing block, when it has nothing to
+do with the coarse level at all: it is the fine-level residual the coarse correction restricts.
+
+**Fix, not a workaround:** `RelaxationSmootherT` (§22.4) already builds and caches an
+OpenMP-threaded `amgcl::backend::builtin<double>::matrix` from `A_free` for the smoother itself —
+the exact same matrix `res = rFree - self._As_free @ xFree` needs. Added
+`RelaxationSmootherT::residual(n, rhs, x, r)` (`amgcl-wrapper.hpp`), computing `r = rhs - A*x` via
+`amgcl::backend::residual` directly on that cached matrix — no second conversion, reuses what is
+already there. Declared in `.pxd`; exposed as `PyAMGCLRelaxationSmoother.residual(rhs, x)` in
+`.pyx`. `ptwogrid.py`'s `_buildChebyshevSmoother` now returns `(smooth, residual)` instead of just
+`smooth`; `applyPreconditioner` calls `self._residual(rFree, xFree)` in place of the scipy matvec.
+
+**Measured, single-ord sanity first (ord 00002): numerically identical** (53 outer iters,
+`true_res=9.75e-06`, exactly matching the pre-fix run — confirms this is a pure performance change,
+not a numerics change) **and `coarseSeconds` drops from 7.10s to 2.95s** for the same 118 calls
+(60.2ms/call → 25.0ms/call, matching the ~46ms reconciliation above closely enough given
+measurement noise). Then the **full 9-ord replay**:
+
+| ord | shipped iters | p-two-grid iters | shipped wall | p-two-grid wall | "speedup" |
+|---|---|---|---|---|---|
+| 00002 | 66 | 53 | 22.12s | 18.98s | 1.17× |
+| 00003 | 164 | 136 | 48.04s | 41.50s | 1.16× |
+| 00004 | 62 | 56 | 20.86s | 20.20s | 1.03× |
+| 00005 | 51 | 48 | 17.21s | 17.89s | 0.96× |
+| 00006 | 55 | 50 | 18.14s | 18.22s | 1.00× |
+| 00007 | 53 | 57 | 17.58s | 20.08s | 0.88× |
+| 00008 | 54 | 53 | 17.87s | 18.83s | 0.95× |
+| 00009 | 23 | 22 | 10.10s | 10.50s | 0.96× |
+| 00010 | 50 | 22 | 16.81s | 10.55s | 1.59× |
+| **TOTAL** | | | **188.75s** | **176.76s** | **1.068×** |
+
+**The p-two-grid solve is now faster than the shipped default in aggregate** — the first time in
+this whole phase (0.368× → 0.792× → 0.881× → **1.068×** across the three rounds of fixes) — with
+five of nine ords individually at or above parity. `fine_share` rose to 66.6-68.3% (unchanged
+absolute fine cost, now a larger share of a much smaller `ptg` total); `ptg_share_of_wall` fell to
+31.7-48.2% (the untouched "nonlocal damage" field's own solve and outer-loop bookkeeping are now
+the largest single share of total wall-clock, on both arms equally — a genuine ceiling on how far
+tuning displacement's own preconditioner alone can move the aggregate number).
+
+**Bar: still fails, but by a much smaller margin.** `1.068×` is short of `≥1.20×` (need
+`1.20/1.068 ≈ 1.12×` more); worst ord `00007` at `0.875×` is short of the `≥0.95×` allowance (one
+ord, not the "every ord" pattern of every earlier round in this section). `p1Maps` stays
+opt-in-only pending that last stretch. Given `fine_share` is now the dominant piece of `ptg`'s own
+time again (not because fine got worse, but because coarse got so much better), the next
+lever most consistent with this section's own pattern (verify the decisive number before
+theorizing) would be re-examining the fine smoother's own configuration (`nu`, degree) the same way
+22.4-bis did for the coarse level, plus checking whether an equivalent hidden-serial-cost pattern
+exists anywhere else in the hot path — this finding's own lesson is that instrumentation buckets
+should not be trusted at face value without an isolated cross-check.
 
 ### 22.5 Live gate, plumbing, and ship decision
 

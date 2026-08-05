@@ -406,3 +406,18 @@ cdef class PyAMGCLRelaxationSmoother:
         cdef double[::1] x_ = x_arr
         cdef double[::1] rhs_ = rhs_arr
         self.smoother.applyStep(n, &rhs_[0], &x_[0])
+
+    def residual(self, object rhs, object x):
+        """``rhs - A@x`` on the same OpenMP-threaded backend matrix :meth:`build` already converted --
+        a plain ``scipy.sparse`` CSR matvec is not thread-parallel regardless of ``OMP_NUM_THREADS``
+        (§22.4-bis), so callers computing the fine-level residual for a two-grid restriction should use
+        this instead of ``A @ x`` in Python. Returns a new float64 array; does not mutate ``x``."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        cdef int n = rhs_arr.shape[0]
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(n, dtype=np.float64)
+        cdef double[::1] rhs_ = rhs_arr
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] r_ = r
+        self.smoother.residual(n, &rhs_[0], &x_[0], &r_[0])
+        return r

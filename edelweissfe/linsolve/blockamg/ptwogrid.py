@@ -78,7 +78,14 @@ def _buildChebyshevSmoother(A, degree, powerIters=50, lower=0.01, higher=1.1):
     constructor via the identical algorithm, so it no longer needs a separate Python-side pass.
     ``higher`` defaults to 1.1, matching the old hand-rolled smoother's ``upper=1.1`` safety margin
     above the estimated spectral radius -- AMGCL's own chebyshev defaults ``higher`` to 1.0, which
-    would silently retune the fine smoother relative to what §22.3 validated."""
+    would silently retune the fine smoother relative to what §22.3 validated.
+
+    Also returns ``residual``, computed on this same object's cached backend matrix (§22.4-bis): a
+    plain ``A @ x`` scipy CSR matvec is not OpenMP-threaded regardless of ``OMP_NUM_THREADS`` (scipy
+    sparse matvec is single-threaded C code), and was measured costing ~30ms/call on the real
+    ~190k-DOF free displacement block -- silently charged to ``coarseSeconds`` in
+    :meth:`PTwoGridPreconditioner.applyPreconditioner`, since that is the timing block it shared,
+    even though it has nothing to do with the coarse level."""
     from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLRelaxationSmoother
 
     smoother = PyAMGCLRelaxationSmoother(
@@ -91,7 +98,7 @@ def _buildChebyshevSmoother(A, degree, powerIters=50, lower=0.01, higher=1.1):
             smoother.applyStep(x, rhs)
         return x
 
-    return smooth
+    return smooth, smoother.residual
 
 
 def buildNodeLevelP(isCorner: np.ndarray, edgeEndpoints: np.ndarray) -> sp.csr_matrix:
@@ -230,7 +237,7 @@ class PTwoGridPreconditioner:
         coarseSolver.build(A1_free)
         self._coarseSolver = coarseSolver
 
-        self._smooth = _buildChebyshevSmoother(A_free, self._fineDegree)
+        self._smooth, self._residual = _buildChebyshevSmoother(A_free, self._fineDegree)
 
     def applyPreconditioner(self, r: np.ndarray) -> np.ndarray:
         """One two-grid V-cycle: pre-smooth, coarse-grid correction, post-smooth, on the free
@@ -247,7 +254,7 @@ class PTwoGridPreconditioner:
         self.fineSeconds += time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        res = rFree - self._As_free @ xFree
+        res = self._residual(rFree, xFree)
         resCoarse = self._P_free.T @ res
         corrCoarse = self._coarseSolver.applyPreconditioner(resCoarse)
         xFree = xFree + self._P_free @ corrCoarse

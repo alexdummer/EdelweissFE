@@ -408,6 +408,28 @@ public:
     auto tmp_rng = amgcl::make_iterator_range( tmp_.data(), tmp_.data() + n );
     relax_->apply_pre( *A_, rhs_rng, x_rng, tmp_rng );
   }
+
+  // r <- rhs - A*x, computed on the same cached OpenMP-threaded backend matrix applyStep() already
+  // built A_ from -- not otherwise part of "the smoother", but ptwogrid.py's V-cycle needs exactly
+  // this fine-level residual to restrict through P before the coarse-grid correction, and it was
+  // computing it via a plain scipy.sparse CSR matvec (A_free @ xFree), which is not OpenMP-threaded
+  // (scipy's sparse matvec is single-threaded C code regardless of OMP_NUM_THREADS) and was found,
+  // by comparing an isolated per-call timing against the coupled solve's own instrumentation, to be
+  // silently costing ~30ms/call on a ~190k-DOF/139-nnz-per-row matrix -- charged to "coarseSeconds"
+  // even though it has nothing to do with the coarse level, because it shares that timing block with
+  // the actual coarse apply in applyPreconditioner(). Reusing A_ here (already built, already the
+  // right backend matrix) avoids a second conversion and gets this SpMV onto the same threaded path
+  // as everything else in this class, for free.
+  void residual( int n, const double* rhs, const double* x, double* r )
+  {
+    if ( !A_ ) {
+      throw std::runtime_error( "residual(): no smoother built yet -- call build() first" );
+    }
+    auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
+    auto x_rng   = amgcl::make_iterator_range( x, x + n );
+    auto r_rng   = amgcl::make_iterator_range( r, r + n );
+    amgcl::backend::residual( rhs_rng, *A_, x_rng, r_rng );
+  }
 };
 
 // The default, unchanged double-precision wrapper, and the new float32 one added for §19.3.
