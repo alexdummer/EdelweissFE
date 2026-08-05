@@ -173,18 +173,29 @@ def finiteElementSimulation(
     try:
         for step in stepManager.generateSteps(jobInfo, model, fieldOutputController, journal, solvers, outputManagers):
             tic = getCurrentTime()
-            step.solve()
-            toc = getCurrentTime()
-            stepTime = toc - tic
-            jobInfo["computationTime"] += stepTime
+            try:
+                step.solve()
+            finally:
+                # Accumulate and report elapsed time for this step regardless of whether it
+                # succeeded or raised (StepFailed, KeyboardInterrupt, or anything else) -- a step
+                # that fails via the deliberate maxNumInc test cap (a common, intentional pattern,
+                # not a real failure) still did real, billable work up to that point, and silently
+                # excluding it from "Job computation time" made that figure wrong for exactly the
+                # runs where a test harness bounds a step via maxNumInc rather than letting it run
+                # to natural completion. Previously this line sat *after* step.solve() outside any
+                # try, so an exception there skipped straight past it to the except/finally blocks
+                # below, permanently dropping that step's time.
+                toc = getCurrentTime()
+                stepTime = toc - tic
+                jobInfo["computationTime"] += stepTime
 
-            journal.printTable(
-                [
-                    ("Step computation time", "{:10.4f}s".format(stepTime)),
-                ],
-                identification,
-                level=0,
-            )
+                journal.printTable(
+                    [
+                        ("Step computation time", "{:10.4f}s".format(stepTime)),
+                    ],
+                    identification,
+                    level=0,
+                )
 
     except KeyboardInterrupt:
         print("")
