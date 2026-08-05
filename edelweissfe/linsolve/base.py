@@ -91,5 +91,21 @@ class LinearSolver:
         simply ignores the call.
         """
 
+    def setP1Maps(self, p1Maps: dict) -> None:
+        """Receive every vector field's P1 corner/midside topology map (§22.1,
+        :func:`edelweissfe.numerics.p1topology.buildP1Map`), computed unconditionally by the nonlinear
+        solver alongside :meth:`setFieldStructure` -- the same "push it to everyone, let the ones that
+        care opt in" convention, since the computation itself is cheap topology-only classification,
+        not a solve.
+
+        Default no-op -- only a solver that has separately opted a field into p-multigrid (e.g.
+        ``blockamg``'s ``p1FieldNames`` option) reads this; every other solver simply ignores the call.
+
+        Parameters
+        ----------
+        p1Maps
+            Every vector field's map, keyed by field name: ``{fieldName: (isCorner, edgeEndpoints)}``.
+        """
+
     def __call__(self, A, b):
         raise NotImplementedError

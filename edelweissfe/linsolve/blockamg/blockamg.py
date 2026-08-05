@@ -183,11 +183,20 @@ class BlockAMGSolver(LinearSolver):
         dimension-based default for that field.
     p1Maps
         Optional mapping of field name to a ``(isCorner, edgeEndpoints)`` P1 topology map (§22.1,
-        :func:`edelweissfe.numerics.p1topology.buildP1Map`). A vector field named here gets a
-        :class:`~edelweissfe.linsolve.blockamg.ptwogrid.PTwoGridPreconditioner` (§22) instead of
-        the single-level AMGCL default -- the map's presence *is* the opt-in, matching
-        ``fieldPreconds``'s own by-presence convention. For this offline-validation step (§22.3)
-        the map is injected directly; NIST plumbing (§22.4) is not wired up yet.
+        :func:`edelweissfe.numerics.p1topology.buildP1Map`), injected directly. A vector field named
+        here gets a :class:`~edelweissfe.linsolve.blockamg.ptwogrid.PTwoGridPreconditioner` (§22)
+        instead of the single-level AMGCL default -- the map's presence *is* the opt-in, matching
+        ``fieldPreconds``'s own by-presence convention. This is the offline-probe construction path
+        (the map is known before the solver exists); for a live run built from a ``linsolverConfigFile``,
+        use ``p1FieldNames`` instead -- the actual topology arrays are not known until the nonlinear
+        solver builds the model's field structure, well after this constructor runs.
+    p1FieldNames
+        Optional list of vector field names to use p-multigrid for, once their topology map arrives via
+        :meth:`setP1Maps` (§22.5's NIST plumbing: the nonlinear solver computes every vector field's map
+        unconditionally, alongside :meth:`setFieldStructure`, and pushes all of them here regardless of
+        which solver is in use -- this list is what filters that down to the ones actually requested).
+        Ignored for a field also present in ``p1Maps`` (that field's map is already known; nothing to
+        wait for).
     etaMin, etaMax
         Clamp on the Eisenstat--Walker forcing tolerance (ignored if ``outerTol`` is given). ``etaMax``
         is also the tolerance used whenever there is no residual history to base a ratio on (the first
@@ -236,6 +245,7 @@ class BlockAMGSolver(LinearSolver):
         symmetric: bool = True,
         fieldPreconds: dict = None,
         p1Maps: dict = None,
+        p1FieldNames: list = None,
         etaMin: float = 1.0e-6,
         etaMax: float = 3.0e-4,
         ewGamma: float = 0.9,
@@ -253,6 +263,7 @@ class BlockAMGSolver(LinearSolver):
         self._symmetric = symmetric
         self._fieldPreconds = fieldPreconds or {}
         self._p1Maps = p1Maps or {}
+        self._p1FieldNamesRequested = set(p1FieldNames or [])
         self._etaMin = etaMin
         self._etaMax = etaMax
         self._ewGamma = ewGamma
@@ -324,6 +335,21 @@ class BlockAMGSolver(LinearSolver):
         split the equation system per field.
         """
         self._fieldStructure = list(fields)
+
+    def setP1Maps(self, p1Maps: dict) -> None:
+        """Receive every vector field's P1 topology map (§22.1); use the ones this instance was
+        constructed with ``p1FieldNames`` to request.
+
+        Overrides :meth:`~edelweissfe.linsolve.base.LinearSolver.setP1Maps`'s no-op default (§22.5's
+        NIST plumbing). Called by the nonlinear solver alongside :meth:`setFieldStructure`, with every
+        vector field's map regardless of which ones (if any) this instance actually wants -- only
+        ``p1FieldNames`` filters that down. A field already supplied via the constructor's ``p1Maps``
+        is not overwritten here (that path is for offline probes that already know the map; nothing to
+        wait for).
+        """
+        for name in self._p1FieldNamesRequested:
+            if name not in self._p1Maps and name in p1Maps:
+                self._p1Maps[name] = p1Maps[name]
 
     def _resolveBlocks(self, n: int) -> list:
         """The field blocks tiling ``[0, n)``, in DOF order, with any trailing DOFs not covered by a

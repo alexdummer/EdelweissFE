@@ -72,6 +72,12 @@ def createSolver(opts) -> Callable:
         ``fieldPreconds``
             Optional mapping of field name (e.g. ``"displacement"``) to an AMGCL preconditioner
             parameter tree, overriding the dimension-based default for that field.
+        ``p1FieldNames``
+            Optional list of vector field names (e.g. ``["displacement"]``) to precondition with
+            p-multigrid (§22) instead of the single-level AMGCL default -- the actual topology map is
+            computed by the nonlinear solver and supplied later via
+            :meth:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver.setP1Maps` (§22.5's NIST
+            plumbing), since it is not known at construction time.
 
         As with the other factories, a non-mapping ``opts`` is tolerated (the implicit-static solver
         passes ``""`` when no configuration file is given), in which case every default applies.
@@ -109,5 +115,7 @@ def createSolver(opts) -> Callable:
             kwargs[key] = cast(optionMap[key])
     if "fieldPreconds" in optionMap:
         kwargs["fieldPreconds"] = dict(optionMap["fieldPreconds"])
+    if "p1FieldNames" in optionMap:
+        kwargs["p1FieldNames"] = list(optionMap["p1FieldNames"])
 
     return BlockAMGSolver(**kwargs)
