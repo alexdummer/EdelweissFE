@@ -629,7 +629,8 @@ public:
               PyPrecondApplyFn applyFn,
               void*            ctx,
               int&             iters,
-              double&          error )
+              double&          error,
+              bool             resetOnce = false )
   {
     if ( n != n_ ) {
       throw std::runtime_error( "LGMRESOuterSolverT::solve(): n=" + std::to_string( n ) + " does not match the size " +
@@ -642,6 +643,21 @@ public:
 
     solver_->prm.tol     = tol;
     solver_->prm.maxiter = static_cast< size_t >( maxiter );
+
+    // §23.9 step 2 (the ord-00009 fix candidate, Fable's review): a caller-requested one-shot reset
+    // of the recycled/augmented Krylov vectors (`outer_v`), without discarding the persistent solver_
+    // object or reconstructing it. AMGCL's own operator() clears outer_v itself, unconditionally,
+    // whenever prm.always_reset is true (verified directly in lgmres.hpp: the very first statement in
+    // operator()) -- so flipping it true for exactly this one call and restoring it immediately after
+    // reuses that already-correct mechanism instead of reaching into outer_v/outer_v_data directly.
+    // blockamg.py wires this to its own `newIncrement` signal: reset across increment/cutback
+    // boundaries (where a stale recycled subspace is hypothesized to cost pure overhead, §23.7's
+    // ord-00009 finding), keep recycling within an increment's own Newton sequence (AMGCL's own
+    // intended use for K, and where every other ord showed recycling helping, not hurting).
+    bool savedAlwaysReset = solver_->prm.always_reset;
+    if ( resetOnce ) {
+      solver_->prm.always_reset = true;
+    }
 
     int  nnz = ptr[n];
     auto A   = std::make_tuple( n,
@@ -665,6 +681,8 @@ public:
     std::tie( itersOut, errorOut ) = ( *solver_ )( Amat, precond, rhs_rng, x_rng );
     iters                          = static_cast< int >( itersOut );
     error                          = errorOut;
+
+    solver_->prm.always_reset = savedAlwaysReset;
   }
 };
 

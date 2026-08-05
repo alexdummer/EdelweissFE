@@ -134,4 +134,5 @@ cdef extern from "amgcl-wrapper.hpp":
                    PyPrecondApplyFn applyFn,
                    void* ctx,
                    int& iters,
-                   double& error) except +
+                   double& error,
+                   bint resetOnce) except +

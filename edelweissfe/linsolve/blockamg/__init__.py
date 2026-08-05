@@ -54,12 +54,12 @@ def createSolver(opts) -> Callable:
             confirmation run changed the Newton path itself, see
             :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver` and
             PERF_LINSOLVE_INVESTIGATION.md §19.2.
-        ``outerSolver``, ``lgmresM``, ``lgmresK``, ``lgmresAlwaysReset``
+        ``outerSolver``, ``lgmresM``, ``lgmresK``, ``lgmresAlwaysReset``, ``lgmresResetOnNewIncrement``
             ``outerSolver`` selects the outer Krylov solve: ``"scipy"`` (default, unchanged) or
             ``"amgcl_lgmres"`` (§23.7, opt-in -- AMGCL's own native ``amgcl::solver::lgmres`` in place
-            of ``scipy.sparse.linalg.gmres``). The other three are only used with ``"amgcl_lgmres"``;
+            of ``scipy.sparse.linalg.gmres``). The other four are only used with ``"amgcl_lgmres"``;
             see :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver` for their meaning.
-            **Not yet built or live-validated** -- see PERF_LINSOLVE_INVESTIGATION.md §23.7.
+            **Not yet live-validated** -- see PERF_LINSOLVE_INVESTIGATION.md §23.7/§23.9.
         ``etaMin``, ``etaMax``, ``ewGamma``, ``ewAlpha``, ``residualGrowthFactor``,
         ``hierarchyStalenessFactor``
             Knobs for the adaptive outer tolerance and the per-field AMG hierarchy reuse across Newton
@@ -109,6 +109,7 @@ def createSolver(opts) -> Callable:
         ("lgmresM", int),
         ("lgmresK", int),
         ("lgmresAlwaysReset", bool),
+        ("lgmresResetOnNewIncrement", bool),
         ("sweeps", int),
         ("symmetric", bool),
         ("etaMin", float),

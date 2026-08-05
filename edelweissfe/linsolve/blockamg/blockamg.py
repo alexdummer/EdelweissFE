@@ -193,6 +193,14 @@ class BlockAMGSolver(LinearSolver):
         ``LGMRESOuterSolverT``'s own doc comment; defaulting to AMGCL's own ``True`` here would silently
         discard that benefit on every call while still paying the callback-per-apply overhead, a strictly
         worse outcome than the scipy path with nothing to show for it).
+    lgmresResetOnNewIncrement
+        Only used when ``outerSolver == "amgcl_lgmres"``. When ``True``, the recycled Krylov vectors are
+        discarded (one-shot, via the ``resetOnce`` parameter to ``PyAMGCLLGMRESSolver.solve``) exactly on
+        a solve where ``newIncrement`` is detected -- i.e. at an increment/cutback boundary, never on a
+        true-residual continuation retry of the same solve -- and kept alive across every other call
+        (§23.9 step 2, the ord-00009 regression's proposed fix, PERF_LINSOLVE_INVESTIGATION.md §23.7's
+        review block). Default ``False``: unvalidated, so this leaves ``lgmres``'s behaviour identical to
+        §23.7's original implementation unless explicitly turned on.
     sweeps
         Block Gauss-Seidel sweeps per preconditioner application.
     symmetric
@@ -264,6 +272,7 @@ class BlockAMGSolver(LinearSolver):
         lgmresM: int = 30,
         lgmresK: int = 3,
         lgmresAlwaysReset: bool = False,
+        lgmresResetOnNewIncrement: bool = False,
         sweeps: int = 1,
         symmetric: bool = True,
         fieldPreconds: dict = None,
@@ -288,6 +297,7 @@ class BlockAMGSolver(LinearSolver):
         self._lgmresM = lgmresM
         self._lgmresK = lgmresK
         self._lgmresAlwaysReset = lgmresAlwaysReset
+        self._lgmresResetOnNewIncrement = lgmresResetOnNewIncrement
         self._sweeps = sweeps
         self._symmetric = symmetric
         self._fieldPreconds = fieldPreconds or {}
@@ -320,6 +330,7 @@ class BlockAMGSolver(LinearSolver):
         self._n = None
         self._lastNnz = None
         self._lastOuterIters = None
+        self._lastContinuations = None
         self._refreshNext = False
 
         # The persistent AMGCL lgmres outer-solver instance (§23.7, only used when outerSolver ==
@@ -636,7 +647,22 @@ class BlockAMGSolver(LinearSolver):
                 )
                 outerIters = len(history)
             else:
-                z = self._lgmresSolver.solve(As, bs, blockGaussSeidel, eta, self._outerRestart * self._outerMaxiter)
+                # resetOnce (§23.9 step 2, the ord-00009 fix candidate, opt-in via
+                # lgmresResetOnNewIncrement -- unvalidated, defaults False, unchanged from §23.7's
+                # original behavior unless explicitly turned on): discard the recycled Krylov subspace
+                # exactly at an increment/cutback boundary -- where the previous solve's Jacobian
+                # belongs to a different (possibly harder-or-easier) problem -- and keep recycling
+                # within an increment's own Newton sequence, AMGCL's own intended use case for it.
+                # Never set on the continuation retry below: that call is a warm restart of *this same*
+                # outer solve at a tighter tolerance, not a new increment.
+                z = self._lgmresSolver.solve(
+                    As,
+                    bs,
+                    blockGaussSeidel,
+                    eta,
+                    self._outerRestart * self._outerMaxiter,
+                    resetOnce=(newIncrement and self._lgmresResetOnNewIncrement),
+                )
                 outerIters = self._lgmresSolver.lastIterations
                 info = 0 if self._lgmresSolver.lastError <= eta else 1
             x = dinv * z
@@ -714,6 +740,7 @@ class BlockAMGSolver(LinearSolver):
         if self._lastOuterIters is not None and outerIters > self._hierarchyStalenessFactor * self._lastOuterIters:
             self._refreshNext = True
         self._lastOuterIters = outerIters
+        self._lastContinuations = continuations
         self._lastResidualNorm = residualNorm
         self._lastEta = eta
 

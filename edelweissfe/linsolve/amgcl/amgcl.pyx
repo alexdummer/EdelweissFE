@@ -593,7 +593,8 @@ cdef class PyAMGCLLGMRESSolver:
         if self.solver != NULL:
             del self.solver
 
-    def solve(self, object A, object rhs, object applyPreconditioner, double tol, int maxiter, object x0=None):
+    def solve(self, object A, object rhs, object applyPreconditioner, double tol, int maxiter, object x0=None,
+              bint resetOnce=False):
         """
         A
             scipy.sparse.csr_matrix, this solve's (equilibrated) full coupled operator -- converted
@@ -614,6 +615,13 @@ cdef class PyAMGCLLGMRESSolver:
         x0
             Optional initial guess (warm start), e.g. blockamg.py's true-residual continuation retry.
             Defaults to zero.
+        resetOnce
+            §23.9 step 2: discard this instance's recycled/augmented Krylov vectors for this call only
+            (by temporarily flipping the underlying solver's ``prm.always_reset`` to true and restoring
+            it immediately after -- see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT::solve`` for why
+            this reuses AMGCL's own reset mechanism rather than touching ``outer_v`` directly), without
+            discarding this persistent instance itself. Default ``False`` -- recycling continues
+            uninterrupted unless a caller explicitly asks for a one-shot reset.
         """
         if not scipy.sparse.isspmatrix_csr(A):
             A = A.tocsr()
@@ -656,7 +664,7 @@ cdef class PyAMGCLLGMRESSolver:
         try:
             self.solver.solve(
                 n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0],
-                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error
+                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, resetOnce
             )
         finally:
             self._precondCallable = None
