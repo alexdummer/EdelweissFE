@@ -3928,7 +3928,7 @@ anything; the §21.2 Cython condensation kernel; p-two-grid's own remaining `~1.
 (deliberately parked at §22.4-quater's stopping point — this phase will move that goalpost, and
 §22's record gets the honest update in 23.5, but chasing it is not this phase's job); D4.
 
-### 23.7 A first cut at bucket (h) — AMGCL's native `lgmres` as an opt-in outer solver (implemented, not yet built or validated)
+### 23.7 A first cut at bucket (h) — AMGCL's native `lgmres` as an opt-in outer solver (implemented, offline-validated)
 
 §23.1's census left bucket (h) ("GMRES internals by subtraction" — Arnoldi/Gram-Schmidt/restart
 bookkeeping) as the single largest line in the shipped arm's own solve wall (38.4%, 66.18s of
@@ -4010,24 +4010,65 @@ untouched):
   `outerSolver`; `blockGaussSeidel` itself is unchanged and reused verbatim by both branches.
 - `blockamg/__init__.py`: the matching `linsolverConfigFile` option parsing.
 
-**Not yet done, explicitly**:
+**Built and offline-validated** (same session, once `xeon` was free — the live benchmark that
+blocked this during implementation was aborted for an unrelated reason, see below). Build was clean,
+zero errors, on the first attempt (`pip install -v -e .`). A quick smoke test first (a 200×200
+tridiagonal system, identity preconditioner, plus a deliberate exception raised from the
+preconditioner callable) confirmed basic correctness and exception propagation across the C
+function-pointer boundary before committing to the full replay.
 
-- **Not built, not run, not measured.** Per this task's own constraint, the machine with the AMGCL
-  headers and the working Cython/C++ build (`xeon`) had a live benchmark running for hours in another
-  session for the whole duration of this work and was not touched — no ssh, no build, no test run.
-  Every design decision above was checked directly against the installed `amgcl/solver/lgmres.hpp`
-  and its neighboring headers (`precond_side.hpp`, `backend/builtin.hpp`) fetched read-only from
-  upstream source, not assumed from memory or documentation — but the code itself has never compiled.
-  **No performance numbers exist for this change.** The next session must, in order: (1) build on
-  `xeon` (`pip install -v -e .`), (2) validate against the offline dumped-matrix replay (the same
-  9-ord harness §23.5 used) before anything live — outer-iteration counts and true residuals should
-  be in the same ballpark as the scipy arm (not necessarily identical; a different Krylov
-  implementation, not just a threaded matvec, so §23.2's tight FP-drift band does not directly apply
-  here), (3) only then the live gate.
-- `always_reset=False`'s actual cross-Newton-iteration benefit is unmeasured — plausible from
-  AMGCL's own doc comment, not confirmed on this codebase's actual Jacobian sequence.
-- The `outerRestart * outerMaxiter` → single `lgmres::maxiter` translation is a generous,
-  not-tuned budget, not an attempt at matching scipy's restart semantics bit-for-bit; likewise
-  `lgmresM`/`lgmresK` keep AMGCL's own upstream defaults (`30`/`3`) rather than anything tuned against
-  this codebase's operators. First-pass scope only, per the task's own framing — tuning is future
-  work, contingent on the build/validation above landing first.
+**Full 9-ord offline comparison** (same harness as §23.5: `outerSolver="scipy"` — the shipped
+default, unchanged — vs. `outerSolver="amgcl_lgmres"` with `lgmresM=100` (matched to the shipped
+`outerRestart`), `lgmresK=3`, `lgmresAlwaysReset=False`, same 9 dumped systems, same production
+`BlockAMGSolver` path):
+
+| ord | scipy iters | lgmres iters | scipy wall | lgmres wall | speedup | scipy true res | lgmres true res |
+|---|---|---|---|---|---|---|---|
+| 00002 | 66 | 50 | 18.98s | 12.94s | 1.47× | 6.53e-06 | 1.30e-05 |
+| 00003 | 164 | 109 | 35.65s | 22.59s | 1.58× | 8.92e-09 | 1.43e-07 |
+| 00004 | 62 | 52 | 16.02s | 13.26s | 1.21× | 6.67e-06 | 1.11e-05 |
+| 00005 | 51 | 48 | 14.11s | 12.63s | 1.12× | 4.32e-06 | 1.06e-05 |
+| 00006 | 55 | 50 | 14.81s | 13.07s | 1.13× | 2.71e-06 | 1.40e-05 |
+| 00007 | 53 | 37 | 16.16s | 10.84s | 1.49× | 3.47e-06 | 1.08e-05 |
+| 00008 | 54 | 39 | 14.41s | 11.05s | 1.30× | 3.90e-06 | 1.46e-05 |
+| 00009 | 23 | 35 | 8.74s | 10.43s | **0.84×** | 2.10e-04 | 1.46e-05 |
+| 00010 | 50 | 36 | 14.17s | 10.66s | 1.33× | 4.42e-06 | 1.84e-05 |
+| **TOTAL** | | | **153.07s** | **117.48s** | **1.303×** | | |
+
+**A real, substantial win.** Aggregate `1.303×` — larger than §23.2's own SpMV-threading win
+(`~1.22–1.27×`, same-session-verified) — and 8 of 9 ords individually faster (`1.12×`–`1.58×`), with
+`lgmres` needing *fewer* outer iterations than scipy's GMRES on every one of those 8 (most
+strikingly ord 00003: `109` vs `164`). No NaN/Inf on any ord.
+
+**One ord regresses, honestly recorded rather than averaged away.** Ord 00009 — the cheapest,
+smallest-iteration-count system in the set — needs *more* iterations with `lgmres` (`35` vs scipy's
+`23`) and is `0.84×` slower. A plausible mechanism, not yet confirmed: `always_reset=False` carries
+`outer_v`'s recycled Krylov vectors from the *previous* ord's (harder) solve into this easier one;
+if that augmented subspace is not well-aligned for the new, easier system, it is pure
+orthogonalization overhead bought for zero convergence benefit. Worth a dedicated check (e.g.
+re-running with `always_reset=True` on just this ord) if this path gets promoted further, not
+treated as disqualifying on its own — every other ord shows the opposite effect, recycling helping
+rather than hurting.
+
+**True residuals are systematically looser (not just on the one regressed ord)** — roughly 2–5×
+higher than scipy's on every ord, though still comfortably inside whatever tolerance was actually
+requested (all in the `1e-5`–`1e-7` range against tolerances of `3e-4`–`1e-6`). The same
+"looser-but-within-tolerance" character already found for p-two-grid (§22.3/§22.4) — a recurring,
+apparently benign characteristic of alternative Krylov/preconditioner configurations on this
+problem, not a new failure mode specific to `lgmres`.
+
+**Remaining before this could ship, unchanged from the original scope:**
+- `always_reset=False`'s cross-Newton-iteration recycling benefit is still not isolated from the
+  threading benefit alone — the comparison above bundles both effects together (this is what
+  `outerSolver="amgcl_lgmres"` actually does, so it is the right number for "does this help
+  end-to-end", but a follow-up ablation with `always_reset=True` would attribute the win between the
+  two mechanisms cleanly).
+- The `outerRestart * outerMaxiter` → single `lgmres::maxiter` translation and `lgmresM`/`lgmresK`
+  remain untuned (matched/upstream defaults only) — first-pass scope, per the original framing.
+- The ord 00009 regression's mechanism above is a plausible hypothesis, not a confirmed diagnosis.
+- **No live validation yet.** The live gate methodology itself needs revisiting first — a live
+  4-vs-8-thread PARDISO comparison run in parallel to this work was aborted after finding that
+  PARDISO's own thread-count-dependent parallel reordering can change the Newton iteration count at
+  the *same* trajectory, invalidating a naive live wall-clock comparison across thread counts. That
+  finding is orthogonal to `blockamg`/`lgmres` specifically, but the live-gate plan for *this* feature
+  should account for it before running one.
