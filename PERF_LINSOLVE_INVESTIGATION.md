@@ -219,6 +219,19 @@ has begun. Two cheap leads are now measured on the real model:**
   recorded as an open methodology gap affecting any live cross-thread-count comparison, not specific
   to `blockamg`/`lgmres` (whose own §23.7 validation deliberately used the deterministic offline
   harness instead, sidestepping this exact trap).
+  **23.9 (review + recommended sequencing, Fable — not yet executed):** net state after this round:
+  shipped default **1.22–1.27×** faster than pre-§23, `lgmres` a further **1.303×** offline on top
+  (~1.6× stacked), p-two-grid honestly at parity. §23.7's win conflates a *third* mechanism the
+  record missed — `lgmres` right-preconditions, so its stopping criterion has no
+  preconditioned-vs-true-residual gap, potentially retiring §20.2's continuation machinery on that
+  path. Recommended order: (1) the §23.6 live gate for the threaded SpMV (nothing else blocks
+  shipping it; doubles as the §20.2 re-baseline now that the `Job computation time` driver bug is
+  fixed — a taint note in §20.2's record flags that its historical live table predates the fix);
+  (2) the lgmres attribution ablation offline (continuation counts, `always_reset`, a
+  `newIncrement`-wired recycling reset targeting ord 00009's mechanism); (3) bookkeeping — §20.2
+  log audit, §22's own at-parity caveat, §8 method additions, and the two-branch consolidation
+  decision. Explicitly not next: more p-two-grid tuning, or any further offline config sweeps
+  before a live number lands.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -2237,6 +2250,35 @@ override at all) reproduce the identical trajectory (15/8/5/5, same three cutbac
 improvement (80.4s vs. 81.3s) is within this shared machine's normal run-to-run variance (§19.4), not a
 new effect — the conclusion below is unchanged by it.
 
+> **Taint note added later (review: Fable, after §23.7's driver fix).** §23.7's round found and
+> fixed a real driver bug (`inputfiledrivensimulation.py`, commit `aa3a6fde`): a step terminating
+> via `StepFailed` — which is exactly how the deliberate `maxNumInc` test cap ends a gated run —
+> had its own elapsed time silently excluded from `Job computation time`. Every number in the table
+> above was read from that counter on capped runs, **before** the fix. Whether these specific runs
+> under-counted needs a one-time audit against the preserved logs (`blockamg_live_202_*.log` etc.:
+> did they end via `StepFailed`, and how many steps preceded the capped one?). Two consequences,
+> stated carefully: (1) if affected, all rows under-counted *identically* (same trajectory, same
+> truncation point), so the relative ~3% spread and the parity *conclusion* likely survive; (2) the
+> **absolute** numbers do not — and this is a candidate mechanism for §21.0's never-reconciled
+> paradox (44 offline solves × ≥11.5 s ≫ 83.9 s whole-job). The audit may not fully close that gap
+> (a preload-only reading would be far *smaller* than 83.9 s — the arithmetic still doesn't
+> reconcile cleanly in either direction), so treat the absolute live numbers here as unverified
+> until the next live gate re-baselines them with the fixed driver, where `Job computation time`
+> and external wall can cross-check each other for the first time.
+>
+> **Resolved (§23.6/§23.9 step 1).** The audit landed: both preserved logs
+> (`blockamg_live_202_final.log`, `blockamg_live_202_step1.log`) contain exactly one `Step
+> computation time` print each — for the preload step only, well before the loading step's
+> `StepFailed` — and `Job computation time` equals that figure exactly in both. So it was in fact a
+> **preload-only** reading, not a partially-truncated one: the guess above ("far *smaller* than
+> 83.9s... doesn't reconcile cleanly") had the direction right but not the magnitude — the entire
+> 44-solve loading step contributed *zero*, not "less than it should have." §23.6 has the corrected,
+> cross-checked (`Job computation time` vs. external wall, <1% apart) re-baseline: PARDISO now reads
+> ~4% *faster* than the current blockamg default at fixed 16 threads, not at parity. Treat every
+> absolute number in the table above as superseded; the relative ~3% spread across blockamg's own
+> levers likely still holds (same truncation applied identically to every blockamg row), but the
+> blockamg-vs-PARDISO parity conclusion does not.
+
 **Every row is within ~3% of every other row.** This is the headline finding of Phase 5, and it cuts
 against the ~1.56× offline win §19.2 originally measured: on the *live* model, wall-clock is dominated
 by the fixed per-solve costs (assembly, AMR, MPC transforms, hierarchy builds) that neither
@@ -3928,8 +3970,61 @@ on the two directly-relevant cases — `CantileverBeamQuad4BlockAMG` (`testfiles
 the only testfile actually exercising `blockamg`) and `AMGCL` (`testfiles/marmot/`) — both **PASS**
 on xeon with §23.2's changes applied. (`GMCDPPlaneStrain3D` did not match the test-name filter in
 this run and was not investigated further — unrelated to this phase's changes; likely needs the
-private `CDP` material, per this workspace's own convention of not always having it cloned.) The
-live gate below is still outstanding.
+private `CDP` material, per this workspace's own convention of not always having it cloned.)
+
+**Live gate, executed (§23.9 step 1).** Three same-session arms on xeon, fixed
+`OMP_NUM_THREADS=MKL_NUM_THREADS=OPENBLAS_NUM_THREADS=16` throughout (§23.8's rule — also the exact
+thread count every historical §19.1/§20.2 number used, so this is a direct re-baseline, not just a
+same-day one), unmodified `blockamg.inp`, and — for the first time on a live run — the §23.7 driver
+fix to `Job computation time` (`inputfiledrivensimulation.py`, commit `aa3a6fde`) in effect:
+
+| arm | `Job computation time` | external wall (`run_bench.sh`) | trajectory |
+|---|---|---|---|
+| **NEW** — current `blockamg.py` (§23.2 threaded SpMV, shipped default) | 1051.44s | 1061.38s | 15/8/5/5, cutbacks `0.0025`/`0.00125`/`0.000625`, `U_loading=0.021875` |
+| **OLD** — pre-§23.2 `blockamg.py` (commit `68991d67`) | 1205.11s | 1214.91s | identical, byte-for-byte |
+| **PARDISO** (`pardiso_noreuse.inp`) | 1007.59s | 1017.43s | identical, byte-for-byte |
+
+All three trajectories diffed byte-identical (`diff -Z`, i.e. modulo trailing whitespace) after
+stripping line-number prefixes — per the standing protocol, an identical trajectory means no arm
+needed the reduced-increment retry.
+
+**This settles two separate things.**
+
+1. **§23.2's threaded SpMV wins live, at 1.145–1.146×** (NEW vs. OLD; `Job computation time` and
+   external wall agree to <0.1% on the ratio) — smaller than the offline ~1.22–1.27× (§23.5)
+   because live wall-clock also carries the AMR/assembly/MPC-transform/hierarchy-build cost the
+   SpMV fix never touched, exactly as anticipated. **Gate passed.** §23.2 ships as-is (already the
+   default; no further action).
+2. **The §20.2 taint note's re-baseline, and §21.0's "never-reconciled paradox," both close.** On
+   every arm here, `Job computation time` and external wall now cross-check to <1% — the first time
+   in this document those two numbers have agreed. Concretely for PARDISO: this run's own `linear
+   solve` accumulator reads 694.78s / 44 calls = 15.79s/solve (squarely inside the offline-verified
+   ≥11.5 s/solve range §21.0 couldn't reconcile against the old 83.9s figure), and the corrected
+   `Job computation time` of 1007.59s comfortably contains it (69%) alongside `mpc transform system
+   matrix` (119.0s), `assemble stiffness CSR` (6.3s), and `dirichlet K on CSR` (3.8s) — every bucket
+   now sums sanely. A direct audit of the preserved §20.2 logs (`blockamg_live_202_final.log`,
+   `blockamg_live_202_step1.log`) confirms the mechanism precisely: each log contains exactly *one*
+   `Step computation time` print — for the trivial 2-increment preload step, printed at line 187,
+   long before the loading step's `StepFailed` at line ~384 — and `Job computation time` at the end
+   equals that preload-only figure exactly (80.3638s / 81.7543s in the two logs, matching to the
+   4th decimal). The historical 83.9s-class numbers were never a whole-job figure; under the old
+   `except StepFailed:` branch, the entire 44-solve loading step's contribution was dropped, not
+   merely truncated — the total was *only* the preload step's cost.
+
+**Corrected parity reading (fixed 16 threads, same session, cross-checked twice over):**
+PARDISO now measures **~4% faster than the current (NEW) blockamg default** (1007.59s vs. 1051.44s
+on both metrics) and ~16% faster than the pre-§23.2 (OLD) default. This reverses the historical
+"blockamg at live parity with PARDISO" reading from §19.1/§20.2, which was built entirely on the
+preload-only metric — the corrected live picture is a modest PARDISO edge, not parity. This does
+not retroactively invalidate anything already shipped: §23.2's SpMV win over blockamg's own prior
+self (point 1 above) is real and metric-independent. It does change the framing for any future
+blockamg-vs-PARDISO strategic call, including how much weight `lgmres`'s stacked ~1.6× claim
+(§23.7, offline-relative to blockamg's *own* baseline, not to PARDISO) should carry in a "should we
+keep chasing blockamg" decision — that number is unaffected by this finding, but the case for
+displacing PARDISO now needs to clear a positive gap, not just hold parity.
+
+Record forward, per §21.0's own rule; the historical rows in §20.2's table are left as printed, with
+the taint note there now cross-referencing this section's resolution.
 
 ### Gotchas specific to this phase (beyond §8/§17/§19/§22)
 
@@ -4099,6 +4194,33 @@ problem, not a new failure mode specific to `lgmres`.
   finding is orthogonal to `blockamg`/`lgmres` specifically, but the live-gate plan for *this* feature
   should account for it before running one.
 
+**Review (Fable): a third conflated mechanism the bullets above miss, and it may be the biggest
+upside.** The comparison bundles not two effects but three: threading, Krylov recycling — and a
+**stopping-criterion change**. scipy's `gmres` stops on the *left-preconditioned* residual, the
+exact gap that forced §20.2's whole true-residual-continuation apparatus (geometric rtol
+tightening, up to 2 re-solves per call). AMGCL's `lgmres` **right-preconditions**, so the residual
+it monitors is essentially the true residual of the original system. Part of the per-ord iteration
+reduction may therefore be nothing more exotic than "stops exactly when actually converged, and
+never needs a continuation re-solve" — which is not a lesser win, it is a *structural* one: if it
+holds up, the §20.2 continuation machinery is dead code on this path, and the
+preconditioned-vs-true-residual gap that has haunted this document since §17 simply does not exist
+for this outer solver. Three cheap, offline follow-ups before any live work:
+
+1. **Record continuation counts per arm** in the next replay (the scipy arm's `cont=` is already
+   logged; count the lgmres arm's equivalent). If lgmres's is ~0 while scipy's is not, the
+   stopping-semantics effect is real and quantified almost for free.
+2. **The `always_reset=True` ablation** (already named above) then cleanly splits the remainder:
+   `always_reset=True` vs `False` isolates recycling; `True`-vs-scipy isolates
+   threading+stopping-semantics together.
+3. **The concrete ord-00009 fix candidate:** `blockamg` *already computes* a `newIncrement` signal
+   (the residual-jump heuristic, `blockamg.py`'s `_residualGrowthFactor`). Wire a per-call
+   `outer_v` reset to that existing signal — recycle *within* an increment's Newton sequence
+   (where consecutive Jacobians are genuinely similar, AMGCL's own intended use case for `K`),
+   reset *across* increments/cutbacks (where ord 00009's hypothesized stale-subspace mechanism
+   bites). This targets the regression's proposed cause directly, costs one boolean plumbed into
+   `solve()`, and is testable on the same 9-ord harness (ords span increments, so the harness
+   exercises the reset).
+
 ### 23.8 A live benchmark methodology finding — PARDISO's thread-count-dependent trajectory (aborted, not yet root-caused)
 
 While the plan was to benchmark PARDISO/`blockamg`/`blockamg`+p1 live across `OMP_NUM_THREADS ∈
@@ -4142,3 +4264,60 @@ is wanted again (for PARDISO, `blockamg`, or anything else), it needs either (a)
 Newton-trajectory verification step before trusting any wall-clock comparison from that run, or (b)
 restricting the comparison to a *fixed* thread count while varying only the solver/configuration
 under test, sidestepping the question entirely for now.
+
+### 23.9 Review of this round + recommended sequencing (review: Fable; step 1 executed, see below)
+
+**What this round settled.** The shipped `blockamg` default is **1.22–1.27× faster** than
+pre-§23, verified by the strongest instrument this investigation has used (same-process,
+order-swapped A/B — this should be the standard for every future before/after code comparison,
+worth adding to §8); the win's attribution was settled by a controlled three-way experiment rather
+than by arithmetic over disputed buckets — also a §8-worthy method lesson, since *both* prior
+reconciliation attempts (the round's own 19.9% and the review's inferred ~9.4%) turned out wrong
+while the controlled experiment was decisive. On top of that, opt-in `lgmres` measures **1.303×**
+offline over the already-threaded default — stacked, roughly **1.6× over the pre-§23 shipped
+default** — with the attribution caveats §23.7's review block records. p-two-grid sits honestly at
+parity (1.014× excluding the fragile ord) and stays what it is: validated, plumbed, opt-in
+infrastructure. Two background finds may outlast the headline numbers: the `Job computation time`
+driver bug (see the taint note now placed in §20.2's record) and §23.8's cross-thread-count
+trajectory confound.
+
+**Recommended order for the next round:**
+
+1. **✅ Executed — the §23.6 live gate for the threaded SpMV (§23.2).** Result: gate passed
+   (1.145–1.146×, trajectory-identical, no retry triggered), and the run doubled as the §20.2
+   re-baseline as intended — PARDISO now reads ~4% faster than the shipped blockamg default at
+   fixed 16 threads (not at parity), and the preload-only mechanism behind the old 83.9s-class
+   numbers is fully audited and closed. Bookkeeping debt 3(a) below is therefore also done. Full
+   writeup: §23.6, with the resolution cross-referenced from §20.2's taint note. Next round should
+   pick up at step 2.
+   <details><summary>Original recommendation (for the record)</summary>
+   Fixed thread count (per §23.8's own rule), external wall per §21.0, unmodified `blockamg.inp`,
+   trajectory-identical check. The regression testfiles already pass. With the driver fix landed,
+   `Job computation time` is trustworthy for the first time — record it *alongside* external wall
+   so the two can cross-check, and so this run doubles as the §20.2 re-baseline the taint note
+   asks for (a fresh PARDISO arm in the same session gives the corrected parity table in one
+   sitting).
+   </details>
+2. **The lgmres attribution ablation (§23.7's review block), offline, before lgmres faces any
+   live gate.** Continuation counts per arm + `always_reset` ablation + the `newIncrement`-wired
+   reset for the ord-00009 mechanism. This decides whether recycling earns its complexity and
+   whether the continuation machinery is dead code on this path — both of which change what
+   "ship lgmres" would even mean (default vs. opt-in, and how much of §20.2's apparatus it
+   retires).
+3. **Bookkeeping debts:** (a) ✅ done as part of step 1 above — the §20.2 log audit confirms both
+   preserved logs ended via `StepFailed` with the historical number equal to the preload step's
+   time alone; (b) verify §22's *own* record carries the
+   at-parity-on-the-new-baseline caveat (1.044× headline / ~1.014× excluding ord 00010), not just
+   §23.5's cross-reference; (c) §8 additions: same-process order-swapped A/B as the before/after
+   standard, the controlled-experiment-over-bucket-arithmetic lesson, the stale-instrumentation
+   trap (a census probe hard-wired to the old code path silently mismeasures after the code
+   changes — exactly how the retracted "bucket (h) bonus" was born), and the
+   `StepFailed`/`Job computation time` under-count; (d) the branch question: §23.7 lives on
+   `feat/amgcl-lgmres-outer-solver` while everything else is on `perf/linsolve-investigation`,
+   with a long unpushed history to `mn` on both — a deliberate consolidation decision (merge
+   order, what ships to `next_v26.11` first) is due before the history gets any longer.
+
+**Explicitly not recommended next:** more p-two-grid tuning (parked at §22.4-quater's stopping
+point, now at parity on a faster baseline — the honest reading is that §23's wins ate its margin);
+another config sweep of any kind before the live gate lands (offline margins are established;
+what's missing is live confirmation, not more offline decimals).
