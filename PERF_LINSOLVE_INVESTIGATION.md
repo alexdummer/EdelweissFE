@@ -193,6 +193,32 @@ has begun. Two cheap leads are now measured on the real model:**
   heavier step (a real pryout simulation, not an offline replay); a deliberate pause point pending
   that decision. The local `blockamg` regression testfiles (the plan's own regression net) should
   run before, not with, that live gate.
+  **23.7 (bucket (h), the largest remaining line, executed on branch `feat/amgcl-lgmres-outer-
+  solver`):** AMGCL's own native `amgcl::solver::lgmres` as a new opt-in `outerSolver` alternative to
+  scipy's `gmres`, bridged via a bare C function-pointer callback (`PyLGMRESPrecondT`/
+  `_lgmresPrecondApplyTrampoline`) since `lgmres`'s `Precond` parameter is a compile-time template,
+  not a runtime interface — implemented and offline-validated (built cleanly first attempt once
+  `xeon` was free): **`1.303×` aggregate** on the same 9-ord harness (`117.48s` vs. `153.07s`),
+  larger than 23.5's own SpMV-threading win, 8 of 9 ords faster with `lgmres` needing *fewer* outer
+  iterations than scipy on every one of those 8. One ord regresses (`00009`, `0.84×`, needing *more*
+  iterations — a plausible but unconfirmed mechanism: `always_reset=False`'s cross-solve Krylov
+  recycling carrying a harder ord's vectors into an easier one, pure overhead with no payoff). True
+  residuals systematically looser (`~2–5×`) than scipy's but still within tolerance on every ord —
+  the same character already found for p-two-grid. Not yet live-validated. Two safety fixes landed
+  alongside this (on both branches): a regression this work exposed — computing the P1 topology map
+  unconditionally for every solver (§22.5) crashed an unrelated model using a rigid-body-contact
+  discretization `buildP1Map` cannot classify — fixed by only computing it when a solver's new
+  `requestedP1FieldNames` attribute actually asks; and a real, independent driver-level bug
+  (`edelweissfe/drivers/inputfiledrivensimulation.py`) where a step failing via the deliberate
+  `maxNumInc` test cap silently excluded its own elapsed time from "Job computation time" (an
+  `except StepFailed:` branch skipping the accumulation line) — several of this session's own
+  live-gate wall-clock readings had unknowingly been reading only the trivial preload step's time.
+  **23.8:** a live cross-thread-count PARDISO benchmark was aborted after observing that 4 vs. 8
+  threads produced a *different* Newton-iteration trajectory on the nominally identical run — MKL
+  PARDISO's own thread-count-dependent parallel reordering is a plausible but unconfirmed mechanism;
+  recorded as an open methodology gap affecting any live cross-thread-count comparison, not specific
+  to `blockamg`/`lgmres` (whose own §23.7 validation deliberately used the deterministic offline
+  harness instead, sidestepping this exact trap).
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -4072,3 +4098,47 @@ problem, not a new failure mode specific to `lgmres`.
   the *same* trajectory, invalidating a naive live wall-clock comparison across thread counts. That
   finding is orthogonal to `blockamg`/`lgmres` specifically, but the live-gate plan for *this* feature
   should account for it before running one.
+
+### 23.8 A live benchmark methodology finding — PARDISO's thread-count-dependent trajectory (aborted, not yet root-caused)
+
+While the plan was to benchmark PARDISO/`blockamg`/`blockamg`+p1 live across `OMP_NUM_THREADS ∈
+{4, 8, 16, 32}`, Matthias observed that PARDISO at 4 threads and at 8 threads produced a *different*
+number of Newton iterations on the nominally identical trajectory — invalidating a naive live
+wall-clock comparison across thread counts before it got far enough to produce one. The benchmark
+was aborted immediately on that observation, not continued to see how far the divergence went.
+
+**What this session's own log inspection can and cannot confirm.** PARDISO×4 completed the full
+trajectory (`15/8/5/5` Newton iterations, matching the established reference exactly,
+`WALLCLOCK_SECONDS: 1867.299`). PARDISO×8 was killed mid-run before finishing; the truncated log
+shows it matching ×4 *up through the point it was killed* — preload (`1`/`1`), cutback to `0.0025`,
+converged in `15` (matching ×4's own first loading increment exactly), then a further cutback to
+`0.00125` (also matching the expected reference pattern) — but was terminated before reaching the
+next convergence check. **This session's own log does not itself capture the specific divergence
+Matthias observed**; it may have appeared later in ×8's trajectory than what survived being killed,
+or been visible in real-time terminal output not fully preserved in the log. Recorded honestly as
+an open gap, not papered over with a confident-sounding but unverified reconstruction.
+
+**A plausible mechanism, not a confirmed root cause.** MKL PARDISO's own parallel reordering/pivoting
+heuristics can depend on the thread count used, producing a slightly different (still valid)
+factorization and therefore slightly different floating-point roundoff — for a Newton iteration
+sitting close to a convergence-tolerance boundary, that could plausibly tip the iteration count by
+one in either direction. This would be a genuine property of MKL's own parallel PARDISO, not a bug
+in this session's benchmark scripts or in `blockamg`/`lgmres` — but it has not been isolated or
+confirmed here, only hypothesized.
+
+**Why this matters beyond just PARDISO.** Any *live* thread-count comparison for *any* solver in
+this investigation (not just PARDISO) is vulnerable to the same class of confound if that solver's
+own numerics are not bit-identical across thread counts — a live wall-clock number and a live
+Newton-iteration-count are only comparable across two runs if the runs are actually solving the same
+sequence of linear systems to convergence, and a trajectory divergence silently breaks that
+assumption without necessarily producing a NaN or a crash to signal it. §23.7's own `lgmres`
+validation deliberately avoided this exact trap by using the **offline** dumped-matrix harness
+(deterministic, fixed matrices, no thread-count-dependent solve-time numerics feeding back into
+which systems get solved next) rather than a live run across thread counts — the right call in
+hindsight, not merely a scheduling convenience.
+
+**Left as an explicit open item, not resolved this round:** if a live cross-thread-count benchmark
+is wanted again (for PARDISO, `blockamg`, or anything else), it needs either (a) a per-thread-count
+Newton-trajectory verification step before trusting any wall-clock comparison from that run, or (b)
+restricting the comparison to a *fixed* thread count while varying only the solver/configuration
+under test, sidestepping the question entirely for now.
