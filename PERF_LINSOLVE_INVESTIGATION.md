@@ -149,6 +149,18 @@ has begun. Two cheap leads are now measured on the real model:**
   much smaller margin than any earlier round. `p1Maps` stays opt-in-only; §22.5 still does not
   proceed. This finding's own lesson — instrumentation buckets are not trustworthy without an
   isolated cross-check — is the working method for whatever comes next.
+  **22.4-quater (closing this round)** isolates exactly where the 22.4-ter win comes from: a direct
+  per-call comparison shows p-two-grid's own preconditioner is 1.246× *more expensive* per call than
+  shipped's, almost exactly offset by needing 0.803× as many outer iterations (`3.96s` projected
+  precond-only cost either way) — the net win is entirely the outer-iteration reduction cascading
+  into the *shared* per-iteration overhead (full-system SpMV, GMRES bookkeeping, the untouched
+  "nonlocal damage" field), not a cheaper preconditioner. A fine-degree sweep (same methodology as
+  22.4-bis) found no further lever: outer iterations are flat across degree 3-8, and degrees 4-8 are
+  cost-tied (a fixed per-call floor, not a tunable trend). Real, substantial progress this round
+  (0.368× → 0.792× → 0.881× → **1.068×**), but the easy system-wide dials are now exhausted; closing
+  the remaining `~1.12×` gap would need per-ord iteration-count investigation (ord 00007 is the one
+  ord where p-two-grid needs *more* iterations than shipped) rather than another config sweep —
+  recorded as the phase's current stopping point.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -3416,6 +3428,65 @@ theorizing) would be re-examining the fine smoother's own configuration (`nu`, d
 22.4-bis did for the coarse level, plus checking whether an equivalent hidden-serial-cost pattern
 exists anywhere else in the hot path — this finding's own lesson is that instrumentation buckets
 should not be trusted at face value without an isolated cross-check.
+
+#### 22.4-quater — where the win actually comes from, and why fine-degree tuning has no more room (executed)
+
+Two follow-up measurements, both isolating the question precisely rather than continuing to tune
+by feel.
+
+**1. A direct, isolated per-call comparison** (ord 00002, `OMP_NUM_THREADS=16`): the shipped
+default's own `PyAMGCLSolver.applyPreconditioner` on the full (unmasked) displacement block, vs.
+`PTwoGridPreconditioner.applyPreconditioner`'s complete V-cycle (pre-smooth + coarse correction +
+post-smooth), both timed over 80 calls with random RHS vectors.
+
+| | per-call | outer iters | projected precond-only cost |
+|---|---|---|---|
+| shipped | 60.04ms | 66 | 3.96s |
+| p-two-grid | 74.81ms | 53 | 3.96s |
+
+**p-two-grid's own preconditioner is 1.246× *more expensive* per call than shipped's — and it is
+exactly offset by needing 0.803× as many outer iterations** (`1.246 × 0.803 ≈ 1.001`). The
+displacement field's own preconditioner cost is a *wash* between the two arms, to two decimal
+places, on this ord. This means **22.4-ter's aggregate win (0.881× → 1.068×) does not come from
+the preconditioner being cheaper** — it comes from the outer-iteration reduction cascading into
+savings on everything *outside* the preconditioner that scales with outer-iteration count: the
+full coupled-system SpMV, GMRES's own orthogonalization bookkeeping, and the "nonlocal damage"
+field's own (unmodified, identical-cost-on-both-arms) preconditioner apply. A genuinely different
+mechanism than every gain so far in this section, worth knowing explicitly before tuning further:
+shrinking `ptg`'s own cost from here is not fighting a wash anymore, it is a *net* lever, because
+the iteration-count side of the ledger has already banked its win through the shared overhead.
+
+**2. A fine-level degree sweep**, same methodology as 22.4-bis's coarse sweep, same single ord,
+full production path:
+
+| fine degree | outer iters | wall | fine | coarse |
+|---|---|---|---|---|
+| 3 | 53 | 21.81s | 6.76s | 2.92s |
+| 4 | 53 | 19.13s | 5.65s | 2.56s |
+| 5 (current default) | 53 | 19.27s | 5.60s | 2.69s |
+| 6 | 53 | 19.25s | 5.57s | 2.64s |
+| 8 | 53 | 19.24s | 5.58s | 2.68s |
+
+**No lever here, found rather than assumed.** Outer iterations are unchanged (53) across the whole
+range — unlike the coarse level, the fine smoother's degree does not visibly affect two-grid
+convergence in this range, so there is no quality-vs-cost tradeoff to navigate. But there is also
+no cost win: degrees 4-8 are statistically indistinguishable (19.13-19.27s, fine 5.57-5.65s) —
+noise-level differences, not a trend — and degree 3 is actually *slower* (21.81s), consistent with
+a fixed per-call floor (Python/Cython boundary crossing, `iterator_range` construction) that a
+lower polynomial degree cannot amortize away. The current default (5) is already on this flat
+plateau; there is nothing to gain by moving off it in either direction.
+
+**Net assessment:** the remaining `1.20/1.068 ≈ 1.12×` gap is not sitting in an easy, single,
+system-wide dial the way the coarse-level tuning and the hidden-matvec fix were. It is now
+distributed across per-ord iteration-count outcomes (00007 needs *more* outer iterations for
+p-two-grid than shipped, 57 vs. 53 — the one ord where the general pattern this section has
+reported throughout, "fewer outer iterations on every ord," does not hold) and whatever residual
+cost sits in the untouched "nonlocal damage" field / outer-GMRES bookkeeping share. Recorded here
+as a deliberate stopping point: real, substantial, honestly-measured progress this round
+(0.368× → 0.792× → 0.881× → **1.068×** across four sequential fixes), but the easy wins in this
+direction are exhausted — closing the rest would mean either accepting the phase's current state
+or a different kind of investigation (per-ord iteration-count sensitivity, or the shared
+outer-loop overhead) rather than another config sweep.
 
 ### 22.5 Live gate, plumbing, and ship decision
 
