@@ -1,5 +1,25 @@
 # Linear-solver performance investigation — handoff
 
+## Quick reference — read this first
+
+This document has grown long across many rounds; if you just need "what's actually shipped and
+what's still opt-in," this table is the answer. Everything below it is the detailed record —
+consult it for *why*, not to re-derive *what*.
+
+| Method | What it is | Status | Headline number | Where |
+|---|---|---|---|---|
+| **PARDISO** | Direct sparse LU factorize-and-solve (MKL) — exact, no iteration | The original baseline | ~4% faster than the shipped `blockamg` default, fixed 16 threads (§23.6, corrected metric) | default outside `blockamg`, no config |
+| **`blockamg`** | scipy `gmres` + a custom block-Gauss–Seidel preconditioner (one AMGCL AMG hierarchy per physical field) | **Shipped default** | — | `edelweissfe/linsolve/blockamg` |
+| **↳ threaded outer SpMV** (§23.2) | `blockamg`'s own inner matrix–vector product now runs OpenMP-threaded (all cores) instead of single-threaded scipy CSR | **Shipped**, live-gate-verified (§23.6) — this investigation's one delivered, proven win | **1.145–1.16× live**, 1.22–1.27× offline, vs. pre-fix `blockamg` | automatic, no config needed, already the default |
+| **p-two-grid** (`p1Maps`/`p1FieldNames`) | Swaps the per-field preconditioner for a genuine two-grid V-cycle (needs a corner/edge-midside topology map) | Opt-in, **parked at parity** (§22 series, §23.5) | ~1.01–1.04× vs. shipped, *combined with* the threaded SpMV above — not a real margin, not worth more tuning right now | opt-in via `p1FieldNames` in `blockamg.json`, never shipped as default |
+| **`lgmres`** | Swaps scipy's outer `gmres` loop for AMGCL's own native C++ GMRES variant, which also recycles Krylov search directions across separate Newton iterations instead of restarting from scratch | Opt-in, **offline-validated only, not live-gated, not yet attributed** (§23.7, task #29 pending) | **1.303×** faster than the (already-threaded) shipped default, offline — but bundles ≥3 distinct mechanisms not yet separated (native-code overhead removal, cross-iteration recycling, a different residual-check semantics); one ord regresses | opt-in via `outerSolver` in `blockamg.json` |
+
+**Net effect on what actually runs today, with zero config changes: `blockamg` is ~1.15× faster
+live than a year ago, on the same default it always shipped.** Everything else in the table is
+measured and recorded, sitting behind an opt-in flag nobody has to touch.
+
+---
+
 Branch `perf/linsolve-investigation`, based on `feat/amr-recovery-marker` (`d495e90b`).
 Working tree clean. **22 commits sit on top of `d83728ba`, all local — NOT pushed to `mn`.** xeon has
 the changed files rsynced into its working tree for the experiments (its git is untouched and behind);
