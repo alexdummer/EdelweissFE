@@ -327,6 +327,16 @@ class BlockAMGSolver(LinearSolver):
 
         return min(self._etaMax, max(self._etaMin, eta))
 
+    @property
+    def requestedP1FieldNames(self) -> frozenset:
+        """Overrides :meth:`~edelweissfe.linsolve.base.LinearSolver.requestedP1FieldNames` -- the
+        vector field names constructed with ``p1FieldNames``, still waiting for their actual topology
+        map via :meth:`setP1Maps`. Fields already supplied directly via the constructor's ``p1Maps``
+        (the offline-probe path, which never goes through the nonlinear solver's query in the first
+        place) are not included here -- there is nothing left to wait for.
+        """
+        return frozenset(self._p1FieldNamesRequested)
+
     def setFieldStructure(self, fields: list) -> None:
         """Receive the ordered field blocks of the DOF vector (in DOF order).
 
