@@ -72,20 +72,28 @@ has begun. Two cheap leads are now measured on the real model:**
   system size, since SciPy's SpGEMM must scan the left operand's full row range regardless of the
   right operand's sparsity. Ships as `useCachedMPCCondensation` (default `False`). D4 (the ≥1M-dof
   demonstration) remains the phase after.
-- **Phase 7 in progress** ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
+- **Phase 7 executed — hypothesis falsified, phase stopped at its own pre-committed gate**
+  ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
   **p-multigrid for the displacement block** — precondition the quadratic serendipity operator
-  through a Galerkin-projected P1 corner-node operator (`A₁ = PᵀA₂P`, `P` purely topological),
-  AMG on `A₁`, Chebyshev smoothing on the quadratic level. Rationale: SA-AMG is known to degrade
-  on quadratic elasticity, and the in-house evidence (3-level hierarchies, ~18× first-level
-  coarsening, `eps_strong` needing 0.01) fits that signature; this is the standard high-order
-  remedy (low-order preconditioning), chosen over a P1 *rediscretization* because the Galerkin
-  projection inherits the damaged tangent, contact penalties, and MPC condensation for free.
-  **22.1 (the enabler) is done**: the corner/midside topology map is built, validated (pytest +
-  live sanity checks: `P` shape, row sums, identity on corners), and committed — with a real,
-  unanticipated finding along the way (a small fraction of nodes at 2:1 non-conforming AMR
-  boundaries genuinely disagree between elements about their edge affiliation; resolved by falling
-  back to "corner", always safe for P1, with every fallback reported, not swallowed). 22.2-22.4
-  (the go/no-go probe, coupled validation, live gate) remain.
+  through a Galerkin-projected P1 corner-node operator (`A₁ = PᵀA₂P`, `P` purely topological), AMG
+  on `A₁`, Chebyshev smoothing on the quadratic level. Rationale: SA-AMG is known to degrade on
+  quadratic elasticity, and the in-house evidence (3-level hierarchies, ~18× first-level
+  coarsening, `eps_strong` needing 0.01) fit that signature. **22.1 (the enabler)** is done and
+  committed: the corner/midside topology map, validated (pytest + live sanity checks), with a
+  real finding along the way (a small fraction of nodes at 2:1 non-conforming AMR boundaries
+  genuinely disagree between elements about their edge affiliation; resolved by falling back to
+  "corner", always safe for P1, every fallback reported). **22.2 (the go/no-go probe) ran the
+  plan's own deciding diagnostic — `A₁`'s own AMG hierarchy is still shallow and steeply coarsened
+  (3 levels, 13-61× coarsening), the same pathology the full quadratic operator already showed.**
+  Per the plan's pre-committed criterion this falsifies the quadratic-discretization hypothesis:
+  the real obstacle is the contact-penalty/condensation structure (this operator is ~50%
+  non-symmetric) surviving the projection, not the element order. 22.3-22.4 not attempted — their
+  premise depends on 22.2 clearing the gate. Redirects future preconditioning effort toward
+  constraint-aware methods, not further AMG tuning. A separate, real finding surfaced along the
+  way: xeon's standard `OMP_NUM_THREADS`/`MKL_NUM_THREADS` run convention leaves numpy/scipy's
+  OpenBLAS pthreads pool (not MKL — confirmed) uncoordinated with AMGCL's OpenMP pool, ~32 total
+  threads rather than the intended 16 (not hardware oversubscription on this 36-core box, but a
+  violation of the "16 threads total" assumption every run command here has made).
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -2680,6 +2688,105 @@ penalty/Woodbury idea from the Phase-7 discussion), not to more AMG tuning.
 **Gate:** best two-grid arm beats the production default on the isolated block by **≥20%
 projected-threaded wall** (and no worse measured-serial than the §17 tuned arm), with iteration
 count materially below 96. Otherwise record and stop.
+
+**22.2 — executed. The deciding diagnostic falsifies the hypothesis; the phase stops here, per
+the plan's own pre-committed criterion.**
+
+**Setup, verified working:** `probe_222_pmultigrid.py` (xeon, investigation dir, ad hoc, not
+checked in) builds `P` from §22.1's dump, projects `A₁ = Pᵀ Asₘ P` (see the Dirichlet-masking note
+below for `Asₘ`), and wraps both single-level AMGCL (the two reference arms) and the two-grid
+scheme as a one-application-per-outer-iteration `M` inside `scipy.sparse.linalg.gmres` — never
+AMGCL's own `.solve()`, per §20.1's rule. Reference arms reproduce the expected ballpark (111/77
+total iterations vs. the `.solve()`-based `probe_201_block_isolated_v2.log`'s 96/51 — different
+Krylov implementations wrapping the *same* preconditioner, so a different but comparable iteration
+count is expected, not a red flag).
+
+**Two real bugs in the probe script itself, both fixed before trusting any number it produced:**
+
+1. **`scipy.sparse.linalg.gmres`'s `maxiter` counts restart cycles, not total inner iterations**,
+   whenever no `callback` function is supplied (`callback_type` alone, without `callback`, has
+   *no effect* per SciPy's own docs — an earlier draft of this probe relied on exactly that
+   no-op). With `restart=100`, the first version's `maxiter=500` silently requested up to **50,000**
+   total preconditioner applications, not 500 — the reason the very first sweep attempt ran for
+   23+ minutes without finishing even one arm. Fixed by expressing the intended ~150-200 total
+   iteration cap as `maxiter=2` restart cycles.
+2. **Dirichlet identity rows do not Galerkin-project cleanly through a non-trivial `P`** — verified
+   live: 24160 of 214659 displacement rows on this block are pure Dirichlet identity rows
+   (`nnz==1`, on-diagonal, value exactly 1.0), and 15408 of those are at *midside* nodes, so
+   `Pᵀ(identity row)P` spreads a spurious ½-weighted entry across the two corner rows/columns
+   instead of preserving the constraint — corrupting `A₁` (every two-grid arm stalled at
+   `true_res` ≈ 1.0 in the first working sweep). The plan's own text names this exact gotcha
+   ("mask Dirichlet rows/columns of `As₂` before projecting") but a first masking attempt
+   (`Mfree @ As @ Mfree`, zeroing both rows *and* columns via a single diagonal similarity
+   transform) also zeroed the *diagonal* at Dirichlet positions — a Dirichlet dof's own diagonal
+   entry `(i,i)` lies in both its masked row and its masked column — producing a singular `A₁`
+   (1538 exactly-zero diagonal entries, all traced to Dirichlet corners, which project 1:1 through
+   `P`). Fixed by masking off-diagonal coupling only, preserving the diagonal explicitly:
+   `Mfree @ (As - diag(As)) @ Mfree + diag(As)`. Verified on a tiny synthetic example locally
+   before re-running on xeon, and confirmed the shallow-hierarchy finding below is *not* an
+   artifact of this masking (the unmasked `A₁` gives the same 3-level, steep-coarsening pathology,
+   just with additionally-pathological negative diagonal entries from the unmasked smearing).
+
+**The fine Chebyshev smoother also diverges standalone** (17-80× residual growth over 3 sweeps,
+isolated from any coarse correction) — traced to `As` (the isolated, equilibrated displacement
+block) being genuinely **~50% non-symmetric** (`‖A - Aᵀ‖/‖A‖ ≈ 0.50`, matching this document's
+earlier-documented condensed-elasticity asymmetry, §13/§17), which a naive power-iteration-based
+Chebyshev semi-iteration (designed for SPD spectra) is not built for — confirmed the spectral
+*radius* estimate itself is not the problem (ARPACK's Arnoldi-based `eigs` gives 6.46-7.09, close
+to the power iteration's 6.65), so this is departure-from-normality, not a bad bound. AMGCL's own
+internal "chebyshev" relax type, used *inside* a full SA-AMG V-cycle rather than standalone,
+evidently tolerates this operator (the single-level reference arms converge fine) — a hand-rolled,
+standalone Chebyshev sweep with no coarse partner does not. **This was not pursued to a full fix**,
+because the diagnostic below settles the phase's actual question before it matters.
+
+**The deciding diagnostic (`report()` on `A₁`'s hierarchy) — falsified.** Both tested coarsening
+configs give a **shallow, steeply-coarsened hierarchy**, not the "4+ levels, ~3-4× coarsening"
+the hypothesis predicted:
+
+| coarsening config | levels | coarsening ratios | operator complexity |
+|---|---|---|---|
+| shipped default (SA, no `eps_strong` override) | 3 | 79167 → 5962 (13.3×) → 304 (19.6×) | 1.19 |
+| §17 tuned (`eps_strong=0.01`, degree 8) | 2 | 79167 → 1303 (60.8×) | 1.01 |
+| *(unmasked `A₁`, sanity cross-check)* | 3 | 79167 → 4423 (17.9×) → 175 (25.3×) | 1.14 |
+
+This is essentially the **same** shallow/degenerate pathology the *full* quadratic operator
+already showed (§17 A2's 3-level/18× hierarchy) — the P1 projection does not rescue AMG's
+behavior. Per the plan's own pre-committed criterion, **the quadratic-discretization hypothesis is
+falsified**: the quadratic serendipity discretization was not, on its own, the root cause of the
+displacement-block AMG weakness this document has been fighting since §12. The real obstacle
+survives the projection — almost certainly the contact-penalty/condensation structure (the same
+~50% non-symmetry that broke the fine smoother above is a direct symptom of that structure), not
+the element order.
+
+**Phase stops here, exactly as the plan's own text directs on this outcome.** 22.3 (coupled offline
+validation) and 22.4 (live gate, NIST plumbing, ship decision) are **not attempted** — their entire
+premise (a two-grid scheme worth validating end-to-end) depends on 22.2 clearing the go/no-go, which
+it does not. This redirects future preconditioning effort toward constraint-aware methods (the
+low-rank penalty/Woodbury idea named in the Phase 7 discussion) rather than further AMG tuning on
+this operator class. The §22.1 enabler (the P1 topology map itself, its two real bugs, and its
+regression tests) remains committed and correct regardless — it is generically useful
+infrastructure for any future low-order-preconditioning attempt, independent of this specific
+two-grid construction's fate.
+
+**A separate, real finding surfaced along the way, unrelated to the hypothesis test itself:**
+`OMP_NUM_THREADS`/`MKL_NUM_THREADS` (this whole investigation's standard env-var convention) leaves
+a **second, uncoordinated thread pool** active throughout every run on xeon. `numpy`/`scipy` here
+are linked against OpenBLAS's pthreads build (`libopenblasp*.so`), not MKL (`numpy.show_config()`
+confirms generic BLAS/LAPACK, not MKL) — so `MKL_NUM_THREADS` has been a no-op for the whole
+investigation's numpy/scipy calls. AMGCL's compiled extension links `libgomp` (GNU OpenMP) and
+correctly respects `OMP_NUM_THREADS`, but OpenBLAS's pthreads pool is a separate runtime that does
+not share that budget; both were observed sizing themselves to roughly 16 independently, live on
+this exact probe's process (`Threads: 31`, split into two groups by accumulated CPU time),
+totaling ~32 OS threads on this 36-core, 2-socket, no-hyperthreading machine — not hardware
+oversubscription, but a real violation of the "16 threads total" mental model every run command in
+this document has assumed. Explicitly setting `OPENBLAS_NUM_THREADS=16` alongside the existing
+vars does not change the total (OpenBLAS was already landing near 16 via its own heuristic), since
+the two pools are structurally independent regardless of either variable's value — a genuine fix
+would mean deliberately splitting the 16-thread budget between the two runtimes (e.g. `OMP_NUM_THREADS=8`
++ `OPENBLAS_NUM_THREADS=8`) if a true combined cap of 16 is wanted, or accepting 32 as intentional
+on a 36-core box. Recorded here for whoever revisits xeon's run-command conventions; not otherwise
+acted on in this phase (same-session relative comparisons throughout this document are unaffected,
+since all arms in a given probe are subject to the same oversubscription equally).
 
 ### 22.3 Coupled offline validation (production code path, all 9 ords)
 
