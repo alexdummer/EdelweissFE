@@ -509,7 +509,11 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
             for record in mpc.getMultiPointConstraints(self.theDofManager)
         ]
 
-        transformation = MultiPointConstraintTransformation(records, self.theDofManager.nDof)
+        transformation = MultiPointConstraintTransformation(
+            records,
+            self.theDofManager.nDof,
+            useCachedCondensation=self.options.get("useCachedMPCCondensation", False),
+        )
 
         self.journal.message(
             "eliminating {:} slave DOF(s) via multi-point constraints".format(transformation.nEliminatedDof),

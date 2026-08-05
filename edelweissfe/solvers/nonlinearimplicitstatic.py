@@ -128,6 +128,20 @@ class NISTSchema:
         dtype=bool,
         default=True,
     )
+    useCachedMPCCondensation: bool | None = schemaField(
+        description=(
+            "Condense the multi-point-constraint system matrix as a cached-pattern value scatter "
+            "(§21.2 B2) instead of the direct T^T K T + C expression. Correctness-equivalent "
+            "(validated on the full test suites plus a live 280k-dof contact+AMR+tie model, "
+            "byte-for-byte trajectory match) but measured slower on that same model -- the "
+            "SpGEMMs it restricts to the eliminated DOFs' rows still cost proportional to the "
+            "full system size, not to the (typically much smaller) number of eliminated DOFs. "
+            "Off by default until that asymmetry is addressed or a model is found where it wins; "
+            "exists as an opt-in for experimentation."
+        ),
+        dtype=bool,
+        default=False,
+    )
 
 
 class NIST(NonlinearSolverBase):
@@ -156,6 +170,7 @@ class NIST(NonlinearSolverBase):
         "linsolver": "pardiso",
         "linsolverConfigFile": "",
         "pruneCondensedMatrixZeros": True,
+        "useCachedMPCCondensation": False,
     }
 
     def __init__(self, jobInfo, journal, **kwargs):
