@@ -3897,6 +3897,14 @@ the existing `blockamg` testfiles must pass unchanged — they are the regressio
 fail at any gate: record the table and the mechanism, revert nothing blindly — a per-bucket win
 that fails the aggregate gate is still knowledge, and the census table stays either way.
 
+**Regression testfiles run before, not with, the live gate (per review):** `run_tests_edelweissfe`
+on the two directly-relevant cases — `CantileverBeamQuad4BlockAMG` (`testfiles/edelweiss-only/`,
+the only testfile actually exercising `blockamg`) and `AMGCL` (`testfiles/marmot/`) — both **PASS**
+on xeon with §23.2's changes applied. (`GMCDPPlaneStrain3D` did not match the test-name filter in
+this run and was not investigated further — unrelated to this phase's changes; likely needs the
+private `CDP` material, per this workspace's own convention of not always having it cloned.) The
+live gate below is still outstanding.
+
 ### Gotchas specific to this phase (beyond §8/§17/§19/§22)
 
 - **§22.4's ADL/`crs_tuple` trap** applies to any new class touching AMGCL relaxation/backend
