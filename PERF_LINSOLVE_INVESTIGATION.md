@@ -72,7 +72,8 @@ has begun. Two cheap leads are now measured on the real model:**
   system size, since SciPy's SpGEMM must scan the left operand's full row range regardless of the
   right operand's sparsity. Ships as `useCachedMPCCondensation` (default `False`). D4 (the ≥1M-dof
   demonstration) remains the phase after.
-- **Phase 7 in progress — 22.2's "falsified" verdict retracted by 22.2-bis; the phase resumes**
+- **Phase 7 in progress — 22.2's "falsified" verdict retracted by 22.2-bis, then 22.3 found the
+  real blocker: a serial fine smoother, not the algorithm**
   ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
   **p-multigrid for the displacement block** — precondition the quadratic serendipity operator
   through a Galerkin-projected P1 corner-node operator (`A₁ = PᵀA₂P`, `P` purely topological), AMG
@@ -93,9 +94,20 @@ has begun. Two cheap leads are now measured on the real model:**
   expected — this document's own §17 A2 data (a 3-level/~18× hierarchy delivering the phase's
   headline 29-iteration win) already proved that, unused at the time. Also found and fixed: SciPy's
   `gmres` `maxiter` counts restart cycles without a `callback`, not total iterations (also in §8
-  now) — a probe requesting a ~500-iteration cap had silently asked for up to 50,000. Proceeding
-  into 22.3 (coupled offline validation) and 22.4 (live gate, plumbing, ship decision) next. A
-  separate, real finding surfaced along the way, unrelated to the hypothesis test: xeon's standard
+  now) — a probe requesting a ~500-iteration cap had silently asked for up to 50,000.
+  **22.3 (coupled offline validation, all 9 ords, via a new opt-in `p1Maps` option on
+  `BlockAMGSolver` and a new `PTwoGridPreconditioner` matching AMGCL's own build/apply interface)
+  confirms the algorithm and finds the real blocker.** Outer GMRES iterations drop on every single
+  ord (e.g. 66→50, 164→121) — the p-multigrid win is real and consistent — but wall-clock is
+  **2.7× worse aggregate** (0.368×, nowhere near the required ≥1.20×), because the serial
+  hand-rolled Chebyshev fine smoother is **81% of the preconditioner's own time** on every ord, far
+  past the 15% threshold this section's own text pre-committed as the line for shipping the simple
+  version. Bar fails; per the plan's own instruction on this outcome, `p1Maps` stays opt-in-only,
+  not shipped as any default, and §22.4 (NIST plumbing, live gate, ship-as-default) does not
+  proceed until a threaded fine-smoother apply exists — a concrete, scoped follow-up
+  (`relaxation::as_preconditioner` in the AMGCL wrapper, or a `prange` Cython SpMV fallback; the
+  fine smoother needs roughly a 5-6× speedup to clear the bar). A separate, real finding surfaced
+  along the way, unrelated to the hypothesis test: xeon's standard
   `OMP_NUM_THREADS`/`MKL_NUM_THREADS` run convention leaves numpy/scipy's OpenBLAS pthreads pool
   (not MKL — confirmed) uncoordinated with AMGCL's OpenMP pool, ~32 total threads rather than the
   intended 16 (not hardware oversubscription on this 36-core box, but a violation of the "16
@@ -2997,6 +3009,82 @@ AMGCL wrapper with a standalone relaxation-as-preconditioner entry point
 other AMGCL kernel. A `prange` Cython SpMV is the fallback. Decide by measuring the serial
 version's share first — if fine smoothing is <15% of a coupled solve, ship the simple version and
 record the deferred optimization.
+
+**22.3 — executed. The bar fails on wall-clock, decisively and for the exact reason this
+section's own text anticipated — the serial fine smoother, not the algorithm.**
+
+**Implementation.** `edelweissfe/linsolve/blockamg/ptwogrid.py` — `PTwoGridPreconditioner`,
+matching `PyAMGCLSolver`'s `build()`/`applyPreconditioner()` call shape closely enough to slot
+into `BlockAMGSolver`'s existing per-field sweep (`sweepOnce`) with **zero change** to the sweep
+itself. `blockamg.py` gained one new constructor option, `p1Maps: dict[str, tuple]` (field name →
+`(isCorner, edgeEndpoints)`) — a field's map being present *is* the opt-in, mirroring
+`fieldPreconds`'s own by-presence convention; for this offline step the map is injected directly
+(`probe_223_coupled_ptwogrid.py`, xeon, investigation dir, ad hoc, not checked in) rather than
+through NIST plumbing (§22.4). `PTwoGridPreconditioner.build()` reconstructs §22.2-bis R2's
+free-submatrix construction fresh from whatever diagonal block `BlockAMGSolver` hands it (Dirichlet
+rows identified from the block's own structure, not assumed), using R1/R2's winning configuration
+(coarse: `eps_strong=0.01`, chebyshev degree 8, npre=npost=2, translations nullspace on the
+free-corner space; fine: `ν=1`, chebyshev degree 5).
+
+**Sanity-checked end-to-end first** (a single ord, both arms) before committing to the full
+9-ord replay: correct, no crashes, no NaN — and immediately informative: fewer outer iterations
+(50 vs. 66) but a *slower* solve (55.98s vs. 21.43s), the opposite of R2's isolated 2.30× win.
+Added fine/coarse timing to `PTwoGridPreconditioner` (`fineSeconds`/`coarseSeconds`/`applyCalls`)
+before going further, per this section's own instruction to measure the serial smoother's share
+rather than assume it.
+
+**Full 9-ord replay** (shipped default vs. p-two-grid, both with the shipped EW forcing +
+true-residual stopping behaviour, unchanged, same session):
+
+| ord | shipped iters | p-two-grid iters | shipped wall | p-two-grid wall | "speedup" |
+|---|---|---|---|---|---|
+| 00002 | 66 | 50 | 22.62s | 56.75s | 0.40× |
+| 00003 | 164 | 121 | 47.28s | 122.63s | 0.39× |
+| 00004 | 62 | 53 | 22.04s | 59.03s | 0.37× |
+| 00005 | 51 | 46 | 18.41s | 51.00s | 0.36× |
+| 00006 | 55 | 51 | 19.75s | 55.25s | 0.36× |
+| 00007 | 53 | 54 | 18.90s | 57.95s | 0.33× |
+| 00008 | 54 | 49 | 19.13s | 53.53s | 0.36× |
+| 00009 | 23 | 20 | 10.60s | 25.64s | 0.41× |
+| 00010 | 50 | 45 | 16.94s | 49.77s | 0.34× |
+| **TOTAL** | | | **195.67s** | **531.54s** | **0.368×** |
+
+**The outer-iteration reduction is real and consistent** — the p-two-grid needs fewer outer GMRES
+iterations than the shipped single-level default on **every single ord** (8 of 9 strictly fewer,
+one essentially tied: 53 vs. 54 on ord 00007), the same direction R1/R2 already found offline.
+**The wall-clock is uniformly worse anyway** — 2.4-3.0× slower, not faster, on every ord, because
+the fine Chebyshev smoother's cost swamps the iteration win: measured fine/coarse split, stable
+across every ord, **fine smoothing is 81.1-81.6% of the p-two-grid preconditioner's own apply
+time**, and 66.6-81.1% of the *entire solve's* wall-clock. This is the exact mechanism this
+section's own text flagged as a risk ("the probe's serial scipy Chebyshev is a stand-in") and the
+exact decision rule it pre-committed to ("if fine smoothing is <15% of a coupled solve, ship the
+simple version") — at 81%, nowhere near 15%, that decision rule's answer is unambiguous: **do not
+ship the serial-smoother version; a threaded fine-smoother apply is a prerequisite, not an optional
+follow-on.**
+
+**True residuals: within the requested tolerance either way, but genuinely looser on two ords.**
+Both arms converge below their requested `eta` (`3e-4` or, after a continuation, `1e-6`) on every
+ord — neither arm fails to converge to what was asked. But the p-two-grid's true residual is
+2.0-2.3× the shipped default's on ords 00002/00003 specifically (`1.52e-05` vs. `6.53e-06`;
+`1.80e-08` vs. `8.92e-09`), mildly looser (1.1-1.5×) on most others, and marginally *tighter* on
+one (`00009`). Not a correctness failure (both are far below the requested tolerance in absolute
+terms), but the bar's literal wording ("true residuals no looser than the shipped default's") is
+not met on every ord either — recorded honestly, not waved through.
+
+**Bar: fails.** Aggregate wall-clock is **0.368×** (a 2.7× *regression*, not the required ≥1.20×
+speedup); the worst single-ord ratio is 0.326× (nowhere near the "no ord past ~1.05×" allowance);
+true residuals are measurably looser on 2 of 9 ords. Per this section's own instruction on this
+outcome ("record the table and the mechanism, default untouched"): **`p1Maps` stays a correctly-
+implemented, tested, opt-in-only mechanism — not shipped as any default, and §22.4's live gate /
+NIST plumbing / ship-as-default steps do not proceed** until a threaded fine-smoother apply exists
+to close this specific, now precisely-quantified gap. The underlying p-multigrid *algorithm*
+remains validated (R1's 26 iterations on `A₁` alone, R2's 2.30× win in isolation, and now this
+section's consistent iteration-count reduction on every real coupled ord) — what is missing is
+solely an OpenMP-threaded fine-smoother apply, exactly the deferred-optimization path this
+section's text already named (`relaxation::as_preconditioner` in the AMGCL wrapper, or a `prange`
+Cython SpMV fallback), now with a hard number attached: **the fine smoother needs roughly a 5-6×
+speedup (81% ÷ 15%, very roughly) before this clears its own bar** — a concrete target for that
+follow-up work, not an open-ended "make it faster."
 
 ### 22.4 Live gate, plumbing, and ship decision
 
