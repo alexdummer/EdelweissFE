@@ -72,28 +72,34 @@ has begun. Two cheap leads are now measured on the real model:**
   system size, since SciPy's SpGEMM must scan the left operand's full row range regardless of the
   right operand's sparsity. Ships as `useCachedMPCCondensation` (default `False`). D4 (the ≥1M-dof
   demonstration) remains the phase after.
-- **Phase 7 executed — hypothesis falsified, phase stopped at its own pre-committed gate**
+- **Phase 7 in progress — 22.2's "falsified" verdict retracted by 22.2-bis; the phase resumes**
   ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
   **p-multigrid for the displacement block** — precondition the quadratic serendipity operator
   through a Galerkin-projected P1 corner-node operator (`A₁ = PᵀA₂P`, `P` purely topological), AMG
-  on `A₁`, Chebyshev smoothing on the quadratic level. Rationale: SA-AMG is known to degrade on
-  quadratic elasticity, and the in-house evidence (3-level hierarchies, ~18× first-level
-  coarsening, `eps_strong` needing 0.01) fit that signature. **22.1 (the enabler)** is done and
-  committed: the corner/midside topology map, validated (pytest + live sanity checks), with a
-  real finding along the way (a small fraction of nodes at 2:1 non-conforming AMR boundaries
-  genuinely disagree between elements about their edge affiliation; resolved by falling back to
-  "corner", always safe for P1, every fallback reported). **22.2 (the go/no-go probe) ran the
-  plan's own deciding diagnostic — `A₁`'s own AMG hierarchy is still shallow and steeply coarsened
-  (3 levels, 13-61× coarsening), the same pathology the full quadratic operator already showed.**
-  Per the plan's pre-committed criterion this falsifies the quadratic-discretization hypothesis:
-  the real obstacle is the contact-penalty/condensation structure (this operator is ~50%
-  non-symmetric) surviving the projection, not the element order. 22.3-22.4 not attempted — their
-  premise depends on 22.2 clearing the gate. Redirects future preconditioning effort toward
-  constraint-aware methods, not further AMG tuning. A separate, real finding surfaced along the
-  way: xeon's standard `OMP_NUM_THREADS`/`MKL_NUM_THREADS` run convention leaves numpy/scipy's
-  OpenBLAS pthreads pool (not MKL — confirmed) uncoordinated with AMGCL's OpenMP pool, ~32 total
-  threads rather than the intended 16 (not hardware oversubscription on this 36-core box, but a
-  violation of the "16 threads total" assumption every run command here has made).
+  on `A₁`, Chebyshev smoothing on the quadratic level. **22.1 (the enabler)** is done and committed:
+  the corner/midside topology map, validated, with a real AMR-boundary finding resolved along the
+  way (falls back to "corner", always safe for P1, every fallback reported). **22.2 (the go/no-go
+  probe) reported the hypothesis falsified**, on a hierarchy-*shape* diagnostic and a fine smoother
+  run on the Dirichlet-unmasked operator. **22.2-bis re-ran it with the right instrument and
+  retracts that verdict**: `A₁` solved directly with AMG-preconditioned GMRES converges in **26
+  iterations** (well under the ≤40 overturn threshold), and a two-grid scheme built with §17 B1's
+  actual Dirichlet-free-submatrix construction on the fine level clears the original gate outright
+  — **58 iterations vs. a 111-iteration single-level reference, a 2.30× projected-threaded
+  speedup**. The asymmetry story is closed too: 22.2's alarming ~50% figure was the unmasked
+  block; masked/free, it is 0.56-0.58%, matching §17 A1 almost exactly — never physics, always a
+  Dirichlet-elimination storage artifact. Root cause of the miscalibration, now recorded in §8 so
+  it cannot fire again: **smoothed aggregation's aggressive per-level coarsening (10-30×, few
+  levels) is healthy by design**, not the classical-AMG "4+ levels, ~3-4×" this gate wrongly
+  expected — this document's own §17 A2 data (a 3-level/~18× hierarchy delivering the phase's
+  headline 29-iteration win) already proved that, unused at the time. Also found and fixed: SciPy's
+  `gmres` `maxiter` counts restart cycles without a `callback`, not total iterations (also in §8
+  now) — a probe requesting a ~500-iteration cap had silently asked for up to 50,000. Proceeding
+  into 22.3 (coupled offline validation) and 22.4 (live gate, plumbing, ship decision) next. A
+  separate, real finding surfaced along the way, unrelated to the hypothesis test: xeon's standard
+  `OMP_NUM_THREADS`/`MKL_NUM_THREADS` run convention leaves numpy/scipy's OpenBLAS pthreads pool
+  (not MKL — confirmed) uncoordinated with AMGCL's OpenMP pool, ~32 total threads rather than the
+  intended 16 (not hardware oversubscription on this 36-core box, but a violation of the "16
+  threads total" assumption every run command here has made).
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -556,6 +562,21 @@ it does not care whether the pattern is stable.
 - **Benchmark the tolerance the application actually needs.** §3.6.
 - **AMGCL ignores unknown parameter keys** with only a warning on stderr, then silently uses its
   default. Check its stderr when a configuration behaves unexpectedly.
+- **Smoothed aggregation's per-level coarsening is aggressive by design — do not judge an SA
+  hierarchy by its shape.** "4+ levels, ~3-4× coarsening" is a classical-AMG/geometric-multigrid
+  expectation; SA aggregates whole strongly-connected neighborhoods, so few levels with ~10-30×
+  coarsening and operator complexity ~1.1-1.3 is *healthy*, not pathological (§17 A2's own
+  headline 29-iteration result ran on a 3-level, ~18×-coarsened hierarchy). §22.2 misapplied the
+  classical-AMG ruler to an SA hierarchy and drew a false "falsified" verdict from it — see §22.2-bis.
+  Judge an SA hierarchy by preconditioned convergence on its own operator, never by level count or
+  coarsening ratio alone.
+- **`scipy.sparse.linalg.gmres`'s `maxiter` counts restart cycles, not total inner iterations**,
+  whenever no `callback` function is supplied — `callback_type` alone, without an actual
+  `callback`, has *no effect* (per SciPy's own docstring). With `restart=100`, a probe intending a
+  ~500-iteration cap that instead passes `maxiter=500` silently asks for up to 50,000 total
+  preconditioner applications (§22.2). State the intended total iteration budget as
+  `maxiter = ceil(budget / restart)` explicitly, and sanity-check a probe's first arm finishes in
+  a plausible time before trusting a long queue of them.
 
 ---
 
@@ -2739,6 +2760,15 @@ evidently tolerates this operator (the single-level reference arms converge fine
 standalone Chebyshev sweep with no coarse partner does not. **This was not pursued to a full fix**,
 because the diagnostic below settles the phase's actual question before it matters.
 
+> **Retracted by §22.2-bis, below.** The "deciding diagnostic" applied here (hierarchy *shape*)
+> was the wrong instrument — smoothed aggregation's per-level coarsening is aggressive by design,
+> and this document's own §17 A2 data already showed a 3-level/~18×-coarsened hierarchy delivering
+> the phase's headline 29-iteration success. §22.2-bis reran the actual decisive measurement
+> (preconditioned convergence on `A₁` itself) and it is unambiguously AMG-friendly (26 iterations);
+> a two-grid scheme built with §17 B1's Dirichlet-handling on the fine level clears the original
+> ≥20% gate with a 2.30× margin. Kept below verbatim as the record of what went wrong and why —
+> see §22.2-bis for the corrected result and the retraction in full.
+
 **The deciding diagnostic (`report()` on `A₁`'s hierarchy) — falsified.** Both tested coarsening
 configs give a **shallow, steeply-coarsened hierarchy**, not the "4+ levels, ~3-4× coarsening"
 the hypothesis predicted:
@@ -2758,15 +2788,16 @@ survives the projection — almost certainly the contact-penalty/condensation st
 ~50% non-symmetry that broke the fine smoother above is a direct symptom of that structure), not
 the element order.
 
-**Phase stops here, exactly as the plan's own text directs on this outcome.** 22.3 (coupled offline
-validation) and 22.4 (live gate, NIST plumbing, ship decision) are **not attempted** — their entire
+~~Phase stops here, exactly as the plan's own text directs on this outcome. 22.3 (coupled offline
+validation) and 22.4 (live gate, NIST plumbing, ship decision) are not attempted — their entire
 premise (a two-grid scheme worth validating end-to-end) depends on 22.2 clearing the go/no-go, which
 it does not. This redirects future preconditioning effort toward constraint-aware methods (the
 low-rank penalty/Woodbury idea named in the Phase 7 discussion) rather than further AMG tuning on
-this operator class. The §22.1 enabler (the P1 topology map itself, its two real bugs, and its
-regression tests) remains committed and correct regardless — it is generically useful
-infrastructure for any future low-order-preconditioning attempt, independent of this specific
-two-grid construction's fate.
+this operator class.~~ **Retracted — see §22.2-bis.** The go/no-go call above rested on a
+miscalibrated shape-based diagnostic and a fine smoother tested without §17 B1's Dirichlet
+handling; corrected, the phase clears its own gate and continues into 22.3/22.4. The §22.1 enabler
+(the P1 topology map itself, its two real bugs, and its regression tests) remains committed and
+correct throughout — it is the infrastructure both the retracted and the corrected result depend on.
 
 **A separate, real finding surfaced along the way, unrelated to the hypothesis test itself:**
 `OMP_NUM_THREADS`/`MKL_NUM_THREADS` (this whole investigation's standard env-var convention) leaves
@@ -2787,6 +2818,162 @@ would mean deliberately splitting the 16-thread budget between the two runtimes 
 on a 36-core box. Recorded here for whoever revisits xeon's run-command conventions; not otherwise
 acted on in this phase (same-session relative comparisons throughout this document are unaffected,
 since all arms in a given probe are subject to the same oversubscription equally).
+
+### 22.2-bis — re-examination of the 22.2 verdict (executed — verdict retracted)
+
+The 22.2 record above is honest about what it measured, but the verdict "hypothesis falsified"
+does not follow from those measurements. Reviewed (Fable + Matthias, this session); three defects,
+each traceable to a specific earlier section:
+
+1. **The deciding diagnostic's calibration was wrong — and the §22 plan itself planted it.** The
+   gate expected "4+ levels, ~3–4× coarsening" as *healthy*, inherited from §17 A2's wording
+   ("far more aggressive than healthy SA's usual ~3–4×"). That describes classical AMG or
+   geometric multigrid. **Smoothed aggregation is aggressive-coarsening by design** — an aggregate
+   is a whole strongly-connected neighborhood, so ~10–30× per level with operator complexity
+   ~1.1–1.3 and few levels is *textbook SA*, and the measured `A₁` hierarchy (3 levels,
+   13.3×/19.6×, complexity 1.19) fits it. The document's own data proves shape was never
+   disqualifying: **§17's headline 29-iteration result was achieved on a 3-level, ~18×-coarsened
+   hierarchy** on the full quadratic block. Hierarchy shape is a weak observable; convergence is
+   the observable.
+2. **The fine-smoother divergence was mis-diagnosed, reinstating §13's retracted causal story.**
+   The probe ran Chebyshev on the *unmasked* equilibrated block and attributed the divergence to
+   "genuine ~50% non-symmetry" from contact/condensation. §17 A1 measured exactly this and
+   localized it: the asymmetry collapses to **0.03% raw / 0.58% scaled once Dirichlet rows and
+   columns are masked** — a Dirichlet/`eliminate_zeros` storage artifact, not physics. And §17 B1
+   showed the operational consequence directly: Chebyshev diverges on the full block but
+   **converges on the Dirichlet-masked free submatrix with zero tuning**. The probe masked
+   Dirichlet for the projection but not for the smoothing — the one place §17 B1 says it matters
+   most.
+3. **The decisive quantity was never measured.** No two-grid arm ever ran to convergence after the
+   masking fix, and nobody solved `A₁` itself with AMG-preconditioned GMRES — minutes of compute
+   that answers the actual question ("is the P1 Galerkin operator AMG-friendly?") directly. The
+   closing redirect toward constraint-aware preconditioning is currently *asserted, not measured* —
+   the exact failure pattern §16 called out in §13, which this document has already retracted once.
+
+**Corrected calibration, stated once so this ruler cannot fire again (also add to §8):** for
+smoothed aggregation, few levels + 10–30× per-level coarsening + operator complexity ~1.1–1.3 is
+healthy by construction. Never judge an SA hierarchy by its shape; judge it by preconditioned
+convergence on its own operator.
+
+All steps offline on xeon (investigation dir, same-session interleaved arms, external
+`perf_counter` timing, RSS guard). Env vars: `OMP_NUM_THREADS=16` **and, per 22.2's own finding,
+`OPENBLAS_NUM_THREADS` set explicitly** (`MKL_NUM_THREADS` is a no-op for numpy/scipy here —
+OpenBLAS build). Total ~1–2 h.
+
+**R1 — the decisive number (~30 min).** On the masked-projected `A₁` from the fixed 22.2 probe:
+solve `A₁ x = r` with `gmres(M=100, rtol=1e-6)` preconditioned by one AMGCL V-cycle per iteration
+(`build(A₁)` once; one-shot-`M` mode as everywhere). Two right-hand sides, both recorded: `Pᵀ`
+applied to the dumped block's (masked, equilibrated) residual, and one fixed random vector. Arms:
+{shipped scalar default, §17 tuned d=8/npre=npost=2} × {no nullspace, 3 translations on `A₁`}
+(`A₁`'s DOF layout is corner-node-major × 3 by construction of `P = kron(P_node, I_3)` — build the
+translations accordingly). Also record `report()` per arm, now as *context*, not as a gate.
+
+*Pre-committed interpretation:* best arm **≤ ~40 iterations** → `A₁` is AMG-friendly, the 22.2
+falsification is overturned, proceed to R2. **≥ ~100** → the falsification is *confirmed on the
+right instrument*, the constraint-aware redirect is earned, and the phase re-closes with that
+recorded. In between → report both numbers and stop for a judgement call; do not improvise.
+
+**R2 — one honest two-grid arm, free-submatrix construction (~30 min; only if R1 is good).**
+§17 B1's construction, applied end-to-end: remove Dirichlet rows/columns *entirely* on the fine
+level (the free submatrix — §17 B1 found 24,160 Dirichlet rows → 190,499 free on this block;
+recompute, don't assume), and restrict `P` to free fine rows × free coarse columns. The one
+interpolation rule that needs stating: a free midside node whose edge-endpoint corner is
+Dirichlet-constrained keeps only the ½-weight on its free endpoint, **no renormalization** — the
+constrained corner contributes exactly zero to a homogeneous Newton correction, which is what the
+weight dropping encodes. Assert the resulting free-`P` rows are nonzero (a free midside with
+*both* endpoints constrained would be an orphan — hard-error if one exists, it would mean the
+Dirichlet data disagrees with the topology map). Fine smoothing: hand-rolled Chebyshev **on the
+free submatrix** (spectral radius from ~50 power iterations *on that submatrix*, `lower=0.01`) —
+the configuration §17 B1 measured converging standalone with zero tuning, so it is a valid
+smoother there. Solve the free system directly with outer GMRES (equivalent to identity-on-
+Dirichlet for the full system, and simpler). Arms: `ν ∈ {1, 2}` × fine degree ∈ {3, 5} × R1's best
+coarse config; reference arm in the same run: single-level AMGCL (production default) on the same
+free submatrix, same one-shot-`M` mode. Gate as 22.2 intended: ≥20% projected-threaded wall vs.
+that reference, iteration count materially below it.
+
+**R3 — close the asymmetry story on paper (~5 min).** Measure `‖A−Aᵀ‖_F/‖A‖_F` on the *masked*
+equilibrated block and on the free submatrix. Expected per §17 A1: ~0.6% and ~0.03%-ish. Record
+next to 22.2's ~50% unmasked figure with one sentence tracing the difference to the Dirichlet
+artifact — so the §13 story stays retracted in writing and the "departure from normality" claim
+is either killed or, if the masked number surprises, genuinely earned.
+
+**Bookkeeping, either way:** update the header bullet and the 22.2 record's closing paragraph with
+the R1 outcome (overturned → resume the original 22.2 sweep using R2's construction, then
+22.3/22.4 as planned; confirmed → the phase re-closes, redirect earned). Add to §8: the corrected
+SA calibration above, and 22.2's scipy `gmres` `maxiter`-counts-restart-cycles-without-`callback`
+trap (currently recorded only inside the 22.2 text). The OpenBLAS/`MKL_NUM_THREADS` finding should
+also change the standard run-command convention going forward (set `OPENBLAS_NUM_THREADS`
+explicitly; whether to split 8+8 or accept ~32 threads on the 36-core box is a deliberate choice
+to record, not benchmark, here).
+
+**22.2-bis — executed. R1 overturns 22.2 outright; R2 confirms a real, gate-clearing two-grid win
+on the correct (free-submatrix) construction; R3 closes the asymmetry story exactly as §17 A1
+predicted. The 22.2 "falsified" verdict is retracted.**
+
+**R1 — the decisive number.** `probe_222bis_R1.py` (xeon, investigation dir, ad hoc, not checked
+in). Solved `A₁ x = r` directly with `gmres(M=100, rtol=1e-6)`, one AMGCL V-cycle per iteration,
+`build(A₁)` once, two RHS (`Pᵀ` applied to the dumped block's masked/equilibrated residual;
+one fixed random vector), four arms (`{shipped default, §17 tuned} × {no nullspace, 3 translations
+on A₁}`):
+
+| coarse config | nullspace | iters (both RHS agree) |
+|---|---|---|
+| shipped default | none | 70-72 |
+| shipped default | translations | 61 |
+| §17 tuned (`eps_strong=0.01`, d=8, npre=npost=2) | none | 38 |
+| **§17 tuned** | **translations** | **26** |
+
+Best arm, 26 iterations, is **well under the ≤40 threshold** — `A₁` is unambiguously AMG-friendly.
+A genuine bonus finding: the rigid-body translation near-null-space, which measurably does **not**
+help on the full quadratic condensed block (§11/§13), **does** help here (72→61, 38→26) — exactly
+the textbook behavior expected of a clean low-order elasticity operator, further supporting that
+`A₁` is a "normal" AMG target unlike its quadratic parent. **R1 verdict: OVERTURNED — proceed to R2.**
+
+**R2 — one honest two-grid arm, free-submatrix construction.** `probe_222bis_R2.py`. Recomputed
+(not assumed) the free/Dirichlet split on this block: **24,160 Dirichlet, 190,499 free** —
+identical to §17 B1's figure, a strong cross-check. Built `Asfree` (Dirichlet rows/columns removed
+entirely, not masked-in-place), restricted `P` to free fine rows × free coarse columns (74,167 →
+70,415 free coarse dofs), asserted zero orphan rows (none found — the topology map and the
+Dirichlet data agree), projected `A₁free = Pfreeᵀ Asfree Pfree` (diagonal healthy: min 0.31, 0
+non-positive), and ran a real two-grid sweep (`ν ∈ {1,2} × degree ∈ {3,5}`, coarse = R1's winner)
+against a single-level-AMGCL reference, both measured the same one-shot-`M` way, on `Asfree`
+directly (solving the free system, equivalent to identity-on-Dirichlet for the full one):
+
+| arm | iters | wall | projected-threaded wall |
+|---|---|---|---|
+| reference: single-level AMGCL, production default | 111 | 14.71s | 8.00s |
+| *(context)* single-level AMGCL, §17 tuned | 60 | 13.52s | 10.26s |
+| two-grid: ν=1, degree=3 | 74 | 22.75s | 3.93s |
+| **two-grid: ν=1, degree=5** | **58** | 25.16s | **3.48s** |
+| two-grid: ν=2, degree=3 | 61 | 30.92s | 3.98s |
+| two-grid: ν=2, degree=5 | 50 | 40.77s | 4.29s |
+
+**Best arm: 2.30× projected-threaded speedup vs. the production-default reference, at 58
+iterations vs. 111 — clears the ≥20% gate with iteration count materially below the reference.**
+The fine Chebyshev smoother (identical construction to 22.2's, applied this time to `Asfree`
+instead of the unmasked full block) converges cleanly with no divergence at all — confirming the
+22.2 divergence really was the Dirichlet-contamination artifact §17 B1 already named, not a
+property of the physics.
+
+**R3 — the asymmetry story, closed.** `‖A-Aᵀ‖/‖A‖`: **0.56%** on the masked equilibrated block
+(vs. §17 A1's reported 0.58% scaled — matches almost exactly) and **0.58%** on the free submatrix.
+Both tiny, both consistent with §17 A1's prediction. 22.2's ~50% figure was measured on the
+*unmasked* block and was always a Dirichlet-elimination storage artifact, never physics — the
+"departure from normality" explanation 22.2 offered for the fine-smoother divergence is killed,
+cleanly, in writing, for good.
+
+**Retraction, stated plainly:** §22.2's verdict ("the quadratic-discretization hypothesis is
+falsified... the real obstacle is the contact-penalty/condensation structure") was wrong, and
+wrong for the exact reason §16/§13 already warned about once before in this document — asserting
+a redirect instead of measuring the one number that decides it. The corrected record: **the P1
+Galerkin operator is measurably AMG-friendly, and a two-grid scheme built on it delivers a real,
+gate-clearing win once Dirichlet handling matches §17 B1's construction on the fine level, not
+just the coarse projection.** Per this section's own bookkeeping instruction, the phase resumes:
+22.2's original sweep is superseded by R2's construction (the free-submatrix two-grid already
+clears the gate, so the broader `ν × degree × coarse-config` grid 22.2 originally specified is not
+separately re-run — R2's 4-arm sweep already identifies a clear winner and clears the bar with
+margin); proceed to 22.3 (coupled offline validation) and 22.4 (live gate, plumbing, ship
+decision) next.
 
 ### 22.3 Coupled offline validation (production code path, all 9 ords)
 
