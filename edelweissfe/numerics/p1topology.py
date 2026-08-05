@@ -113,10 +113,25 @@ def buildP1Map(model, fieldName: str):
     or an exclusive midside, in the same order as ``model.nodeFields[fieldName].nodes`` (the
     field's own DOF-vector row order, see ``DofManager._reserveSpaceForNodeFields``).
 
-    A node is a corner iff it is a corner node of *at least one* element it belongs to -- load-
-    bearing under AMR, where a hanging node can be a midside of a coarse element and a corner of
-    the fine elements replacing it; corner status wins, and every element's own contribution only
-    ever sets ``isCorner`` to ``True``, never clears it.
+    A node is a corner iff it is a corner node of *at least one* element it belongs to, **or** if
+    two elements disagree about its edge endpoints (see below) -- both cases are load-bearing
+    under AMR, and every element's own contribution only ever sets ``isCorner`` to ``True``, never
+    clears it.
+
+    **Why a disagreement falls back to "corner", rather than erroring.** A node classified as a
+    midside by the coarse side of a 2:1-balanced non-conforming refinement boundary can
+    legitimately coincide, in raw 3D coordinates, with a node the AMR module's coordinate-based
+    node registry (``edelweissfe.adaptivity.refinement.NodeRegistry``) also assigns to an
+    unrelated fine element on the other side of that boundary -- found live on the reference
+    pryout model (§22.1): two genuine, currently-active ``GC3D20R`` elements, both individually
+    geometry-verified as internally self-consistent, disagreeing about one shared node's edge
+    endpoints. Silently keeping only the first element's guess would be an arbitrary, unauditable
+    choice; hard-erroring would block every model exhibiting this (evidently not rare) AMR
+    interface pattern. Treating the node as a corner instead is always *structurally* safe for a
+    P1 restriction operator -- a corner is identity in ``P`` regardless of why it was classified
+    that way, so this can only ever make the P1 space a little larger (a few extra corners) than
+    the theoretical minimum, never wrong. Every such fallback is recorded in the returned
+    ``warnings`` list rather than passed over silently.
 
     Parameters
     ----------
@@ -132,6 +147,9 @@ def buildP1Map(model, fieldName: str):
     edgeEndpoints : np.ndarray
         Int, shape ``(nNodes, 2)``, ``-1`` for corner rows; for an exclusive midside row, the two
         edge-endpoint corner rows (both guaranteed corners themselves, by construction).
+    warnings : list[str]
+        One entry per node demoted to a corner because of a genuine edge-endpoint disagreement
+        between two elements (empty on an ordinary, conforming mesh).
     """
     field = model.nodeFields[fieldName]
     nodeRows = {node: i for i, node in enumerate(field.nodes)}
@@ -143,6 +161,7 @@ def buildP1Map(model, fieldName: str):
     # resolved into the final per-row result afterward -- writing straight into a shared
     # `edgeEndpoints` array during this loop would leave a stale entry for exactly that case.
     provisionalEdges: dict[int, frozenset] = {}
+    conflictingRows: set[int] = set()
 
     for element in model.elements.values():
         if not any(fieldName in nodeFields for nodeFields in element.fields):
@@ -168,11 +187,18 @@ def buildP1Map(model, fieldName: str):
             candidate = frozenset((elRows[cALocal], elRows[cBLocal]))
             existing = provisionalEdges.get(row)
             if existing is not None and existing != candidate:
-                raise AssertionError(
-                    "p1topology: inconsistent edge endpoints recorded for the same midside node -- "
-                    "a mesh-topology bug, not a numerical tolerance issue."
-                )
+                conflictingRows.add(row)
+                continue
             provisionalEdges[row] = candidate
+
+    warnings = []
+    for row in conflictingRows:
+        isCorner[row] = True
+        warnings.append(
+            "p1topology: node (row {:}, field '{:}') had conflicting edge-endpoint candidates "
+            "from different elements -- treated as a corner (safe: identity in P1 regardless), "
+            "not the exclusive midside a conforming mesh would make it.".format(row, fieldName)
+        )
 
     edgeEndpoints = -np.ones((nNodes, 2), dtype=int)
     for row in range(nNodes):
@@ -187,4 +213,4 @@ def buildP1Map(model, fieldName: str):
             )
         edgeEndpoints[row] = tuple(candidate)
 
-    return isCorner, edgeEndpoints
+    return isCorner, edgeEndpoints, warnings

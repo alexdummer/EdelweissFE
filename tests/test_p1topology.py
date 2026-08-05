@@ -69,13 +69,14 @@ def test_quad8_isolated_element():
     element = _FakeElement(nodes, nSpatialDimensions=2)
     model = _FakeModel({"displacement": _FakeNodeField(nodes)}, [element])
 
-    isCorner, edgeEndpoints = buildP1Map(model, "displacement")
+    isCorner, edgeEndpoints, warnings = buildP1Map(model, "displacement")
     assert list(np.nonzero(isCorner)[0]) == [0, 1, 2, 3]
     assert set(edgeEndpoints[4].tolist()) == {0, 1}
     assert set(edgeEndpoints[5].tolist()) == {1, 2}
     assert set(edgeEndpoints[6].tolist()) == {2, 3}
     assert set(edgeEndpoints[7].tolist()) == {3, 0}
     assert (edgeEndpoints[:4] == -1).all()
+    assert warnings == []
 
 
 def test_hexa20_isolated_element():
@@ -83,7 +84,7 @@ def test_hexa20_isolated_element():
     element = _FakeElement(nodes, nSpatialDimensions=3)
     model = _FakeModel({"displacement": _FakeNodeField(nodes)}, [element])
 
-    isCorner, edgeEndpoints = buildP1Map(model, "displacement")
+    isCorner, edgeEndpoints, warnings = buildP1Map(model, "displacement")
     assert list(np.nonzero(isCorner)[0]) == list(range(8))
     expectedEdges = {
         8: (0, 1),
@@ -116,7 +117,7 @@ def test_amr_corner_wins_over_midside_from_a_different_element():
     allNodes = nodes + linearNodes[1:]
     model = _FakeModel({"displacement": _FakeNodeField(allNodes)}, [quad8, linearElement])
 
-    isCorner, edgeEndpoints = buildP1Map(model, "displacement")
+    isCorner, edgeEndpoints, warnings = buildP1Map(model, "displacement")
     rowOf4 = allNodes.index(sharedMidNode)
     assert isCorner[rowOf4], "corner status must win over midside status from a different element"
     assert (edgeEndpoints[rowOf4] == -1).all(), "a corner row must not carry edge endpoints"
@@ -127,7 +128,7 @@ def test_contact_facet_without_nspatialdimensions_is_pure_corner():
     facetElement = _FakeElement(facetNodes, nSpatialDimensions=None)
     model = _FakeModel({"displacement": _FakeNodeField(facetNodes)}, [facetElement])
 
-    isCorner, edgeEndpoints = buildP1Map(model, "displacement")
+    isCorner, edgeEndpoints, warnings = buildP1Map(model, "displacement")
     assert isCorner.all()
     assert (edgeEndpoints == -1).all()
 
@@ -143,9 +144,12 @@ def test_unrecognized_topology_raises():
         buildP1Map(model, "displacement")
 
 
-def test_inconsistent_edge_endpoints_raises():
-    """Two elements disagreeing about a shared midside's edge endpoints is a genuine mesh-topology
-    bug, not a numerical tolerance issue -- must fail loudly."""
+def test_inconsistent_edge_endpoints_falls_back_to_corner():
+    """Two elements disagreeing about a shared midside's edge endpoints is a real pattern found on
+    the reference pryout model, at a 2:1 non-conforming AMR refinement boundary (§22.1) -- the
+    node is conservatively treated as a corner (always structurally safe for P1) rather than
+    hard-erroring or arbitrarily keeping one element's guess, and the fallback is reported via
+    the returned `warnings`, not swallowed silently."""
     nodes = [_FakeNode(i, {"displacement": True}) for i in range(8)]
     quad8 = _FakeElement(nodes, nSpatialDimensions=2)  # midside 4 -> edge (nodes[0], nodes[1])
 
@@ -158,5 +162,8 @@ def test_inconsistent_edge_endpoints_raises():
     allNodes = nodes + otherCorners + otherNodes[5:]
     model = _FakeModel({"displacement": _FakeNodeField(allNodes)}, [quad8, conflicting])
 
-    with pytest.raises(AssertionError):
-        buildP1Map(model, "displacement")
+    isCorner, edgeEndpoints, warnings = buildP1Map(model, "displacement")
+    rowOf4 = allNodes.index(nodes[4])
+    assert isCorner[rowOf4], "a genuine edge-endpoint conflict must fall back to corner"
+    assert (edgeEndpoints[rowOf4] == -1).all()
+    assert len(warnings) == 1 and "conflicting edge-endpoint" in warnings[0]

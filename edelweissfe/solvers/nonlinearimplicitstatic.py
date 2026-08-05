@@ -354,9 +354,11 @@ class NIST(NonlinearSolverBase):
                         for fieldName, field in model.nodeFields.items():
                             if field.dimension <= 1:
                                 continue
-                            isCorner, edgeEndpoints = buildP1Map(model, fieldName)
+                            isCorner, edgeEndpoints, p1Warnings = buildP1Map(model, fieldName)
                             p1MapData[fieldName + "_isCorner"] = isCorner
                             p1MapData[fieldName + "_edgeEndpoints"] = edgeEndpoints
+                            for w in p1Warnings:
+                                self.journal.message(w, self.identification, 1)
                         np.savez(os.path.join(p1MapDumpDir, "p1map.npz"), **p1MapData)
                         self.journal.message(
                             "dumped P1 topology map ({:} vector field(s)) to {:}".format(
