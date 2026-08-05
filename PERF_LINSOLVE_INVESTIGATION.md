@@ -123,8 +123,16 @@ has begun. Two cheap leads are now measured on the real model:**
   wall-clock rose from 0.368× to **0.792×** — a real 2.15× improvement — but still short of the
   ≥1.20× gate; the bottleneck has moved to the **coarse-level AMGCL apply** (55-61% of the
   preconditioner's own time, now bigger than the fine smoother's 38-41%) and to fixed per-iteration
-  overhead, not the fine smoother anymore. `p1Maps` stays opt-in-only; §22.5 still does not
-  proceed. Recorded as a deliberate stopping point pending a judgement call on a further round.
+  overhead, not the fine smoother anymore.
+  **22.4-bis (coarse-level tuning, Matthias: "continue attacking the coarse-level cost")** sweeps
+  `npre`/`npost`/Chebyshev degree on the coarse `A₁` solve: weakening `npre`/`npost` cuts per-call
+  cost but pushes outer GMRES iterations up (a real quality floor); halving degree (8→4) at the
+  validated sweep count does not, and is the new default. A direct PARDISO factorization on `A₁`
+  (only 70,415 free coarse DOF) was tried and rejected — exact but no cheaper per call (~70ms).
+  Aggregate wall-clock rose further to **0.881×**, still short of ≥1.20×. `p1Maps` stays
+  opt-in-only; §22.5 still does not proceed. Remaining levers (Cholesky/SPD direct solve, a
+  dedicated low-level coarse apply bypassing `PyAMGCLSolver`'s BiCGStab-wrapped-AMG structure) are
+  more invasive than this round's; recorded as the next deliberate stopping point.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -3213,6 +3221,83 @@ what remains is now precisely identified rather than an open-ended "make the fin
 faster." `p1Maps` stays opt-in-only; 22.5's live gate / NIST plumbing / ship-as-default steps still
 do not proceed. Recorded here as a deliberate stopping point for a judgement call on whether
 attacking the coarse-level cost is worth a further round, rather than continuing un-asked.
+
+#### 22.4-bis — coarse-level config sweep + a direct-solve comparison (executed, Matthias: "continue attacking the coarse-level cost")
+
+**Config sweep, single ord (00002), full production path (not an isolated apply-only
+microbenchmark), six candidates against the shipped `npre=2`/`npost=2`/`degree=8` baseline:**
+
+| config | outer iters | wall | coarse/call |
+|---|---|---|---|
+| baseline (npre=2,npost=2,deg=8) | 50 | 24.96s | 71.64ms |
+| npre=1,npost=1,deg=8 | **65** | 27.29s | 58.44ms |
+| npre=1,npost=1,deg=4 | 55 | 23.08s | 50.99ms |
+| **npre=2,npost=2,deg=4** | **53** | **23.08s** | 58.26ms |
+| npre=1,npost=1,deg=6 | 54 | 23.06s | 54.56ms |
+| npre=1,npost=0,deg=8 | **58** | 23.81s | 50.60ms |
+
+**A real quality floor, found rather than assumed:** weakening `npre`/`npost` (dropping to 1/1, or
+dropping post-smoothing entirely) cuts the per-call cost but pushes outer GMRES iterations *up*
+enough to be a wash or a net regression — a cheaper-but-weaker coarse correction is not free, it
+just moves the cost into more outer iterations. Halving the Chebyshev *degree* instead (8→4) at the
+validated `npre=2`/`npost=2` sweep count is the one config that both matches the original
+iteration count almost exactly (53 vs. 50) and is cheaper per call (58.26ms vs. 71.64ms, ~7-19%
+depending on which baseline column it's read against) — picked as the new default.
+
+**A direct-solve alternative, tried and rejected.** `A₁`'s free coarse DOF is far smaller than
+guessed going in — 70,415 (37.0% of the fine free DOF), a 2-level AMGCL hierarchy itself (operator
+complexity 1.07). Small enough that a one-shot direct factorization (build once per Newton refresh,
+exactly the amortization the AMG hierarchy already gets) looked promising against an *approximate*
+few-sweep V-cycle. Tried the codebase's existing `PardisoSolver.factorize()`/`.solveFactorized()`
+split (already used elsewhere for a lagged-Newton preconditioner, so build-once/apply-many is a
+supported, tested mode, not a stretch) directly on `A₁`: `factorize()` took 1.10s (one-shot, cheap
+relative to ~50-130 subsequent calls), and the solve is exact (residual `9.36e-15` against a random
+RHS) — but `solveFactorized()` averaged **70.2ms/call**, essentially tied with the tuned AMGCL
+config, not cheaper. Cause: `A₁` already has ~71 nnz/row at its original sparsity, and a *general*
+(unsymmetric, PARDISO `mtype=11`) LU factorization of a 3D-elasticity-like operator at this size
+fills in heavily — the triangular back-substitution ends up doing about as much work as the
+approximate V-cycle it was meant to replace. A symmetric/SPD reformulation (`A₁` is only 0.03-0.6%
+asymmetric per §22.2-bis R3, so Cholesky via PARDISO `mtype=2` might fill in less) was considered
+but not attempted: `PardisoSolver` hard-codes `mtype=11` in `__cinit__`, so testing this would mean
+either modifying a shared, already-relied-upon production class or hand-rolling a parallel
+low-level PARDISO call outside it — a real code-risk/uncertain-payoff tradeoff, not a quick probe,
+so left as a named but unexplored option rather than pursued speculatively.
+
+**Full 9-ord replay with the tuned coarse config** (same 9 systems, same both-arms setup as 22.3/22.4):
+
+| ord | shipped iters | p-two-grid iters | shipped wall | p-two-grid wall | "speedup" |
+|---|---|---|---|---|---|
+| 00002 | 66 | 53 | 22.63s | 23.58s | 0.96× |
+| 00003 | 164 | 136 | 49.13s | 53.00s | 0.93× |
+| 00004 | 62 | 56 | 19.75s | 24.70s | 0.80× |
+| 00005 | 51 | 48 | 17.26s | 21.39s | 0.81× |
+| 00006 | 55 | 50 | 17.90s | 22.13s | 0.81× |
+| 00007 | 53 | 57 | 17.42s | 24.38s | 0.71× |
+| 00008 | 54 | 53 | 17.60s | 22.96s | 0.77× |
+| 00009 | 23 | 22 | 10.73s | 12.29s | 0.87× |
+| 00010 | 50 | 22 | 18.44s | 12.29s | **1.50×** |
+| **TOTAL** | | | **190.84s** | **216.70s** | **0.881×** |
+
+**A further real improvement**: aggregate rose from **0.792×** to **0.881×**, worst single ord from
+0.600× to 0.714×. One ord (00010) now beats the shipped default outright (1.50×) — its outer
+iteration count dropped from 45 (22.4's threaded-only run) to 22, enough to avoid the tolerance
+continuation (`cont=0` instead of `cont=1`) entirely. Flagged honestly rather than celebrated at
+face value: this looks like a boundary effect (a slightly different converged iterate landing on
+the loose-tolerance side of the continuation trigger by chance) rather than a systematic 1.5×
+lever repeatable on other ords — every other ord improved far more modestly, consistent with the
+single-ord sweep's ~7% finding. True residuals show the same character as before (still
+measurably looser than shipped on most ords) — unaffected by this change, as expected.
+
+**Bar: still fails.** Aggregate `0.881×` is closer to the `≥1.20×` gate but a `≥1.20/0.881 ≈ 1.36×`
+further improvement is still needed; worst ord `0.714×` remains well short of the `≥0.95×`
+allowance. `_DEFAULT_COARSE_PRECOND` in `ptwogrid.py` is updated to the tuned config (real,
+measured win, no reason to leave the old default in place); `p1Maps` stays opt-in-only. The
+remaining, named-but-untried levers are more invasive than this round's: a Cholesky/SPD
+reformulation of the direct solve (requires changing shared `PardisoSolver` or duplicating its
+low-level PARDISO calls), or a dedicated low-level coarse "apply" analogous to §22.4's
+`RelaxationSmootherT` that bypasses `PyAMGCLSolver`'s generic BiCGStab-wrapped-AMG structure and
+its own array-copy overhead at the C++ boundary. Recorded here as the next deliberate stopping
+point.
 
 ### 22.5 Live gate, plumbing, and ship decision
 

@@ -50,11 +50,18 @@ zero to a homogeneous Newton correction, which the dropped weight already encode
 import numpy as np
 import scipy.sparse as sp
 
-#: R1/R2's winning coarse-level AMGCL configuration (§22.2-bis): 26 (R1, on A1 alone) / 58 (R2,
-#: full two-grid on the free submatrix) iterations, both comfortably clearing their gates.
+#: §22.4's coarse-config sweep (single-ord, all six candidates run through the full production path):
+#: halving the Chebyshev degree (8 -> 4) at the validated npre=2/npost=2 sweep count matches the
+#: original §22.2-bis outer-iteration count almost exactly while cutting the coarse apply's own cost
+#: by ~7% -- npre=1/npost=1 variants were cheaper per call but pushed outer GMRES iterations up
+#: enough to be a wash or a regression (a weaker coarse correction is not free). A direct PARDISO
+#: factorization of A1 was also tried and rejected: exact (residual ~1e-14) but no cheaper per call
+#: (~70ms, matching this config) -- A1's ~71 nnz/row at 70k free coarse DOF fills in heavily under a
+#: general (unsymmetric) LU, so an exact triangular solve costs about as much as the approximate
+#: V-cycle here.
 _DEFAULT_COARSE_PRECOND = {
     "coarsening": {"type": "smoothed_aggregation", "aggr": {"eps_strong": 0.01}},
-    "relax": {"type": "chebyshev", "degree": 8, "power_iters": 50, "lower": 0.01},
+    "relax": {"type": "chebyshev", "degree": 4, "power_iters": 50, "lower": 0.01},
     "npre": 2,
     "npost": 2,
 }
