@@ -3927,3 +3927,107 @@ attacked — the PETSc/HPDDM route remains a future phase); Krylov recycling (GC
 anything; the §21.2 Cython condensation kernel; p-two-grid's own remaining `~1.12×` gap
 (deliberately parked at §22.4-quater's stopping point — this phase will move that goalpost, and
 §22's record gets the honest update in 23.5, but chasing it is not this phase's job); D4.
+
+### 23.7 A first cut at bucket (h) — AMGCL's native `lgmres` as an opt-in outer solver (implemented, not yet built or validated)
+
+§23.1's census left bucket (h) ("GMRES internals by subtraction" — Arnoldi/Gram-Schmidt/restart
+bookkeeping) as the single largest line in the shipped arm's own solve wall (38.4%, 66.18s of
+172.24s across the 9 ords), explicitly out of that phase's own scope but named as the sizing input
+for a follow-up. This is that follow-up's first pass, done offline (no xeon access this round — see
+below) directly against `amgcl/solver/lgmres.hpp` (read in full from the installed AMGCL headers) to
+confirm the design before writing any code.
+
+**Why `lgmres`, not `gmres`.** `scipy.sparse.linalg.gmres`'s own orchestration is pure serial
+CPython regardless of how well-threaded the matvec/preconditioner underneath it are (§23.2 already
+threads the matvec; this is the next layer up). `amgcl::solver::lgmres` runs the equivalent
+bookkeeping (Arnoldi vectors, Given rotations, the least-squares back-substitution) on AMGCL's own
+`backend::builtin` — the same OpenMP-threaded backend `ThreadedMatrixT`/`RelaxationSmootherT` already
+use — so it inherits that threading for free. Loose GMRES specifically (not plain restarted GMRES)
+also has a second, independent motivation for this codebase: its `params::always_reset` flag
+(default `true` upstream), when set to `false`, keeps the solver's own recycled/augmented Krylov
+vectors (`outer_v`) alive *across* separate calls to the same `lgmres` object instance. AMGCL's own
+doc comment on `K` names "solving multiple similar problems" / "non-stationary problems with slowly
+changing coefficients" as the intended use for this — and a sequence of Newton iterations' outer
+solves, each on a slightly-changed Jacobian, is exactly that case. This is a second potential win
+layered on top of the threading one, not yet measured (see "Not yet done" below).
+
+**The architectural problem, and the resolution.** `lgmres::operator()` takes a `Precond` template
+parameter and calls `P.apply(rhs, x)` directly — a compile-time, statically-typed call, not a
+runtime-polymorphic one. This codebase's actual preconditioner is pure Python
+(`blockamg.py`'s `blockGaussSeidel` closure, dispatching to per-field `PyAMGCLSolver`/
+`PTwoGridPreconditioner` Cython objects) — there is no way to hand a Python callable to a C++
+template parameter directly. The bridge: a bare C function pointer + opaque `void*` context
+(`PyPrecondApplyFn`, `PyLGMRESPrecondT` in `amgcl-wrapper.hpp`), set from Cython
+(`amgcl.pyx`'s `_lgmresPrecondApplyTrampoline`), rather than a Cython-overridden C++ virtual method —
+`lgmres`'s `Precond` parameter never needs runtime polymorphism internally, so a virtual interface
+would only add a vtable/RTTI for no benefit, and a bare function pointer keeps `amgcl-wrapper.hpp`
+entirely free of any Python/Cython dependency, matching every other class in that file. Verified this
+plan directly against the installed header (not assumed): confirmed `apply()` is the *only* method
+`lgmres` calls on `P` under the default right-preconditioning side, always on its own internal
+`amgcl::backend::builtin<double>::vector` (`numa_vector<double>`) storage — never on the raw `rhs`/`x`
+passed to `operator()` itself — which is why the bridge's `apply()` is written directly against that
+concrete vector type rather than kept generic.
+
+Same ADL/`crs_tuple` trap as §22.4/§23.2 (documented there, re-verified against `lgmres.hpp` directly
+rather than assumed to still apply): `lgmres::operator()` calls `backend::residual()`/`backend::spmv()`
+on the matrix argument via ADL, which only resolves against `amgcl::backend::crs<...>`, not the raw
+`amgcl::adapter::crs_tuple` adapter — so the new `LGMRESOuterSolverT::solve()` converts through
+`Backend::matrix` first, exactly like every other class in `amgcl-wrapper.hpp`.
+
+A second design fork, not flagged in the original task framing but found necessary while writing the
+constructor: `tol`/`maxiter` cannot be fixed at construction time the way the rest of `lgmres::params`
+is, because `blockamg.py`'s Eisenstat–Walker forcing tolerance (`eta`) and the true-residual
+continuation's tightened tolerance change *every call*, while the whole point of this class is to
+keep one persistent instance alive *across* calls for `outer_v` recycling — rebuilding the object
+per call to change `tol` would throw away exactly that state. Resolved by mutating the underlying
+`amgcl::solver::lgmres` object's own public `prm` member in place on every `solve()` call (`prm` is
+not `const`-guarded in the upstream header — confirmed by reading it, not assumed), which reconciles
+per-call tolerances with cross-call vector recycling. Documented as a class-comment in
+`LGMRESOuterSolverT`.
+
+**What shipped this round** (all in `edelweissfe/linsolve/`, additive only — the existing
+`LinearSolver`/`RelaxationSmoother`/`ThreadedMatrix` classes and the shipped scipy path are
+untouched):
+
+- `amgcl/amgcl-wrapper.hpp`: `PyPrecondApplyFn` (the callback typedef), `PyLGMRESPrecondT` (the
+  Precond adapter), `LGMRESOuterSolverT`/`LGMRESOuterSolver` (the solver wrapper, `prm.tol`/
+  `prm.maxiter` mutated per call, matrix rebuilt per call like `ThreadedMatrixT`, Krylov vectors
+  persisted across calls).
+- `amgcl/amgcl.pxd`, `amgcl/amgcl.pyx`: the Cython declarations plus `_lgmresPrecondApplyTrampoline`
+  (the C-callable trampoline; catches and defers any Python exception raised by the preconditioner
+  callable, since it cannot propagate across the C function-pointer boundary directly) and
+  `PyAMGCLLGMRESSolver` (the Python-facing wrapper).
+- `blockamg/blockamg.py`: a new opt-in `outerSolver` constructor option (`"scipy"` default,
+  unchanged; `"amgcl_lgmres"` the alternative), plus `lgmresM`/`lgmresK`/`lgmresAlwaysReset`. One
+  `PyAMGCLLGMRESSolver` instance is built once per `BlockAMGSolver` and reused for its entire
+  lifetime (rebuilt only on a size change, e.g. AMR) — *not* rebuilt whenever the per-field AMG
+  hierarchies are refreshed (`mustRefresh`), since those are an orthogonal, independent kind of
+  staleness and rebuilding on that signal too would discard the Krylov-vector recycling this class
+  exists for. `lgmresAlwaysReset` defaults to `False` here (not AMGCL's own upstream default of
+  `True`) — deliberately, since defaulting to discarding the recycled vectors on every call would
+  make this path strictly worse than the scipy default, with none of the intended benefit. Both call
+  sites the scipy path uses (the main solve, the true-residual continuation retry) now branch on
+  `outerSolver`; `blockGaussSeidel` itself is unchanged and reused verbatim by both branches.
+- `blockamg/__init__.py`: the matching `linsolverConfigFile` option parsing.
+
+**Not yet done, explicitly**:
+
+- **Not built, not run, not measured.** Per this task's own constraint, the machine with the AMGCL
+  headers and the working Cython/C++ build (`xeon`) had a live benchmark running for hours in another
+  session for the whole duration of this work and was not touched — no ssh, no build, no test run.
+  Every design decision above was checked directly against the installed `amgcl/solver/lgmres.hpp`
+  and its neighboring headers (`precond_side.hpp`, `backend/builtin.hpp`) fetched read-only from
+  upstream source, not assumed from memory or documentation — but the code itself has never compiled.
+  **No performance numbers exist for this change.** The next session must, in order: (1) build on
+  `xeon` (`pip install -v -e .`), (2) validate against the offline dumped-matrix replay (the same
+  9-ord harness §23.5 used) before anything live — outer-iteration counts and true residuals should
+  be in the same ballpark as the scipy arm (not necessarily identical; a different Krylov
+  implementation, not just a threaded matvec, so §23.2's tight FP-drift band does not directly apply
+  here), (3) only then the live gate.
+- `always_reset=False`'s actual cross-Newton-iteration benefit is unmeasured — plausible from
+  AMGCL's own doc comment, not confirmed on this codebase's actual Jacobian sequence.
+- The `outerRestart * outerMaxiter` → single `lgmres::maxiter` translation is a generous,
+  not-tuned budget, not an attempt at matching scipy's restart semantics bit-for-bit; likewise
+  `lgmresM`/`lgmresK` keep AMGCL's own upstream defaults (`30`/`3`) rather than anything tuned against
+  this codebase's operators. First-pass scope only, per the task's own framing — tuning is future
+  work, contingent on the build/validation above landing first.
