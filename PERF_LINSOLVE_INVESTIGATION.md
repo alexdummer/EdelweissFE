@@ -72,7 +72,7 @@ has begun. Two cheap leads are now measured on the real model:**
   system size, since SciPy's SpGEMM must scan the left operand's full row range regardless of the
   right operand's sparsity. Ships as `useCachedMPCCondensation` (default `False`). D4 (the ≥1M-dof
   demonstration) remains the phase after.
-- **Phase 7 is planned, not started** ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
+- **Phase 7 in progress** ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
   **p-multigrid for the displacement block** — precondition the quadratic serendipity operator
   through a Galerkin-projected P1 corner-node operator (`A₁ = PᵀA₂P`, `P` purely topological),
   AMG on `A₁`, Chebyshev smoothing on the quadratic level. Rationale: SA-AMG is known to degrade
@@ -80,6 +80,12 @@ has begun. Two cheap leads are now measured on the real model:**
   coarsening, `eps_strong` needing 0.01) fits that signature; this is the standard high-order
   remedy (low-order preconditioning), chosen over a P1 *rediscretization* because the Galerkin
   projection inherits the damaged tangent, contact penalties, and MPC condensation for free.
+  **22.1 (the enabler) is done**: the corner/midside topology map is built, validated (pytest +
+  live sanity checks: `P` shape, row sums, identity on corners), and committed — with a real,
+  unanticipated finding along the way (a small fraction of nodes at 2:1 non-conforming AMR
+  boundaries genuinely disagree between elements about their edge affiliation; resolved by falling
+  back to "corner", always safe for P1, with every fallback reported, not swallowed). 22.2-22.4
+  (the go/no-go probe, coupled validation, live gate) remain.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -2565,6 +2571,70 @@ Run once on xeon against the same model state as the 9 dumps (displacement field
 `[0, 214659)` — the §13 coords-dump procedure describes catching the right snapshot). Sanity-check
 offline: `P` shape (214659 × 3·nCorners), row sums ≈ 1 per component, `P` restricted to corner
 dofs is the identity.
+
+**22.1 — executed.** `edelweissfe/numerics/p1topology.py` (`classifyElementTopology`,
+`buildP1Map`) plus the `EDELWEISS_DUMP_P1MAP` enabler in `nonlinearimplicitstatic.py`. Local
+node-order tables for Quad8/Hexa20 verified directly against both the pure-Python element shape
+functions and Marmot's `DisplacementFiniteElement` C++ source (not assumed from Abaqus memory), and
+cross-checked against the existing `edelweissfe.adaptivity.hex20shapefunctions.EDGES` table (used
+in production by SPR recovery) — all three agree. A pytest suite
+(`tests/test_p1topology.py`, 6 tests, stub objects, Cython/Marmot-free) plus a live smoke test
+against a real, meshed Quad8 model (378 nodes, 75 elements) both pass.
+
+**A real, unanticipated finding, found on the actual xeon run (not the plan's own anticipated
+"corner wins" case) — a genuine edge-endpoint conflict at 2:1-balanced non-conforming AMR
+boundaries.** The first live run raised: two currently-*active* `GC3D20R` elements disagreed about
+a shared node's edge endpoints. Both possible simpler explanations were checked and ruled out
+before concluding this is real:
+
+- **Not an MPC slave DOF** — verified live (a wrapper around `buildMPCTransformation` capturing
+  the transformation and checking the conflicting node's 3 displacement DOF indices against
+  `slaveDofIndices` — none matched). If it were a hanging node, it would never reach the
+  condensed operator blockamg actually preconditions, so the conflict wouldn't matter; it does,
+  because it's a genuine independent DOF.
+- **Not a stale/inactive AMR parent lingering in `model.elements`** — verified by reading
+  `edelweissfe/modelmodifiers/adaptivity/hadaptivity.py`'s `_materialize`: a refined parent is
+  unconditionally deleted from `model.elements` (and every `elementSets` entry) in the same
+  synchronous call that adds its children — never observable as still-present afterward.
+- **Not a node-order bug in AMR-generated children** — verified by reading `Hex20Topology.subdivide`
+  (`edelweissfe/adaptivity/hex20topology.py`) and `hex20_box_coords`
+  (`edelweissfe/adaptivity/hex20shapefunctions.py`): every child's 20-node list is constructed
+  explicitly in standard C3D20 order (corners 0-7, then midsides), not by octant structure or a
+  fine-grid index. `_materialize` passes that order straight to `setNodes()`, no remap.
+- **Both elements individually geometry-verified.** One side's midside-corner claim was checked
+  directly against the raw mesh coordinates (`mesh/concrete.inp`'s `*NODE` block): the midpoint of
+  its claimed corner pair matches the shared node's coordinates to the file's own precision, exact.
+
+**Root cause (best explanation, not fully proven further — see the scope note below):**
+`edelweissfe.adaptivity.refinement.NodeRegistry.label()` deduplicates newly-created AMR nodes by
+*rounded coordinate*, with no topological awareness of which edge/element a coordinate "belongs"
+to. At a genuine 2:1 hanging-node interface, a coarse element's own edge-midpoint node can
+coincide, in raw 3D space, with a node an *unrelated* neighboring fine element (refined from a
+*different* coarse parent) also needs at that same location — and the registry correctly reuses
+the one shared label, but the two elements' independent, locally-correct classifications of "what
+edge is this node the midpoint of" then genuinely disagree, because they are answering that
+question at two different mesh resolutions. This is very likely a pre-existing property of how
+this AMR module's non-conforming refinement produces shared boundary nodes, not a bug introduced
+by this work — but confirming that fully would need reading the AMR module's own non-conforming-
+interface design intent directly with its author, which is out of scope for this enabler.
+
+**Resolution — corner status wins here too, not just for the plan's originally-anticipated
+corner-vs-midside case.** `buildP1Map` was extended (beyond the plan's own text, which only
+specified the corner-vs-midside rule) to treat a genuine edge-endpoint *conflict* the same way: a
+corner is always identity in `P1` regardless of *why* it is one, so this can only ever enlarge the
+`P1` space by a handful of extra corners, never miscompute it — unlike silently keeping one
+element's arbitrary guess (unauditable) or hard-erroring (blocks every model exhibiting this,
+evidently not a rare, pattern). Every fallback is reported through a new `warnings` return value,
+routed to the Journal at the dump call site (level 1), not swallowed. Measured on the reference
+model: **524 conflicting nodes out of 71553 (~0.7%)**, localized (as expected) to refinement
+boundaries.
+
+**Sanity checks passed** (`sanity_check_p1map.py`, ad hoc, not checked in): `P_node` shape
+`(71553, 26389)`; every row sums to exactly `1.0`; `P` restricted to corner rows is exactly the
+identity; the DOF-level `P = kron(P_node, I_3)` has the expected shape `(214659, 79167)`.
+
+Commits: `05be1d6c` (Fable's §22 plan, committed — it had been sitting uncommitted on disk),
+`4aeee612` (the enabler), `dc4bf620` (the conflict-fallback fix, found and resolved live on xeon).
 
 ### 22.2 Offline two-grid probe on the displacement block — the go/no-go (~half day)
 
