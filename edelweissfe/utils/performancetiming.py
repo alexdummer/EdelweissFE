@@ -124,7 +124,17 @@ def _mergeInto(dst: dict, src: dict) -> None:
 def _mergedSnapshot() -> dict:
     """The combined snapshot across every thread that has ever recorded a measurement, summed by
     category name at every nesting level -- the multi-threaded equivalent of the old single shared
-    ``times`` tree's own :meth:`_PerformanceTimerBranch.get_snapshot`."""
+    ``times`` tree's own :meth:`_PerformanceTimerBranch.get_snapshot`.
+
+    Quiescent-point requirement (found on review, not yet exploitable by any call site in this
+    codebase): this reads every registered thread's tree without a lock. Safe as long as no other
+    thread is still actively timing something when this is called -- true today, since every call
+    site (:func:`makePrettyTable`, :func:`extractIncrementTimes`, :func:`reset`) runs only after
+    joining whatever thread pool did the work being reported on, never concurrently with it. Adding
+    per-node locking to make this safe under genuinely concurrent reporting too would reintroduce
+    exactly the lock contention on the hot tic()/toc() path this module's whole redesign exists to
+    avoid, for a usage pattern nothing here currently needs.
+    """
     with _allRootsLock:
         roots = list(_allRoots)
     merged = {"time": 0.0, "calls": 0, "children": {}}
@@ -142,18 +152,34 @@ class timeit:
     ----------
     category
         The category for storing the measured time.
+
+    Thread-safety note (found on review): the *decorator* form (``@timeit(...)``) constructs exactly
+    one ``timeit`` instance at decoration time, and every call to the decorated function reuses the
+    same ``wrapper`` closure over that one instance -- so anything stored on ``self`` here would be
+    shared and racy across concurrent or recursive calls to the same decorated function, exactly the
+    class of bug this module's thread-local redesign exists to eliminate. ``wrapper`` therefore keeps
+    its "what do I restore the stack to" bookkeeping in a plain local variable, not on ``self`` --
+    safe by construction, since every call gets its own Python stack frame regardless of which thread
+    or how many concurrent/recursive calls are in flight. The *context-manager* form (``with
+    timeit(...):``) cannot do the same (``__enter__``/``__exit__`` are separate calls needing to share
+    state across them) -- every call site in this codebase already constructs a fresh instance per
+    ``with`` block, which is enough in practice, but ``self._parentStackLevel`` is kept in a
+    per-instance ``threading.local()`` regardless, so even a ``with`` block built from a *shared,
+    reused* ``timeit`` instance stays correct if used across multiple threads.
     """
 
     def __init__(self, category: str):
         self._category = category
-        self._parentStackLevel = None
+        self._local = threading.local()
 
     def __call__(self, theFunction):
+        category = self._category
+
         def wrapper(*args, **kwargs):
             _currentThreadRoot()  # idempotent registration; cheap after the first call on this thread
             state = _threadLocalState
-            self._parentStackLevel = state.stack
-            timer = state.stack[self._category]
+            parentStackLevel = state.stack  # a plain local, not self.* -- see the class docstring
+            timer = state.stack[category]
             state.stack = timer
 
             timer.tic()
@@ -161,7 +187,7 @@ class timeit:
                 return theFunction(*args, **kwargs)
             finally:
                 timer.toc()
-                state.stack = self._parentStackLevel
+                state.stack = parentStackLevel
 
         wrapper.__doc__ = theFunction.__doc__
         wrapper.__module__ = theFunction.__module__
@@ -172,7 +198,7 @@ class timeit:
     def __enter__(self):
         _currentThreadRoot()  # idempotent registration; cheap after the first call on this thread
         state = _threadLocalState
-        self._parentStackLevel = state.stack
+        self._local.parentStackLevel = state.stack
         timer = state.stack[self._category]
         state.stack = timer
         timer.tic()
@@ -180,7 +206,7 @@ class timeit:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         _threadLocalState.stack.toc()
-        _threadLocalState.stack = self._parentStackLevel
+        _threadLocalState.stack = self._local.parentStackLevel
 
 
 def _makeTable(branch: dict, level: int, maxLevels: int) -> list[tuple]:
