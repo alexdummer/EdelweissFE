@@ -193,6 +193,32 @@ has begun. Two cheap leads are now measured on the real model:**
   heavier step (a real pryout simulation, not an offline replay); a deliberate pause point pending
   that decision. The local `blockamg` regression testfiles (the plan's own regression net) should
   run before, not with, that live gate.
+  **23.7 (bucket (h), the largest remaining line, executed on branch `feat/amgcl-lgmres-outer-
+  solver`):** AMGCL's own native `amgcl::solver::lgmres` as a new opt-in `outerSolver` alternative to
+  scipy's `gmres`, bridged via a bare C function-pointer callback (`PyLGMRESPrecondT`/
+  `_lgmresPrecondApplyTrampoline`) since `lgmres`'s `Precond` parameter is a compile-time template,
+  not a runtime interface — implemented and offline-validated (built cleanly first attempt once
+  `xeon` was free): **`1.303×` aggregate** on the same 9-ord harness (`117.48s` vs. `153.07s`),
+  larger than 23.5's own SpMV-threading win, 8 of 9 ords faster with `lgmres` needing *fewer* outer
+  iterations than scipy on every one of those 8. One ord regresses (`00009`, `0.84×`, needing *more*
+  iterations — a plausible but unconfirmed mechanism: `always_reset=False`'s cross-solve Krylov
+  recycling carrying a harder ord's vectors into an easier one, pure overhead with no payoff). True
+  residuals systematically looser (`~2–5×`) than scipy's but still within tolerance on every ord —
+  the same character already found for p-two-grid. Not yet live-validated. Two safety fixes landed
+  alongside this (on both branches): a regression this work exposed — computing the P1 topology map
+  unconditionally for every solver (§22.5) crashed an unrelated model using a rigid-body-contact
+  discretization `buildP1Map` cannot classify — fixed by only computing it when a solver's new
+  `requestedP1FieldNames` attribute actually asks; and a real, independent driver-level bug
+  (`edelweissfe/drivers/inputfiledrivensimulation.py`) where a step failing via the deliberate
+  `maxNumInc` test cap silently excluded its own elapsed time from "Job computation time" (an
+  `except StepFailed:` branch skipping the accumulation line) — several of this session's own
+  live-gate wall-clock readings had unknowingly been reading only the trivial preload step's time.
+  **23.8:** a live cross-thread-count PARDISO benchmark was aborted after observing that 4 vs. 8
+  threads produced a *different* Newton-iteration trajectory on the nominally identical run — MKL
+  PARDISO's own thread-count-dependent parallel reordering is a plausible but unconfirmed mechanism;
+  recorded as an open methodology gap affecting any live cross-thread-count comparison, not specific
+  to `blockamg`/`lgmres` (whose own §23.7 validation deliberately used the deterministic offline
+  harness instead, sidestepping this exact trap).
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -3927,3 +3953,192 @@ attacked — the PETSc/HPDDM route remains a future phase); Krylov recycling (GC
 anything; the §21.2 Cython condensation kernel; p-two-grid's own remaining `~1.12×` gap
 (deliberately parked at §22.4-quater's stopping point — this phase will move that goalpost, and
 §22's record gets the honest update in 23.5, but chasing it is not this phase's job); D4.
+
+### 23.7 A first cut at bucket (h) — AMGCL's native `lgmres` as an opt-in outer solver (implemented, offline-validated)
+
+§23.1's census left bucket (h) ("GMRES internals by subtraction" — Arnoldi/Gram-Schmidt/restart
+bookkeeping) as the single largest line in the shipped arm's own solve wall (38.4%, 66.18s of
+172.24s across the 9 ords), explicitly out of that phase's own scope but named as the sizing input
+for a follow-up. This is that follow-up's first pass, done offline (no xeon access this round — see
+below) directly against `amgcl/solver/lgmres.hpp` (read in full from the installed AMGCL headers) to
+confirm the design before writing any code.
+
+**Why `lgmres`, not `gmres`.** `scipy.sparse.linalg.gmres`'s own orchestration is pure serial
+CPython regardless of how well-threaded the matvec/preconditioner underneath it are (§23.2 already
+threads the matvec; this is the next layer up). `amgcl::solver::lgmres` runs the equivalent
+bookkeeping (Arnoldi vectors, Given rotations, the least-squares back-substitution) on AMGCL's own
+`backend::builtin` — the same OpenMP-threaded backend `ThreadedMatrixT`/`RelaxationSmootherT` already
+use — so it inherits that threading for free. Loose GMRES specifically (not plain restarted GMRES)
+also has a second, independent motivation for this codebase: its `params::always_reset` flag
+(default `true` upstream), when set to `false`, keeps the solver's own recycled/augmented Krylov
+vectors (`outer_v`) alive *across* separate calls to the same `lgmres` object instance. AMGCL's own
+doc comment on `K` names "solving multiple similar problems" / "non-stationary problems with slowly
+changing coefficients" as the intended use for this — and a sequence of Newton iterations' outer
+solves, each on a slightly-changed Jacobian, is exactly that case. This is a second potential win
+layered on top of the threading one, not yet measured (see "Not yet done" below).
+
+**The architectural problem, and the resolution.** `lgmres::operator()` takes a `Precond` template
+parameter and calls `P.apply(rhs, x)` directly — a compile-time, statically-typed call, not a
+runtime-polymorphic one. This codebase's actual preconditioner is pure Python
+(`blockamg.py`'s `blockGaussSeidel` closure, dispatching to per-field `PyAMGCLSolver`/
+`PTwoGridPreconditioner` Cython objects) — there is no way to hand a Python callable to a C++
+template parameter directly. The bridge: a bare C function pointer + opaque `void*` context
+(`PyPrecondApplyFn`, `PyLGMRESPrecondT` in `amgcl-wrapper.hpp`), set from Cython
+(`amgcl.pyx`'s `_lgmresPrecondApplyTrampoline`), rather than a Cython-overridden C++ virtual method —
+`lgmres`'s `Precond` parameter never needs runtime polymorphism internally, so a virtual interface
+would only add a vtable/RTTI for no benefit, and a bare function pointer keeps `amgcl-wrapper.hpp`
+entirely free of any Python/Cython dependency, matching every other class in that file. Verified this
+plan directly against the installed header (not assumed): confirmed `apply()` is the *only* method
+`lgmres` calls on `P` under the default right-preconditioning side, always on its own internal
+`amgcl::backend::builtin<double>::vector` (`numa_vector<double>`) storage — never on the raw `rhs`/`x`
+passed to `operator()` itself — which is why the bridge's `apply()` is written directly against that
+concrete vector type rather than kept generic.
+
+Same ADL/`crs_tuple` trap as §22.4/§23.2 (documented there, re-verified against `lgmres.hpp` directly
+rather than assumed to still apply): `lgmres::operator()` calls `backend::residual()`/`backend::spmv()`
+on the matrix argument via ADL, which only resolves against `amgcl::backend::crs<...>`, not the raw
+`amgcl::adapter::crs_tuple` adapter — so the new `LGMRESOuterSolverT::solve()` converts through
+`Backend::matrix` first, exactly like every other class in `amgcl-wrapper.hpp`.
+
+A second design fork, not flagged in the original task framing but found necessary while writing the
+constructor: `tol`/`maxiter` cannot be fixed at construction time the way the rest of `lgmres::params`
+is, because `blockamg.py`'s Eisenstat–Walker forcing tolerance (`eta`) and the true-residual
+continuation's tightened tolerance change *every call*, while the whole point of this class is to
+keep one persistent instance alive *across* calls for `outer_v` recycling — rebuilding the object
+per call to change `tol` would throw away exactly that state. Resolved by mutating the underlying
+`amgcl::solver::lgmres` object's own public `prm` member in place on every `solve()` call (`prm` is
+not `const`-guarded in the upstream header — confirmed by reading it, not assumed), which reconciles
+per-call tolerances with cross-call vector recycling. Documented as a class-comment in
+`LGMRESOuterSolverT`.
+
+**What shipped this round** (all in `edelweissfe/linsolve/`, additive only — the existing
+`LinearSolver`/`RelaxationSmoother`/`ThreadedMatrix` classes and the shipped scipy path are
+untouched):
+
+- `amgcl/amgcl-wrapper.hpp`: `PyPrecondApplyFn` (the callback typedef), `PyLGMRESPrecondT` (the
+  Precond adapter), `LGMRESOuterSolverT`/`LGMRESOuterSolver` (the solver wrapper, `prm.tol`/
+  `prm.maxiter` mutated per call, matrix rebuilt per call like `ThreadedMatrixT`, Krylov vectors
+  persisted across calls).
+- `amgcl/amgcl.pxd`, `amgcl/amgcl.pyx`: the Cython declarations plus `_lgmresPrecondApplyTrampoline`
+  (the C-callable trampoline; catches and defers any Python exception raised by the preconditioner
+  callable, since it cannot propagate across the C function-pointer boundary directly) and
+  `PyAMGCLLGMRESSolver` (the Python-facing wrapper).
+- `blockamg/blockamg.py`: a new opt-in `outerSolver` constructor option (`"scipy"` default,
+  unchanged; `"amgcl_lgmres"` the alternative), plus `lgmresM`/`lgmresK`/`lgmresAlwaysReset`. One
+  `PyAMGCLLGMRESSolver` instance is built once per `BlockAMGSolver` and reused for its entire
+  lifetime (rebuilt only on a size change, e.g. AMR) — *not* rebuilt whenever the per-field AMG
+  hierarchies are refreshed (`mustRefresh`), since those are an orthogonal, independent kind of
+  staleness and rebuilding on that signal too would discard the Krylov-vector recycling this class
+  exists for. `lgmresAlwaysReset` defaults to `False` here (not AMGCL's own upstream default of
+  `True`) — deliberately, since defaulting to discarding the recycled vectors on every call would
+  make this path strictly worse than the scipy default, with none of the intended benefit. Both call
+  sites the scipy path uses (the main solve, the true-residual continuation retry) now branch on
+  `outerSolver`; `blockGaussSeidel` itself is unchanged and reused verbatim by both branches.
+- `blockamg/__init__.py`: the matching `linsolverConfigFile` option parsing.
+
+**Built and offline-validated** (same session, once `xeon` was free — the live benchmark that
+blocked this during implementation was aborted for an unrelated reason, see below). Build was clean,
+zero errors, on the first attempt (`pip install -v -e .`). A quick smoke test first (a 200×200
+tridiagonal system, identity preconditioner, plus a deliberate exception raised from the
+preconditioner callable) confirmed basic correctness and exception propagation across the C
+function-pointer boundary before committing to the full replay.
+
+**Full 9-ord offline comparison** (same harness as §23.5: `outerSolver="scipy"` — the shipped
+default, unchanged — vs. `outerSolver="amgcl_lgmres"` with `lgmresM=100` (matched to the shipped
+`outerRestart`), `lgmresK=3`, `lgmresAlwaysReset=False`, same 9 dumped systems, same production
+`BlockAMGSolver` path):
+
+| ord | scipy iters | lgmres iters | scipy wall | lgmres wall | speedup | scipy true res | lgmres true res |
+|---|---|---|---|---|---|---|---|
+| 00002 | 66 | 50 | 18.98s | 12.94s | 1.47× | 6.53e-06 | 1.30e-05 |
+| 00003 | 164 | 109 | 35.65s | 22.59s | 1.58× | 8.92e-09 | 1.43e-07 |
+| 00004 | 62 | 52 | 16.02s | 13.26s | 1.21× | 6.67e-06 | 1.11e-05 |
+| 00005 | 51 | 48 | 14.11s | 12.63s | 1.12× | 4.32e-06 | 1.06e-05 |
+| 00006 | 55 | 50 | 14.81s | 13.07s | 1.13× | 2.71e-06 | 1.40e-05 |
+| 00007 | 53 | 37 | 16.16s | 10.84s | 1.49× | 3.47e-06 | 1.08e-05 |
+| 00008 | 54 | 39 | 14.41s | 11.05s | 1.30× | 3.90e-06 | 1.46e-05 |
+| 00009 | 23 | 35 | 8.74s | 10.43s | **0.84×** | 2.10e-04 | 1.46e-05 |
+| 00010 | 50 | 36 | 14.17s | 10.66s | 1.33× | 4.42e-06 | 1.84e-05 |
+| **TOTAL** | | | **153.07s** | **117.48s** | **1.303×** | | |
+
+**A real, substantial win.** Aggregate `1.303×` — larger than §23.2's own SpMV-threading win
+(`~1.22–1.27×`, same-session-verified) — and 8 of 9 ords individually faster (`1.12×`–`1.58×`), with
+`lgmres` needing *fewer* outer iterations than scipy's GMRES on every one of those 8 (most
+strikingly ord 00003: `109` vs `164`). No NaN/Inf on any ord.
+
+**One ord regresses, honestly recorded rather than averaged away.** Ord 00009 — the cheapest,
+smallest-iteration-count system in the set — needs *more* iterations with `lgmres` (`35` vs scipy's
+`23`) and is `0.84×` slower. A plausible mechanism, not yet confirmed: `always_reset=False` carries
+`outer_v`'s recycled Krylov vectors from the *previous* ord's (harder) solve into this easier one;
+if that augmented subspace is not well-aligned for the new, easier system, it is pure
+orthogonalization overhead bought for zero convergence benefit. Worth a dedicated check (e.g.
+re-running with `always_reset=True` on just this ord) if this path gets promoted further, not
+treated as disqualifying on its own — every other ord shows the opposite effect, recycling helping
+rather than hurting.
+
+**True residuals are systematically looser (not just on the one regressed ord)** — roughly 2–5×
+higher than scipy's on every ord, though still comfortably inside whatever tolerance was actually
+requested (all in the `1e-5`–`1e-7` range against tolerances of `3e-4`–`1e-6`). The same
+"looser-but-within-tolerance" character already found for p-two-grid (§22.3/§22.4) — a recurring,
+apparently benign characteristic of alternative Krylov/preconditioner configurations on this
+problem, not a new failure mode specific to `lgmres`.
+
+**Remaining before this could ship, unchanged from the original scope:**
+- `always_reset=False`'s cross-Newton-iteration recycling benefit is still not isolated from the
+  threading benefit alone — the comparison above bundles both effects together (this is what
+  `outerSolver="amgcl_lgmres"` actually does, so it is the right number for "does this help
+  end-to-end", but a follow-up ablation with `always_reset=True` would attribute the win between the
+  two mechanisms cleanly).
+- The `outerRestart * outerMaxiter` → single `lgmres::maxiter` translation and `lgmresM`/`lgmresK`
+  remain untuned (matched/upstream defaults only) — first-pass scope, per the original framing.
+- The ord 00009 regression's mechanism above is a plausible hypothesis, not a confirmed diagnosis.
+- **No live validation yet.** The live gate methodology itself needs revisiting first — a live
+  4-vs-8-thread PARDISO comparison run in parallel to this work was aborted after finding that
+  PARDISO's own thread-count-dependent parallel reordering can change the Newton iteration count at
+  the *same* trajectory, invalidating a naive live wall-clock comparison across thread counts. That
+  finding is orthogonal to `blockamg`/`lgmres` specifically, but the live-gate plan for *this* feature
+  should account for it before running one.
+
+### 23.8 A live benchmark methodology finding — PARDISO's thread-count-dependent trajectory (aborted, not yet root-caused)
+
+While the plan was to benchmark PARDISO/`blockamg`/`blockamg`+p1 live across `OMP_NUM_THREADS ∈
+{4, 8, 16, 32}`, Matthias observed that PARDISO at 4 threads and at 8 threads produced a *different*
+number of Newton iterations on the nominally identical trajectory — invalidating a naive live
+wall-clock comparison across thread counts before it got far enough to produce one. The benchmark
+was aborted immediately on that observation, not continued to see how far the divergence went.
+
+**What this session's own log inspection can and cannot confirm.** PARDISO×4 completed the full
+trajectory (`15/8/5/5` Newton iterations, matching the established reference exactly,
+`WALLCLOCK_SECONDS: 1867.299`). PARDISO×8 was killed mid-run before finishing; the truncated log
+shows it matching ×4 *up through the point it was killed* — preload (`1`/`1`), cutback to `0.0025`,
+converged in `15` (matching ×4's own first loading increment exactly), then a further cutback to
+`0.00125` (also matching the expected reference pattern) — but was terminated before reaching the
+next convergence check. **This session's own log does not itself capture the specific divergence
+Matthias observed**; it may have appeared later in ×8's trajectory than what survived being killed,
+or been visible in real-time terminal output not fully preserved in the log. Recorded honestly as
+an open gap, not papered over with a confident-sounding but unverified reconstruction.
+
+**A plausible mechanism, not a confirmed root cause.** MKL PARDISO's own parallel reordering/pivoting
+heuristics can depend on the thread count used, producing a slightly different (still valid)
+factorization and therefore slightly different floating-point roundoff — for a Newton iteration
+sitting close to a convergence-tolerance boundary, that could plausibly tip the iteration count by
+one in either direction. This would be a genuine property of MKL's own parallel PARDISO, not a bug
+in this session's benchmark scripts or in `blockamg`/`lgmres` — but it has not been isolated or
+confirmed here, only hypothesized.
+
+**Why this matters beyond just PARDISO.** Any *live* thread-count comparison for *any* solver in
+this investigation (not just PARDISO) is vulnerable to the same class of confound if that solver's
+own numerics are not bit-identical across thread counts — a live wall-clock number and a live
+Newton-iteration-count are only comparable across two runs if the runs are actually solving the same
+sequence of linear systems to convergence, and a trajectory divergence silently breaks that
+assumption without necessarily producing a NaN or a crash to signal it. §23.7's own `lgmres`
+validation deliberately avoided this exact trap by using the **offline** dumped-matrix harness
+(deterministic, fixed matrices, no thread-count-dependent solve-time numerics feeding back into
+which systems get solved next) rather than a live run across thread counts — the right call in
+hindsight, not merely a scheduling convenience.
+
+**Left as an explicit open item, not resolved this round:** if a live cross-thread-count benchmark
+is wanted again (for PARDISO, `blockamg`, or anything else), it needs either (a) a per-thread-count
+Newton-trajectory verification step before trusting any wall-clock comparison from that run, or (b)
+restricting the comparison to a *fixed* thread count while varying only the solver/configuration
+under test, sidestepping the question entirely for now.
