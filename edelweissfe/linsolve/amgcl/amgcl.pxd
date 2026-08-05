@@ -110,3 +110,28 @@ cdef extern from "amgcl-wrapper.hpp":
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void matvec(int n, const double* x, double* y) except +
         void residual(int n, const double* rhs, const double* x, double* r) except +
+
+    # Callback signature bridging AMGCL's native lgmres Krylov loop back into a Python-level
+    # preconditioner (§23.7) -- see amgcl-wrapper.hpp's own comment on PyPrecondApplyFn/
+    # PyLGMRESPrecondT for why this is a bare function pointer + opaque context rather than a
+    # Cython-overridden C++ virtual method.
+    ctypedef void (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
+
+    # AMGCL's own native outer Krylov solve (§23.7), in place of scipy.sparse.linalg.gmres. Persists
+    # its recycled/augmented Krylov vectors across solve() calls on the same instance whenever
+    # always_reset is set to false in the constructor's params -- see LGMRESOuterSolverT's own
+    # comment for why this class is meant to be built once per BlockAMGSolver, not once per solve.
+    cdef cppclass LGMRESOuterSolver:
+        LGMRESOuterSolver(int n, const char* json_params) except +
+        void solve(int n,
+                   const int* ptr,
+                   const int* col,
+                   const double* val,
+                   const double* rhs,
+                   double* x,
+                   double tol,
+                   int maxiter,
+                   PyPrecondApplyFn applyFn,
+                   void* ctx,
+                   int& iters,
+                   double& error) except +

@@ -479,3 +479,193 @@ cdef class PyAMGCLMatrix:
         cdef double[::1] r_ = r
         self.matrix.residual(n, &rhs_[0], &x_[0], &r_[0])
         return r
+
+
+cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
+    """The C-callable trampoline bridging amgcl::solver::lgmres's per-``apply()`` Precond callback
+    (§23.7) back into Python -- passed to :class:`LGMRESOuterSolver` as a bare function pointer (see
+    ``amgcl-wrapper.hpp``'s ``PyPrecondApplyFn``/``PyLGMRESPrecondT``).
+
+    ``ctx`` is the calling :class:`PyAMGCLLGMRESSolver` instance itself, cast to ``void*`` and back --
+    Cython's own documented pattern for passing a Python object through an opaque C callback context.
+    No manual ``PyObject*`` reference counting is needed: ``ctx`` only ever points at ``self`` from the
+    *same*, still-on-stack :meth:`PyAMGCLLGMRESSolver.solve` call that constructed it (see there), so
+    its lifetime is strictly nested inside this function's own call and never outlives it.
+
+    Declared ``noexcept`` and *not* ``nogil``: every call into this function happens nested inside
+    :meth:`PyAMGCLLGMRESSolver.solve`'s own C++ call, made from a plain ``def`` method that never
+    releases the GIL (matching every other AMGCL wrapper method in this module -- the GIL only blocks
+    *other* Python threads from running during the solve; AMGCL's own OpenMP worker threads never touch
+    a Python object, so they are unaffected either way). Not releasing the GIL around the C++ call was
+    a deliberate choice, not an oversight: doing so would require re-acquiring it here (``with gil:``)
+    on every single preconditioner application -- the hottest inner loop this whole class exists to
+    speed up -- for a benefit (letting unrelated Python threads run during one linear solve) this
+    codebase's actual threading model does not use.
+
+    A Python exception raised by the preconditioner callable cannot propagate through this C
+    function-pointer boundary (there is no C++ exception handler on the AMGCL side expecting one), so
+    it is caught here and stashed on the calling instance instead; :meth:`PyAMGCLLGMRESSolver.solve`
+    re-raises it once the (now-abandoned) AMGCL call returns. ``x`` is zeroed on that path so the
+    (about-to-be-discarded) AMGCL iteration continues on defined, if meaningless, numbers rather than
+    whatever uninitialized/stale data happened to be there.
+    """
+    cdef PyAMGCLLGMRESSolver self = <PyAMGCLLGMRESSolver> ctx
+    cdef Py_ssize_t i
+    # rhs arrives as a `const double*` (it is AMGCL's own internal Arnoldi-vector storage, never meant
+    # to be written through) -- copied element-by-element into a fresh, ordinary (non-const) numpy
+    # array rather than wrapped in a zero-copy memoryview, which would need casting away the pointer's
+    # constness. n is at most the outer Krylov restart length, so this copy is not the cost driver
+    # here -- the Python-level preconditioner call below is.
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr = np.empty(n, dtype=np.float64)
+    cdef double[::1] xView
+    try:
+        for i in range(n):
+            rhsArr[i] = rhs[i]
+        result = self._precondCallable(rhsArr)
+        xView = np.ascontiguousarray(result, dtype=np.float64)
+        if xView.shape[0] != n:
+            raise ValueError(
+                "PyAMGCLLGMRESSolver: preconditioner callable returned a vector of length {:} for an "
+                "input of length {:}".format(xView.shape[0], n)
+            )
+        for i in range(n):
+            x[i] = xView[i]
+    except BaseException as exc:
+        self._pendingException = exc
+        for i in range(n):
+            x[i] = 0.0
+
+
+cdef class PyAMGCLLGMRESSolver:
+    """AMGCL's own native ``amgcl::solver::lgmres`` as blockamg.py's outer Krylov solve (§23.7), in
+    place of ``scipy.sparse.linalg.gmres`` -- see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for
+    the full motivation and design reasoning (this class is a thin Cython shell around it).
+
+    Bridges the field-split block Gauss-Seidel preconditioner
+    (:mod:`edelweissfe.linsolve.blockamg.blockamg`'s ``blockGaussSeidel`` closure, dispatching to
+    per-field :class:`PyAMGCLSolver`/:class:`~edelweissfe.linsolve.blockamg.ptwogrid.
+    PTwoGridPreconditioner` objects) to AMGCL's native ``Precond`` interface via
+    :func:`_lgmresPrecondApplyTrampoline`, called once per Arnoldi vector.
+
+    One instance should be constructed once per ``BlockAMGSolver`` and reused for that solver's entire
+    lifetime (see ``blockamg.py``'s construction site), not rebuilt per solve: with ``always_reset:
+    false``, this is what lets AMGCL's own recycled/augmented Krylov vectors survive *across* separate
+    :meth:`solve` calls -- the entire point of using ``lgmres`` here instead of plain GMRES. The
+    problem size ``n`` is fixed at construction (AMGCL preallocates every scratch vector for it); a
+    field-structure/dof-count change needs a fresh instance.
+    """
+    cdef LGMRESOuterSolver* solver
+    cdef readonly int n
+    """The fixed problem size this instance was constructed for."""
+    cdef readonly int lastIterations
+    """The iteration count AMGCL's lgmres reported for the most recent solve, -1 before the first."""
+    cdef readonly double lastError
+    """The relative (preconditioned) residual AMGCL's lgmres reported for the most recent solve, NaN
+    before the first."""
+    cdef object _precondCallable
+    cdef object _pendingException
+
+    def __cinit__(self, int n, dict params=None):
+        """
+        n
+            The fixed problem size this instance is built for.
+        params
+            AMGCL's own ``lgmres::params`` field names, forwarded verbatim as JSON (``M``, ``K``,
+            ``always_reset``, ``pside``, ``maxiter``, ``tol``, ``abstol``, ``ns_search``, ``verbose``)
+            -- unlike :class:`PyAMGCLSolver`, there is no ``precond``/``solver`` nesting here, since
+            this wraps a single ``amgcl::solver::lgmres`` object directly, not ``amgcl::make_solver``.
+            ``maxiter``/``tol`` given here only set the *initial* defaults -- :meth:`solve` overrides
+            both on every call (see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for why).
+        """
+        if params is None:
+            params = {}
+        self.n = n
+        self.lastIterations = -1
+        self.lastError = float("nan")
+        self._precondCallable = None
+        self._pendingException = None
+
+        cdef bytes json_bytes = json.dumps(params).encode("utf-8")
+        cdef const char* c_json = json_bytes
+        self.solver = new LGMRESOuterSolver(n, c_json)
+
+    def __dealloc__(self):
+        if self.solver != NULL:
+            del self.solver
+
+    def solve(self, object A, object rhs, object applyPreconditioner, double tol, int maxiter, object x0=None):
+        """
+        A
+            scipy.sparse.csr_matrix, this solve's (equilibrated) full coupled operator -- converted
+            fresh every call (its pattern churns every solve, same as :class:`PyAMGCLMatrix`; only the
+            recycled Krylov *vectors* persist across calls, never a cached matrix conversion).
+        rhs
+            array-like, converted to 1D float64 (C-contiguous).
+        applyPreconditioner
+            A Python callable, ``residual (1D float64 array) -> correction (1D float64 array)`` --
+            exactly :mod:`~edelweissfe.linsolve.blockamg.blockamg`'s ``blockGaussSeidel`` closure's own
+            shape. Called once per Arnoldi vector via :func:`_lgmresPrecondApplyTrampoline`; any
+            exception it raises is re-raised here once the (now-abandoned) AMGCL call returns.
+        tol, maxiter
+            This call's relative residual tolerance and maximum total Arnoldi iterations (across every
+            internal restart -- AMGCL's own ``maxiter`` semantics differ from scipy's restart x maxiter,
+            see blockamg.py's call site). Mutates the underlying ``amgcl::solver::lgmres`` object's own
+            ``prm`` in place rather than reconstructing it, so the recycled Krylov vectors survive.
+        x0
+            Optional initial guess (warm start), e.g. blockamg.py's true-residual continuation retry.
+            Defaults to zero.
+        """
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+
+        cdef int n = A.shape[0]
+        if n != self.n:
+            raise ValueError(
+                "PyAMGCLLGMRESSolver: matrix size {:} does not match the size {:} this instance was "
+                "constructed for -- construct a fresh instance on any field-structure/size "
+                "change.".format(n, self.n)
+            )
+
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x
+        if x0 is None:
+            x = np.zeros(n, dtype=np.float64)
+        else:
+            x = np.ascontiguousarray(x0, dtype=np.float64).copy()
+
+        cdef int[::1] indptr_ = indptr
+        cdef int[::1] indices_ = indices
+        cdef double[::1] data_ = data
+        cdef double[::1] rhs_ = rhs_arr
+        cdef double[::1] x_ = x
+
+        cdef int iters = 0
+        cdef double error = 0.0
+
+        # self is passed through as the callback's opaque context, cast to void* and back in
+        # _lgmresPrecondApplyTrampoline -- see that function's own docstring for why this needs no
+        # manual PyObject* reference counting (self is kept alive by this very call's own stack frame
+        # for as long as the cast pointer is in use).
+        self._precondCallable = applyPreconditioner
+        self._pendingException = None
+        cdef void* ctx = <void*> self
+        try:
+            self.solver.solve(
+                n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0],
+                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error
+            )
+        finally:
+            self._precondCallable = None
+
+        if self._pendingException is not None:
+            exc = self._pendingException
+            self._pendingException = None
+            raise exc
+
+        self.lastIterations = iters
+        self.lastError = error
+        return x
