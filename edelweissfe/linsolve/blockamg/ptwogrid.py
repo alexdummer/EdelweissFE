@@ -49,8 +49,6 @@ zero to a homogeneous Newton correction, which the dropped weight already encode
 
 import numpy as np
 import scipy.sparse as sp
-from pyamg.relaxation.chebyshev import chebyshev_polynomial_coefficients
-from pyamg.relaxation.relaxation import polynomial
 
 #: R1/R2's winning coarse-level AMGCL configuration (§22.2-bis): 26 (R1, on A1 alone) / 58 (R2,
 #: full two-grid on the free submatrix) iterations, both comfortably clearing their gates.
@@ -65,26 +63,25 @@ _DEFAULT_NU = 1
 _DEFAULT_FINE_DEGREE = 5
 
 
-def _powerIterationSpectralRadius(A, iters=50, seed=0):
-    """~50-step power iteration (§17 B5: a short/default estimate is what made Chebyshev diverge
-    before), symmetry-agnostic (valid for the mildly non-symmetric free submatrix too)."""
-    rng = np.random.default_rng(seed)
-    v = rng.standard_normal(A.shape[0])
-    v /= np.linalg.norm(v)
-    nrm = 1.0
-    for _ in range(iters):
-        v = A @ v
-        nrm = np.linalg.norm(v)
-        v = v / nrm
-    return nrm
+def _buildChebyshevSmoother(A, degree, powerIters=50, lower=0.01, higher=1.1):
+    """The fine smoother, backed by AMGCL's own OpenMP-threaded ``runtime::relaxation::wrapper``
+    (§22.4) instead of a serial scipy/numpy polynomial -- §22.3 measured the latter at 81%+ of the
+    preconditioner's own apply time. The spectral radius (power iteration, §17 B5: a short/default
+    estimate is what made Chebyshev diverge before) is now computed inside AMGCL's own chebyshev
+    constructor via the identical algorithm, so it no longer needs a separate Python-side pass.
+    ``higher`` defaults to 1.1, matching the old hand-rolled smoother's ``upper=1.1`` safety margin
+    above the estimated spectral radius -- AMGCL's own chebyshev defaults ``higher`` to 1.0, which
+    would silently retune the fine smoother relative to what §22.3 validated."""
+    from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLRelaxationSmoother
 
-
-def _buildChebyshevSmoother(A, rho, degree, lower=0.01, upper=1.1):
-    a = rho * lower
-    coefficients = -chebyshev_polynomial_coefficients(a, rho * upper, degree)[:-1]
+    smoother = PyAMGCLRelaxationSmoother(
+        {"type": "chebyshev", "degree": degree, "power_iters": powerIters, "lower": lower, "higher": higher}
+    )
+    smoother.build(A)
 
     def smooth(x, rhs, sweeps):
-        polynomial(A, x, rhs, coefficients=coefficients, iterations=sweeps)
+        for _ in range(sweeps):
+            smoother.applyStep(x, rhs)
         return x
 
     return smooth
@@ -226,8 +223,7 @@ class PTwoGridPreconditioner:
         coarseSolver.build(A1_free)
         self._coarseSolver = coarseSolver
 
-        rho = _powerIterationSpectralRadius(A_free, iters=50)
-        self._smooth = _buildChebyshevSmoother(A_free, rho, self._fineDegree)
+        self._smooth = _buildChebyshevSmoother(A_free, self._fineDegree)
 
     def applyPreconditioner(self, r: np.ndarray) -> np.ndarray:
         """One two-grid V-cycle: pre-smooth, coarse-grid correction, post-smooth, on the free

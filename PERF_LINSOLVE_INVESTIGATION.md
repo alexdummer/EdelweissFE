@@ -103,7 +103,7 @@ has begun. Two cheap leads are now measured on the real model:**
   hand-rolled Chebyshev fine smoother is **81% of the preconditioner's own time** on every ord, far
   past the 15% threshold this section's own text pre-committed as the line for shipping the simple
   version. Bar fails; per the plan's own instruction on this outcome, `p1Maps` stays opt-in-only,
-  not shipped as any default, and §22.4 (NIST plumbing, live gate, ship-as-default) does not
+  not shipped as any default, and §22.5 (NIST plumbing, live gate, ship-as-default) does not
   proceed until a threaded fine-smoother apply exists — a concrete, scoped follow-up
   (`relaxation::as_preconditioner` in the AMGCL wrapper, or a `prange` Cython SpMV fallback; the
   fine smoother needs roughly a 5-6× speedup to clear the bar). A separate, real finding surfaced
@@ -112,6 +112,19 @@ has begun. Two cheap leads are now measured on the real model:**
   (not MKL — confirmed) uncoordinated with AMGCL's OpenMP pool, ~32 total threads rather than the
   intended 16 (not hardware oversubscription on this 36-core box, but a violation of the "16
   threads total" assumption every run command here has made).
+  **22.4 (the threaded fine smoother, executed)** wraps AMGCL's `runtime::relaxation::wrapper`
+  directly (`as_preconditioner`'s `Relax` template-template parameter cannot be chosen from a JSON
+  string, and its always-from-zero `apply()` does not fit the two-grid V-cycle's warm post-smooth
+  anyway) as a new `RelaxationSmootherT`/`PyAMGCLRelaxationSmoother` class, fixing two pitfalls
+  found while building it: the raw `crs_tuple` adapter fails ADL for the relaxation constructors
+  (needs converting through `Backend::matrix` first, like `as_preconditioner.hpp`'s own `init()`
+  does), and AMGCL's `chebyshev::higher` defaults to `1.0` vs. the old hand-rolled smoother's
+  validated `1.1` (silently drifted the iteration count until pinned explicitly). Result: aggregate
+  wall-clock rose from 0.368× to **0.792×** — a real 2.15× improvement — but still short of the
+  ≥1.20× gate; the bottleneck has moved to the **coarse-level AMGCL apply** (55-61% of the
+  preconditioner's own time, now bigger than the fine smoother's 38-41%) and to fixed per-iteration
+  overhead, not the fine smoother anymore. `p1Maps` stays opt-in-only; §22.5 still does not
+  proceed. Recorded as a deliberate stopping point pending a judgement call on a further round.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -3075,7 +3088,7 @@ not met on every ord either — recorded honestly, not waved through.
 speedup); the worst single-ord ratio is 0.326× (nowhere near the "no ord past ~1.05×" allowance);
 true residuals are measurably looser on 2 of 9 ords. Per this section's own instruction on this
 outcome ("record the table and the mechanism, default untouched"): **`p1Maps` stays a correctly-
-implemented, tested, opt-in-only mechanism — not shipped as any default, and §22.4's live gate /
+implemented, tested, opt-in-only mechanism — not shipped as any default, and §22.5's live gate /
 NIST plumbing / ship-as-default steps do not proceed** until a threaded fine-smoother apply exists
 to close this specific, now precisely-quantified gap. The underlying p-multigrid *algorithm*
 remains validated (R1's 26 iterations on `A₁` alone, R2's 2.30× win in isolation, and now this
@@ -3086,7 +3099,122 @@ Cython SpMV fallback), now with a hard number attached: **the fine smoother need
 speedup (81% ÷ 15%, very roughly) before this clears its own bar** — a concrete target for that
 follow-up work, not an open-ended "make it faster."
 
-### 22.4 Live gate, plumbing, and ship decision
+### 22.4 Threaded fine smoother — AMGCL `relaxation::as_preconditioner`-style wrapper (executed)
+
+Picked up 22.3's own named follow-up (Matthias, after review): extend the AMGCL wrapper with a
+standalone, OpenMP-threaded smoother entry point so the fine sweep stops being the serial
+scipy/numpy bottleneck 22.3 measured at 81%+.
+
+**Design decision, found while reading AMGCL's headers, not assumed from the plan text.** The plan
+named `amgcl::relaxation::as_preconditioner<Backend, Relax>` as the target. Its second parameter is
+a **compile-time template-template parameter** — unlike every other method in
+`amgcl-wrapper.hpp`, which selects its AMGCL component at *runtime* via a JSON `"type"` string
+through `amgcl::runtime::preconditioner<Backend>`, `as_preconditioner`'s `Relax` cannot be chosen
+from a JSON string without a hard-coded, non-configurable instantiation per smoother type. AMGCL
+ships the missing piece: `amgcl::runtime::relaxation::wrapper<Backend>` (`amgcl/relaxation/
+runtime.hpp`) is itself a plain `template<class Backend>` class implementing the same
+`apply`/`apply_pre`/`apply_post` interface as any concrete relaxation, dispatching internally on
+its own `"type"` key — exactly the runtime flexibility `as_preconditioner` lacks. Used directly as
+the smoother (one level below a full hierarchy), not through `as_preconditioner` at all, for a
+second reason found on inspection: `as_preconditioner::apply()` always clears `x` first (built for
+a single standalone application), which does not fit the two-grid V-cycle's actual need — a
+from-zero pre-smooth, a coarse-grid correction, then a **warm** post-smooth continuing from the
+corrected `x`. Exposing `apply_pre()` directly (identical to `apply_post()` for chebyshev) lets the
+Python side decide "from zero" (zero `x` itself) and "how many sweeps" (call the step repeatedly),
+matching the old hand-rolled `smooth(x, rhs, sweeps)` closure's contract exactly — `ptwogrid.py`'s
+`build()`/`applyPreconditioner()` needed no structural change, only the closure's implementation.
+
+**A second library-level pitfall found and fixed while implementing, not assumed:** passing the
+raw `amgcl::adapter::crs_tuple`-adapted `std::tuple` (the same tuple form `LinearSolverT::build()`
+already passes successfully into `amgcl::make_solver`) directly into
+`runtime::relaxation::wrapper`'s constructor fails to compile — a wall of "`'rows' was not declared
+in this scope`" across every one of the ten relaxation types the runtime wrapper's `switch`
+instantiates (all ten, not just the one selected at runtime — the switch forces every branch to
+compile). Root cause: several relaxation constructors (chebyshev included) call `rows(A)` /
+`diagonal(A, ...)` / `row_begin(A, i)` **unqualified**, relying on ADL to find `amgcl::backend`'s
+overloads — ADL only searches a type's *own* associated namespaces, and `amgcl::backend::crs<...>`
+lives there, but the raw adapter tuple (`std::tuple<int, amgcl::iterator_range<...>, ...>`) does
+not, even though the tuple adapter is genuinely sufficient for the *qualified* calls the AMG
+hierarchy build itself uses. Fixed by converting once via `Backend::matrix`'s (`amgcl::backend::
+crs<double,int,int>`) own generic-`Matrix` constructor before ever touching the relaxation object —
+the same conversion `as_preconditioner.hpp`'s own `init()` performs — and keeping the result alive
+for every `applyStep()` call, since chebyshev's constructor extracts the spectral radius but does
+not retain `A` itself.
+
+**A tuning pitfall found by comparing outer-iteration counts, not assumed correct from a clean
+build:** the first working build ran, but ord 00002 needed 61 outer GMRES iterations against the
+50 §22.3's validated hand-rolled smoother needed on the exact same system — a silent behavioural
+drift despite "the same degree, the same nu." Cause: AMGCL's own `chebyshev::params::higher`
+defaults to `1.0`, but the old hand-rolled `_buildChebyshevSmoother`'s `upper=1.1` (a deliberate
+safety margin above the power-iterated spectral radius estimate) was never carried over into the
+new JSON params. Passing `"higher": 1.1` explicitly reproduced the validated 50-iteration count
+exactly. Recorded here because it is exactly the kind of default-vs-validated-default mismatch
+§8/§17's gotcha lists exist to catch, and because it is easy to miss: the *coarse* level's own
+chebyshev config (`_DEFAULT_COARSE_PRECOND`) has always run on AMGCL's default `higher=1.0`
+un-noticed (it goes through AMGCL's own hierarchy, no Python-side override existed to compare
+against) — only the fine level's hand-rolled Python smoother had ever set `upper=1.1`, so only the
+fine level's replacement could silently drift.
+
+**Files:** `edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp` (new `RelaxationSmootherT` class + a
+`RelaxationSmoother` typedef), `.pxd` (new `cdef cppclass RelaxationSmoother` declaration), `.pyx`
+(new `PyAMGCLRelaxationSmoother` cdef class: `build(A)` / `applyStep(x, rhs)` in place). `ptwogrid.py`:
+`_buildChebyshevSmoother` now builds a `PyAMGCLRelaxationSmoother` and loops `applyStep` `sweeps`
+times instead of calling `pyamg.relaxation.relaxation.polynomial`; the separate Python-side
+`_powerIterationSpectralRadius` pass is gone (AMGCL's chebyshev constructor computes the identical
+power-iteration estimate internally now) and so is the `pyamg` import.
+
+**Measured (single-ord sanity, then the full 9-ord replay, same session, same 9 dumped systems as
+22.3):**
+
+| ord | shipped iters | p-two-grid iters | shipped wall | p-two-grid wall | "speedup" | shipped res | ptwogrid res |
+|---|---|---|---|---|---|---|---|
+| 00002 | 66 | 50 | 23.17s | 23.77s | 0.97× | 6.53e-06 | 1.47e-05 |
+| 00003 | 164 | 121 | 47.29s | 49.68s | 0.95× | 8.92e-09 | 1.81e-08 |
+| 00004 | 62 | 53 | 20.88s | 24.80s | 0.84× | 6.67e-06 | 6.86e-06 |
+| 00005 | 51 | 46 | 17.31s | 23.08s | 0.75× | 4.32e-06 | 5.58e-06 |
+| 00006 | 55 | 51 | 17.74s | 26.95s | 0.66× | 2.71e-06 | 3.29e-06 |
+| 00007 | 53 | 54 | 17.34s | 28.89s | 0.60× | 3.47e-06 | 4.02e-06 |
+| 00008 | 54 | 49 | 18.04s | 25.01s | 0.72× | 3.90e-06 | 5.82e-06 |
+| 00009 | 23 | 20 | 10.25s | 12.87s | 0.80× | 2.10e-04 | 2.04e-04 |
+| 00010 | 50 | 45 | 17.07s | 23.72s | 0.72× | 4.42e-06 | 4.97e-06 |
+| **TOTAL** | | | **189.09s** | **238.77s** | **0.792×** | | |
+
+Outer-iteration counts are unchanged from 22.3 (as expected — threading the smoother's arithmetic
+does not change the algorithm, only its wall-clock). **A real, large wall-clock improvement:**
+aggregate speedup rose from 22.3's **0.368×** to **0.792×** — the p-two-grid solve is now 2.15×
+faster than it was before threading, purely from this change. **Still below the ≥1.20× gate**, and
+the worst single ord (00007, 0.60×) is nowhere near the "no ord past ~1.05×" allowance. True
+residuals show the same character as 22.3 (both arms comfortably inside the requested tolerance;
+p-two-grid measurably looser on most ords, 1.1–2.3×, marginally tighter on one) — unaffected by the
+smoother-implementation swap, as expected, since only the arithmetic backend changed, not the
+algorithm.
+
+**The bottleneck has moved, and this is the section's main new finding.** Fine-smoother share of
+the preconditioner's own apply time dropped from 22.3's 81.1–81.6% to **37.8–41.3%** — the threaded
+Chebyshev did exactly what it was built to do. But the **coarse-level AMGCL apply** (the two-grid
+V-cycle on `A₁`, `npre=2`/`npost=2` at chebyshev degree 8) is now the *larger* of the two
+components, at 54.3–61.1% of the preconditioner's own time, and the p-two-grid preconditioner's
+share of the *whole solve's* wall-clock also fell, from 22.3's 66.6–81.1% to 42.3–61.1% — meaning
+outer-loop and Python/Cython call overhead (a separate `PyAMGCLSolver.applyPreconditioner` call per
+outer iteration, with its own value-type array copy at the C++ boundary, plus the `P_free.T @ res`
+/ `P_free @ corrCoarse` sparse matvecs, plus per-call Python/Cython crossing cost) now account for a
+comparable-or-larger share than either smoother. **The plan's own "5-6× fine-smoother speedup"
+estimate was accurate for what it measured (fine share alone) but incomplete as a sufficient
+condition** — the fine smoother's threading was necessary but is not sufficient on its own; the
+coarse-level apply and the fixed per-iteration overhead are now co-equal levers, not
+already-solved background cost. A next attempt would need to attack the coarse `applyPreconditioner`
+cost (fewer/cheaper `npre`/`npost` sweeps, a lighter coarsening, or eliminating its own array-copy
+overhead) and/or the fixed per-outer-iteration overhead, not just the fine smoother again.
+
+**Bar: still fails**, by the same reading as 22.3 (aggregate `0.792×` vs. the `≥1.20×` gate; worst
+ord `0.600×` vs. the `≥0.95×` allowance) — but the gap has shrunk by more than half in wall-clock
+terms (2.7× regression → 1.26× regression) from this one change alone, and the *mechanism* for
+what remains is now precisely identified rather than an open-ended "make the fine smoother
+faster." `p1Maps` stays opt-in-only; 22.5's live gate / NIST plumbing / ship-as-default steps still
+do not proceed. Recorded here as a deliberate stopping point for a judgement call on whether
+attacking the coarse-level cost is worth a further round, rather than continuing un-asked.
+
+### 22.5 Live gate, plumbing, and ship decision
 
 1. **NIST plumbing:** compute `isCorner`/`edgeEndpoints` at equation-system build, next to where
    the field structure is already pushed (`nonlinearimplicitstatic.py:314`,

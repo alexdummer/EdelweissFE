@@ -94,3 +94,11 @@ cdef extern from "amgcl-wrapper.hpp":
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void applyPreconditioner(int n, const double* rhs, double* x) except +
         string report() except +
+
+    # A standalone, OpenMP-threaded relaxation smoother (§22.4) -- e.g. the p-two-grid
+    # preconditioner's fine sweep, one level below a full AMG hierarchy. Its own constructor
+    # parameter tree is flat ({"type": "chebyshev", ...}), not nested under "precond.relax".
+    cdef cppclass RelaxationSmoother:
+        RelaxationSmoother(const char* json_params) except +
+        void build(int n, const int* ptr, const int* col, const double* val) except +
+        void applyStep(int n, const double* rhs, double* x) except +

@@ -6,6 +6,7 @@
 #include <amgcl/backend/builtin.hpp>
 #include <amgcl/make_solver.hpp>
 #include <amgcl/preconditioner/runtime.hpp>
+#include <amgcl/relaxation/runtime.hpp>
 #include <amgcl/solver/runtime.hpp>
 #include <amgcl/value_type/static_matrix.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -316,6 +317,99 @@ public:
   }
 };
 
+// A standalone, runtime-selectable smoother -- e.g. the p-two-grid preconditioner's fine sweep
+// (§22.3/§22.4, ptwogrid.py), which previously ran a hand-rolled serial scipy/numpy Chebyshev
+// polynomial and was measured at 81%+ of the preconditioner's own apply time. amgcl::relaxation::
+// as_preconditioner<Backend, Relax> cannot serve this directly: its Relax parameter is a
+// *compile-time* template-template parameter, so a JSON "type" string (the convention every other
+// method here follows, chosen via amgcl::runtime::preconditioner<Backend>) cannot select it. AMGCL
+// ships exactly the type this needs though: amgcl::runtime::relaxation::wrapper<Backend> is itself a
+// plain template<class Backend> class implementing the same apply/apply_pre/apply_post interface as
+// any concrete relaxation, dispatching internally on its own "type" key (chebyshev, gauss_seidel,
+// ilu0, spai0, ...) -- so it is used here directly as the smoother, one level below the full AMG
+// hierarchy, rather than through as_preconditioner at all.
+//
+// as_preconditioner's own apply() always clears x first (a fresh, standalone preconditioner
+// application), which does not fit ptwogrid.py's V-cycle: it needs a *from-zero* pre-smooth followed
+// by a coarse-grid correction and then a *warm* post-smooth continuing from the corrected x, not two
+// independent from-zero applications. Exposing apply_pre() directly (identical to apply_post() for
+// chebyshev; both just continue the polynomial recursion from the given x) lets the Python side decide
+// "start from zero" (zero x itself before the pre-smooth loop) and "how many sweeps" (call applyStep
+// repeatedly) exactly as the old hand-rolled smooth(x, rhs, sweeps) closure did, so ptwogrid.py's
+// build()/applyPreconditioner() need no structural change -- only the closure's implementation swaps
+// from serial scipy/numpy to this OpenMP-threaded builtin backend.
+//
+// The relaxation object does not retain A (chebyshev's constructor only extracts the spectral radius
+// and, if scale=true, the inverse diagonal); apply_pre() takes A again on every call. LinearSolverT's
+// AMG hierarchy gets this for free -- amgcl::make_solver copies the input tuple into the hierarchy's
+// own amgcl::backend::crs<...> once, and every level's relaxation object (including the coarse-level
+// chebyshev used above) is then built and applied on *that*, never on the raw tuple. Bypassing the
+// hierarchy (as this class does, deliberately) loses that conversion, and it turns out to be load-
+// bearing, not incidental: several relaxation constructors (chebyshev included) call `rows(A)` /
+// `diagonal(A, ...)` / `row_begin(A, i)` unqualified, relying on ADL to find amgcl::backend's
+// overloads. ADL only reaches into a type's *own* namespace -- amgcl::backend::crs<...> lives there,
+// so ADL finds them; the raw adapter tuple (amgcl::adapter::crs_tuple.hpp's std::tuple<int,
+// iterator_range<...>, ...>) does not, even though the tuple adapter itself is genuinely sufficient
+// for copying (crs's own generic-Matrix constructor calls the *qualified* backend::rows(A) etc., which
+// does work on the tuple). Confirmed by reproducing exactly this failure first: passing the raw tuple
+// straight to amgcl::runtime::relaxation::wrapper's constructor compiles the tuple-vs-crs mismatch
+// into a wall of "'rows' was not declared in this scope" errors across every relaxation type the
+// runtime wrapper's switch instantiates (chebyshev included, despite it being the only type actually
+// selected at runtime -- the switch statement forces the compiler to instantiate all ten). The fix:
+// convert once via Backend::matrix's own generic-Matrix constructor (the same conversion
+// as_preconditioner.hpp's own init() performs) and keep the result alive for every applyStep() call.
+class RelaxationSmootherT {
+public:
+  typedef amgcl::backend::builtin< double >              Backend;
+  typedef amgcl::runtime::relaxation::wrapper< Backend > Relaxation;
+  typedef Backend::matrix                                BackendMatrix;
+
+  boost::property_tree::ptree      prm;
+  std::shared_ptr< BackendMatrix > A_;
+  std::unique_ptr< Relaxation >    relax_;
+  std::vector< double >            tmp_;
+
+  // Constructor: parses the relaxation's own parameter tree directly (a flat "type"-keyed tree, e.g.
+  // {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01} -- not nested under
+  // "precond.relax" like the full-hierarchy wrappers above, since there is no hierarchy here).
+  RelaxationSmootherT( const char* json_params ) : relax_()
+  {
+    std::string json_str( json_params );
+    if ( !json_str.empty() ) {
+      std::stringstream ss( json_str );
+      boost::property_tree::read_json( ss, prm );
+    }
+  }
+
+  // Build the smoother for A once, so applyStep() can be called repeatedly without rebuilding
+  // (mirrors LinearSolverT::build()'s build-once / apply-many split).
+  void build( int n, const int* ptr, const int* col, const double* val )
+  {
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    A_       = std::make_shared< BackendMatrix >( A );
+    relax_.reset( new Relaxation( *A_, prm ) );
+    tmp_.assign( n, 0.0 );
+  }
+
+  // One in-place smoothing step continuing from the given x (apply_pre; identical to apply_post for
+  // chebyshev, the only relaxation type this has been exercised with so far -- see the class comment).
+  // Call repeatedly for multiple sweeps; zero x beforehand for a from-zero (pre-smooth) application.
+  void applyStep( int n, const double* rhs, double* x )
+  {
+    if ( !relax_ ) {
+      throw std::runtime_error( "applyStep(): no smoother built yet -- call build() first" );
+    }
+    auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
+    auto x_rng   = amgcl::make_iterator_range( x, x + n );
+    auto tmp_rng = amgcl::make_iterator_range( tmp_.data(), tmp_.data() + n );
+    relax_->apply_pre( *A_, rhs_rng, x_rng, tmp_rng );
+  }
+};
+
 // The default, unchanged double-precision wrapper, and the new float32 one added for §19.3.
 typedef LinearSolverT< double > LinearSolver;
 typedef LinearSolverT< float >  LinearSolverFloat;
@@ -324,3 +418,6 @@ typedef LinearSolverT< float >  LinearSolverFloat;
 // registered 2D CantileverBeamQuad4BlockAMG regression test -- one template parameter apart.
 typedef LinearSolverBlockT< amgcl::static_matrix< double, 2, 2 > > LinearSolverBlock2;
 typedef LinearSolverBlockT< amgcl::static_matrix< double, 3, 3 > > LinearSolverBlock3;
+
+// §22.4: standalone OpenMP-threaded relaxation smoother, see RelaxationSmootherT above.
+typedef RelaxationSmootherT RelaxationSmoother;
