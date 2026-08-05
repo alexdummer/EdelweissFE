@@ -176,6 +176,13 @@ mechanism serves the implicit solvers (system matrix transformation
 dynamics (mass-conserving row-sum folding of slave masses and forces onto the masters, direct
 kinematic slaving -- the critical time step is untouched).
 
+The implicit solver's ``useCachedMPCCondensation`` option (:doc:`solvers`, ``NIST``) offers an
+alternative, cached-pattern way to compute :math:`T^T K T + C` (correctness-equivalent, validated
+against the direct expression on the full test suites and a live large-scale contact+AMR+tie
+model). It is off by default: measured on that same model, it was *slower*, not faster, than the
+direct expression -- the SpGEMMs it restricts to the eliminated DOFs still cost proportional to the
+full system size, not to the (typically much smaller) number of eliminated DOFs.
+
 On matching interface meshes, tying is exactly equivalent to merging the interface nodes: the
 patch test passes to machine precision, and both the implicit and the explicit (central
 difference) solutions reproduce the monolithic mesh identically. On non-matching meshes the

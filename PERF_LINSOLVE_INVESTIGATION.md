@@ -59,13 +59,19 @@ has begun. Two cheap leads are now measured on the real model:**
   rungs passed strictly, and **EW forcing shipped as the default (`etaMax=3e-4`,
   commit `76cb09da`)**. Net: trajectory-safe and an accuracy gap closed, but live wall-clock stays
   at PARDISO parity (81.3 s vs 83.9 s) — fixed per-solve costs dominate, not outer iterations.
-- **Phase 6 is planned, not started** ([§21](#21-phase-6-plan--attack-the-fixed-per-solve-costs-stable-pattern-part-a-cached-pattern-condensation-part-b)):
-  attack those fixed per-solve costs. Part A = a stable sparsity pattern via
-  `pruneCondensedMatrixZeros=False` under blockamg, to activate the shipped-but-inert hierarchy
-  reuse. Part B = the MPC condensation rebuilt as a cached-pattern value scatter (the assembly-side
-  half of Lead 2, no §7 exposure). Includes a mandatory metric-reconciliation prerequisite (§21.0) —
-  the `Job computation time` figure the Phase 4/5 parity claims rest on does not reconcile with the
-  offline per-solve measurements. D4 (the ≥1M-dof demonstration) remains the phase after.
+- **Phase 6 executed** ([§21](#21-phase-6-plan--attack-the-fixed-per-solve-costs-stable-pattern-part-a-cached-pattern-condensation-part-b)):
+  attacked the fixed per-solve costs. **Part A stopped at A1**: with
+  `pruneCondensedMatrixZeros=False` the sparsity pattern *still* churns every iteration (driven by
+  contact/tie connectivity, not zero-pruning), so the shipped-but-inert hierarchy reuse has nothing
+  stable to exploit — A2–A5 not attempted, per the plan's own stop condition. **Part B implemented,
+  validated, and shipped as opt-in, not default**: the MPC condensation as a cached-pattern value
+  scatter is correctness-equivalent (two real bugs found and fixed via the exactness assertion; full
+  test suites plus a live 280k-dof trajectory match byte-for-byte on both PARDISO and blockamg) but
+  measured **~1.7× slower**, not faster, on the reference model — the SpGEMMs the plan assumed were
+  cheap (restricted to the eliminated DOFs' tiny row count) actually cost proportional to the full
+  system size, since SciPy's SpGEMM must scan the left operand's full row range regardless of the
+  right operand's sparsity. Ships as `useCachedMPCCondensation` (default `False`). D4 (the ≥1M-dof
+  demonstration) remains the phase after.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -2348,6 +2354,134 @@ TᵀKT + C  =  DKD  +  DᵀKS  +  SᵀKD  +  SᵀKS  +  C
 **B4 — docs + housekeeping.** Update the relevant Sphinx page (wherever MPC condensation is
 documented; `linsolvers.rst` cross-reference at minimum) and this document. While committing:
 finally gitignore `edelweissfe/linsolve/klu/klu.c` (§8/§15 — it has bitten twice).
+
+**B2/B3 — executed. Correctness holds after fixing two real bugs the exactness assertion caught;
+performance is the opposite of the plan's expectation — the cached path is slower, not faster, on
+the reference model. Shipped as an opt-in (`useCachedMPCCondensation`, default `False`), not the
+new default.**
+
+**Implementation** (`edelweissfe/numerics/mpctransformation.py`): `T = D + S` split as planned
+(`D` diagonal, `S` the slave rows only), `DKD` as a values-only mask of `K`'s own pattern (no
+SpGEMM, cheap), the three `S`-touching terms (`D K S`, `Sᵀ K D`, `Sᵀ K S`) as SpGEMMs recomputed
+every call, and a cached union output pattern rebuilt only when `K`'s own `indices`/`indptr`
+identity changes (B1's invalidation check, confirmed valid — see below). `_transformSystemMatrixLegacy`
+kept as the reference expression, both for the `EDELWEISS_MPC_ASSERT_EXACT` cross-check and as the
+method actually used by default now (see the ship decision).
+
+**Two real bugs, both caught by the `EDELWEISS_MPC_ASSERT_EXACT` cross-check the plan specified as
+a debug flag — validating that the flag was worth building, independent of everything else this
+phase found:**
+
+1. **The `-0` slice pitfall.** `self._S = csr_matrix((tVals[-nSlaveEntries:], ...))` — with **zero**
+   slave DOFs (`nSlaveEntries == 0`, a legitimate case: a system assembled before any hanging-node
+   or tie constraint exists yet), `tVals[-0:]` is `tVals[0:]` in Python/NumPy — the **entire**
+   array, not empty. `self._S` silently became the full identity matrix instead of zero, so every
+   `S`-touching term picked up ~3 extra copies of `K`. Caught locally (a standalone, Cython/Marmot-
+   free correctness script run before ever touching xeon) on the very first synthetic test with
+   zero constraints; fixed by slicing from an explicit `len(tVals) - nSlaveEntries` start instead of
+   a negative index. A regression test (`tests/test_mpc_cached_condensation.py::test_zero_slave_dofs_regression`)
+   pins this down.
+2. **SciPy's SpGEMM eliminates output entries whose accumulated value is exactly zero — even with
+   every individual contribution nonzero.** First surfaced on the real AMR test suite (§9's
+   `AMR_*` tests, 12 of them) as a `ValueError: operands could not be broadcast together` — the
+   cached scatter map's fixed size silently went stale because an independent DOF's raw `K` value
+   crossed through exact `0.0` between Newton iterations while `K`'s *pattern* stayed fixed (a
+   `searchsorted`-based recomputation of the three S-touching terms' positions, every call, fixes
+   this — only the *union pattern itself* stays cached per epoch). Fixing that exposed the deeper
+   version of the same mechanism: even a **value-blind** pass meant to build a safe superset pattern
+   (data forced to a uniform placeholder like `1.0`, so no individual factor is ever exactly zero)
+   is not safe, because the placeholder's own accumulated sum can *itself* cancel to exactly zero at
+   a position where the real, differently-weighted sum would not (found live on the actual 280k-dof
+   pryout model: 1290 missing union keys, all in one S-touching term, rows/cols in a suspicious
+   consecutive pattern that traced to two slaves sharing a master with opposite-signed weights).
+   Fixed by using **boolean-dtype** operands for the value-blind pass — SciPy's sparse matmul uses
+   logical OR/AND for `bool`, never arithmetic cancellation, so a structurally reachable entry is
+   always `True`. Both failure modes are pinned down as regressions
+   (`test_value_crossing_exact_zero_regression`, `test_real_value_cancellation_regression`).
+
+**B1's two cache-invalidation facts, verified rather than assumed, both held:** `K.indices`/
+`K.indptr` are the csrGenerator's own persistent objects, returned by identity every iteration
+within an epoch and always freshly allocated by a **new** `CSRGenerator`/`AliasedCSRMatrix` on any
+pattern-changing rebuild (confirmed by reading `csrgeneratorv2.pyx` directly — `updateInPlace` only
+ever rewrites `.data`, never `.indices`/`.indptr`, and the class explicitly locks against in-place
+structural mutation); `mpcTransformation` is reconstructed wholesale in the same conditional block
+that rebuilds the DofManager/CSRGenerator (`modelHasChanged or connectivityHasChanged or
+self.theDofManager is None`), so its caches die exactly when they should, no epoch counter needed.
+
+**B3.1 — exactness, full test suites, `EDELWEISS_MPC_ASSERT_EXACT=1`.** `run_tests_edelweissfe` on
+both `testfiles/edelweiss-only/` and `testfiles/marmot/`: identical failure sets to the unmodified
+baseline (verified by stashing the change and rerunning the same failing tests — same failures,
+same messages, both before and after each bug fix) — 3 pre-existing edelweiss-only failures
+(`MeshPlot` — LaTeX environment, unrelated; `NodeToDeformableSurfaceContactCurvedHexa20` and
+`NodeToDeformableSurfaceContactPullOut`, both §9) and 6 pre-existing marmot failures
+(`AMR_ContactRefineShear`, `AMR_MinMarkedElements`, `AMR_MixedMeshRefine`, `AMR_RecoveryError` — all
+four fail identically on the unmodified baseline too, a residual/reference mismatch unrelated to
+this change; plus the same two LaTeX-environment failures). Zero `EDELWEISS_MPC_ASSERT_EXACT`
+firings anywhere in either suite after both bugs were fixed.
+
+**B3.2 — live trajectory, the pryout, both solvers, `EDELWEISS_MPC_ASSERT_EXACT=1`.** Both
+`profile.inp` (PARDISO) and `blockamg.inp`, run back-to-back against their unmodified-baseline
+references in the same session (§21.0): identical trajectories, byte-for-byte — three cutbacks
+(`0.0025`/`0.00125`/`0.000625`), same termination (`Reached maximum number of increments`), final
+`U_loading` matching the baseline run to the last digit on both solvers
+(`0.021875000000000002` PARDISO, `0.021875000000023456` blockamg). Zero assertion firings across
+46 real Newton iterations on the full 280k-dof, 16556-slave-DOF contact+AMR+tie model — the
+strongest correctness evidence this phase produced, well beyond what the synthetic unit tests alone
+could cover.
+
+**B3.3 — performance, the actual finding.** Externally timed (§21.0) plus a `perf_counter` wrapper
+around `transformSystemMatrix` alone (`run_with_mpc_timing.py`, ad hoc, not checked in — monkeypatches
+the method, reports the aggregate at process exit; cross-checked against the internal
+`performancetiming` table's own sum across its multiple periodic printouts, which reconciled to
+within 2%, so both numbers agree — the §19.1 unreliability caveat is about *trusting a single
+printout in isolation*, not about the mechanism being unusable when its printouts are added up):
+
+| | legacy (`_transformSystemMatrixLegacy`) | cached (`useCachedMPCCondensation=True`) |
+|---|---|---|
+| PARDISO, `MPC_TIMING_TOTAL` | 126.38 s / 46 calls (2.75 s/call) | 216.04 s / 46 calls (4.70 s/call) |
+| blockamg, `MPC_TIMING_TOTAL` | 124.25 s / 46 calls (2.70 s/call) | *(not separately re-measured without the assertion; PARDISO's number is the representative one — the transform itself doesn't depend on which linear solver consumes its output)* |
+
+**The cached path is ~1.7× *slower*, not the hoped-for ≥2× (expected ~5×) faster.** Breakdown
+(internal sub-timers, PARDISO run): `mpc: S-touching SpGEMMs` alone costs 131.58 s over 46 calls
+(2.86 s/call) — **more than the legacy expression's entire per-call cost**. The plan's premise —
+"SpGEMMs restricted to `S`'s tiny `nEliminatedDof` rows, cheap relative to the two full-size SpGEMMs
+this replaces" — does not hold in practice: SciPy's CSR @ CSR must still scan the **left** operand's
+full row range (all of `K`'s own nnz, here in the millions) to find which rows intersect `S`'s tiny
+nonzero-row support, so the cost tracks `K`'s own size, not `S`'s. The other three sub-costs *are*
+cheap as designed (`D K D` 0.53 s/call, `value scatter` 0.69 s/call, `build union pattern` amortized
+over 3 rebuilds in the 5-increment window) — the entire regression is the S-touching SpGEMMs. This
+matches the plan's own explicitly stated fallback trigger almost exactly ("only if measurement shows
+the S-terms or the scatter dominating (≥0.5 s): a Cython numeric-only Gustavson kernel into the
+cached patterns") — the S-terms measured at 2.86 s/call, nearly 6× that trigger threshold. That
+kernel is real, separate work ("do not start it unless the pure-Python numbers demand it" — they
+now do) and is not started here.
+
+**Ship decision — default off, shipped as an opt-in.** Per the plan's own gate ("(3) clears ≥2× on
+the stage"), (3) fails outright (the stage is slower, not faster), so this does **not** replace the
+direct expression as the default despite (1) and (2) both being clean passes. Implemented as
+`MultiPointConstraintTransformation(..., useCachedCondensation: bool = False)`, with
+`transformSystemMatrix` dispatching between `_transformSystemMatrixLegacy` (default) and the newly
+renamed `_transformSystemMatrixCached`; wired through as a new NIST solver option,
+`useCachedMPCCondensation` (default `False`, schema in `nonlinearimplicitstatic.py`, same pattern
+as `pruneCondensedMatrixZeros`), reaching `buildMPCTransformation` via
+`self.options.get("useCachedMPCCondensation", False)` (a `.get`, not `[...]`, since the base class
+also serves `NonlinearExplicitDynamic`, whose own options dict has no such key). Confirmed the
+default (legacy) path reproduces the pre-Part-B baseline exactly on both full test suites after
+adding the toggle — no regression from the toggle plumbing itself.
+
+**Value delivered despite the negative performance result:** two genuine, previously-latent
+correctness bugs found and fixed (both are real hazards for *any* future cached-pattern SpGEMM
+work, not just this one); a permanent regression suite
+(`tests/test_mpc_cached_condensation.py`, 7 tests, pytest, no Cython/Marmot dependency) pinning both
+down plus the exactness-assertion mechanism itself; a switchable, documented, opt-in alternative
+implementation for whoever eventually builds the Cython kernel or finds a model where the
+S-touching cost is proportionally small enough to win (e.g. a much smaller total DOF count, or a
+much larger eliminated fraction).
+
+Docs: `doc/source/documentation/constraints.rst` (a paragraph on the option and the negative
+result, next to the existing tie-constraint condensation description); `useCachedMPCCondensation`'s
+own schema docstring auto-renders via `doc/source/documentation/solvers.rst`'s existing
+`automodule:: edelweissfe.solvers.nonlinearimplicitstatic`. Gitignored `edelweissfe/linsolve/klu/klu.c`.
 
 ### 21.3 Sequencing, and what is explicitly out of scope
 
