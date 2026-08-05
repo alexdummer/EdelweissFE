@@ -162,6 +162,41 @@ has begun. Two cheap leads are now measured on the real model:**
   ord where p-two-grid needs *more* iterations than shipped) rather than another config sweep —
   recorded as the phase's current stopping point.
 
+- **Phase 8 (§23, Fable's recommendation) — thread the shipped default's own shared per-iteration
+  overhead, not another attempt at p1Maps' ship bar**
+  ([§23](#23-phase-8-plan--thread-the-shared-per-iteration-costs-of-the-outer-loop)): §22.4-quater's
+  ledger, read for what it implies about the *shipped default* rather than p-two-grid, motivated a
+  census of the shipped arm's own hot path. **23.1 (executed):** outer operator SpMV is 14.6% of
+  wall (attack), coupling matvecs 3.1% and equilibration 3.9% (both below the 5% gate, skipped per
+  the plan's own pre-committed rule), GMRES internals (orthogonalization/bookkeeping) 38.4% —
+  largest bucket, explicitly out of scope by this phase's charter. **23.2 (executed):** a new
+  `ThreadedMatrixT`/`PyAMGCLMatrix` (matvec + residual, no smoother — separate from
+  `RelaxationSmootherT` to avoid its wasted chebyshev power-iteration build) replaces `As` as
+  scipy `gmres`'s operator via a `LinearOperator`; the true-residual check rides free on the same
+  wrapped matrix via the `D⁻¹(As z − bs) = A x − b` identity (asserted numerically, `5.25e-12` max
+  abs diff, before use). **23.5 (executed): clean pass on every gate** — 9-ord aggregate wall
+  188.75s → 157.37s (**1.199×**, exceeds the ≥10% bar), every single ord faster (no regressions),
+  every outer-iteration count and true residual **exactly** unchanged (no FP-drift band needed in
+  practice). A genuine bonus found along the way: GMRES's own internal bookkeeping (bucket h)
+  shrank *alongside* the attacked SpMV bucket, more than bucket (a) alone predicts. `p1Maps`
+  cross-reference: p-two-grid's relative advantage shrinks from 1.068× to **1.044×** on this faster
+  baseline, exactly the mechanism 23.0 predicted — still above parity, not a failure. **23.6 (live
+  gate) not yet run** — mandatory before shipping since this changes the shipped default's hot
+  path, but a heavier step (a real pryout simulation, not an offline replay); a deliberate pause
+  point pending that decision.
+- **Phase 8 planned — thread the shared serial-scipy per-iteration costs of the outer loop**
+  ([§23](#23-phase-8-plan--thread-the-shared-per-iteration-costs-of-the-outer-loop)): §22.4-quater's
+  ledger showed the dominant per-outer-iteration cost sits *outside* the displacement
+  preconditioner (~335 ms/iteration total on ord 00002's shipped arm vs. ~60 ms for the
+  displacement apply), and inspection of `blockamg.py`'s hot path finds the same
+  serial-scipy-matvec pattern §22.4-ter just caught once, in several more places: the outer GMRES
+  operator SpMV, the block-Gauss-Seidel coupling matvecs, the true-residual checks, and the
+  per-solve equilibration SpGEMMs. Census-first plan (only buckets ≥5% of solve wall get
+  attacked), reusing §22.4's AMGCL-backend machinery. **This targets the shipped default itself**
+  — deliberately decoupled from the `p1Maps` ship bar; per §22.4-quater's own ledger it is
+  *expected* to shrink p-two-grid's relative advantage, recorded up front as a consequence, not a
+  failure.
+
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
 (uncommitted). What is left is validation and the remaining swings (Lead 2 for speed, wall-time work
@@ -3533,3 +3568,304 @@ the §18/§19.3 bandwidth wall, wrong scope for a probe-first phase); Krylov rec
 independent lever, own future phase, pilots cheaply via PETSc/HPDDM given `petsclu` already
 exists); the §21.2 Cython condensation kernel; D4 (still the phase after, on whatever
 configuration this phase leaves); everything §21.3 already lists.
+
+---
+
+## 23. Phase 8 plan — thread the shared per-iteration costs of the outer loop
+
+*(Planned, not started. Written for a Sonnet agent, same working style as §21/§22: measure first,
+pre-committed gates, same-session A/B arms, external `perf_counter` wall time per §21.0. Work
+happens on xeon in the investigation dir against the same 9 dumped ords; production code changes
+land in this repo, committed per step.)*
+
+### 23.0 Why this phase, and what it is not
+
+§22.4-quater's ledger is the motivation, read for what it implies about the **shipped default**,
+not about p-two-grid: on ord 00002 the shipped arm spends ~335 ms per outer GMRES iteration
+(22.12 s / 66), of which the displacement preconditioner apply is ~60 ms. The majority of every
+outer iteration is spent *elsewhere* — the "nonlocal damage" field's preconditioner, the coupling
+matvecs, scipy GMRES's own operator SpMV and orthogonalization, plus fixed per-solve costs. And
+§22.4-ter's lesson generalizes: it found one serial scipy CSR matvec (26.5M nnz, **flat at
+32.5 ms/call across `OMP_NUM_THREADS` 1→16**) hiding in a timing bucket; reading
+`blockamg.py`'s hot path finds the same pattern in several more places, all serial scipy today:
+
+1. **The outer GMRES operator SpMV** (`gmres(As, bs, ...)`, `blockamg.py:512`) — one full-system
+   CSR matvec per inner iteration. `As` is larger than the 26.5M-nnz displacement free block
+   §22.4-ter timed, so ≥ ~35–50 ms serial per matvec, × 50–164 outer iterations per solve
+   (plus continuations). Expected to be the big one: very roughly 2–8 s per 10–49 s solve, on
+   *both* arms.
+2. **The block-Gauss-Seidel coupling matvecs** (`sweepOnce`, `blockamg.py:492`) — per
+   preconditioner application, `sweeps × nFields × (nFields−1) × (1 + symmetric)` scipy matvecs
+   on the off-diagonal coupling blocks.
+3. **The true-residual checks** (`A @ x - b`, `blockamg.py:524` and `:566`) — 1–3 full-system
+   matvecs per solve. Small, but rides free on the same fix (see 23.2).
+4. **The per-solve equilibration** (`sp.diags(dinv) @ A @ sp.diags(dinv)`, `blockamg.py:423`) —
+   two diagonal SpGEMMs over the full nnz, every solve (the pattern churns, §3.1/§21.1, so this
+   never amortizes). Replaceable by a vectorized in-place data scaling, no SpGEMM at all (23.4).
+5. **The off-diagonal split** (`blockamg.py:427-433`) — CSR slicing every solve; probably minor,
+   the census decides.
+
+**What this phase is:** removal of pure arithmetic overhead from the shipped default's hot path.
+No algorithm change, no quality tradeoff, no new options. It serves the investigation's actual
+goal — total wall against PARDISO — regardless of which preconditioner variant ships.
+
+**What this phase is not:** another attempt to push `p1Maps` over its ship bar. Per
+§22.4-quater's ledger, p-two-grid's aggregate win rides on the shared overhead being expensive —
+shrinking that overhead will *shrink p-two-grid's relative advantage*, quite possibly below
+parity. That is an expected, pre-stated consequence, recorded in 23.6, not a failure of this
+phase or of §22. The two arms are compared against the actual objective (absolute wall), not
+against each other's ratio.
+
+### 23.1 The census — measure every bucket before touching anything (executed)
+
+No code changes in this step. On the shipped default arm, one ord first (00002), then all 9:
+decompose a solve's wall into named buckets, each with **both** an instrumented number and an
+isolated cross-check — §22.4-ter's own lesson, now the working method: an instrumentation bucket
+is not trustworthy until an isolated timing of the same thing reconciles with it.
+
+Buckets: (a) outer operator SpMV — isolated per-matvec time on the actual `As` at
+`OMP_NUM_THREADS ∈ {1, 16}` (expect flat — that flatness *is* the finding), × the solve's outer
+iteration count; (b) coupling matvecs, same treatment, × their call count; (c) the "nonlocal
+damage" field's preconditioner apply; (d) the displacement preconditioner apply (known ~60 ms,
+re-confirm); (e) equilibration; (f) off-diagonal split; (g) true-residual checks; (h) **GMRES
+internals by subtraction** — orthogonalization, callback overhead, everything not in (a)–(g).
+Record `As`'s size and nnz alongside.
+
+Env per §22.2's two-pools finding: set `OMP_NUM_THREADS` **and** `OPENBLAS_NUM_THREADS`
+explicitly, record both, same values on every arm.
+
+**Pre-committed rule: only buckets ≥5% of the shipped arm's solve wall get attacked in this
+phase.** Smaller buckets are recorded in the census table and skipped — the table itself is a
+deliverable either way, and bucket (h) is *always* recorded even though it is out of scope to fix
+(it is the sizing input for any future replace-the-outer-GMRES phase, e.g. the PETSc route §22's
+out-of-scope already names).
+
+**Executed.** One ord first (00002), then all 9, reconstructing `As`/`offBlocks`/slices from a real
+`BlockAMGSolver` instance's own stored state (`_dinv`, `_blocks`) after a run — no probe-only
+shortcuts, the same deterministic computation `__call__` itself performs. Every bucket's isolated
+cross-check reconciled with its instrumented counterpart to within measurement noise (bucket-sum
+check: `eq + split + outerLoopTotal + hierBuild` matched the measured wall to within 0.05s on every
+ord) — the isolated numbers are trustworthy.
+
+**One correction to the plan's own bucket accounting, found while instrumenting, not assumed:** the
+"true-residual continuations" `timeit` bucket (blockamg.py's own instrumentation) is *not* just
+the cheap residual check (g) — when a continuation actually triggers, it wraps an entire second
+`gmres()` re-solve, with its own (a)/(b)/(c,d)/(h) shares. `outerIters` (`len(history)`) already
+spans both the main call and any continuations via `history.extend()`, so the per-call × outerIters
+projections for (a)/(b)/(c,d) already account for continuation iterations correctly — but (h) must
+be computed by subtracting from `gmresTime + contTime` combined, not from `gmresTime` alone (a first
+draft of the census script got this wrong and reported (h) as a trivial 0.75s; the corrected
+version, cross-checked against the bucket-sum-equals-wall identity, gives 6.5-9.7s per ord).
+
+**Census table, aggregated over all 9 ords (shipped default, `OMP_NUM_THREADS=MKL_NUM_THREADS=
+OPENBLAS_NUM_THREADS=16`):**
+
+| bucket | total | % of wall | attack? |
+|---|---|---|---|
+| (a) outer operator SpMV | 25.18s | 14.6% | **yes** (≥5%) |
+| (b) coupling matvecs | 5.34s | 3.1% | no (<5%) |
+| (c)/(d) precond applies | 36.74s | 21.3% | not a target (already AMGCL-threaded, nothing serial here) |
+| (e) equilibration | 6.64s | 3.9% | no (<5%) |
+| (f) off-diagonal split | 4.23s | 2.5% | no (<5%) |
+| (g) true-residual checks | negligible (~1-3 × tens of ms/solve) | — | rides free on (a)'s fix |
+| (h) GMRES internals (by subtraction) | 66.18s | **38.4%** | out of scope by design (§23.0) |
+| hierarchy build (`mustRefresh` only) | 27.88s | 16.2% | caveat below, not one of (a)-(h) |
+| **TOTAL WALL** | **172.24s** | | |
+
+**Decision per the pre-committed rule: only §23.2 proceeds.** Bucket (a) clears the 5% gate; (b)
+and (e) do not (3.1% and 3.9%), so §23.3 (coupling matvecs) and §23.4 (equilibration without
+SpGEMM) are **skipped**, exactly as the plan's own conditional text anticipated — recorded here,
+not silently dropped. Bucket (h), the single largest line, stays out of scope by this phase's own
+explicit charter (§23.0) but is the sizing input for a future "replace the outer Krylov solve"
+phase, per the plan's own framing. **Caveat on `hierBuild`'s 16.2%:** this census methodology
+constructs a fresh `BlockAMGSolver` per ord, forcing `mustRefresh=True` on every single solve — in
+real usage most solves reuse a standing hierarchy (only a residual jump, pattern change, or
+staleness triggers a rebuild), so 16.2% overstates its steady-state share; not corrected for here
+since it is not a bucket this phase attacks either way.
+
+### 23.2 The threaded SpMV entry point (expected to be the big one)
+
+A new, deliberately small class in `edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp` —
+`ThreadedMatrixT`: `build(A)` + `matvec(x, y)` (via `amgcl::backend::spmv`) + `residual(rhs, x,
+r)` (via `amgcl::backend::residual`), with the `.pxd`/`.pyx` exposure following exactly the
+`RelaxationSmootherT` pattern §22.4 established. **Do not reuse `RelaxationSmootherT` itself for
+this** — its chebyshev constructor runs a power iteration on build, pure waste for a plain
+matvec. Two known traps, both already documented in §22.4's record, both apply verbatim:
+
+- the raw `crs_tuple` adapter fails ADL for unqualified `rows()`/`diagonal()` calls — convert
+  once through `Backend::matrix` (`amgcl::backend::crs<double,int,int>`) in `build()` and keep it
+  alive;
+- the conversion cost is paid **every solve** (the pattern churns, nothing to cache across
+  solves) — time it explicitly in every table; it is part of this phase's budget, not free.
+
+In `blockamg.py`: wrap `As` once per solve right after equilibration; pass
+`LinearOperator(matvec=...)` backed by it as `gmres`'s operator (both the main call and the
+continuation calls).
+
+**The true-residual checks ride free on the same wrapped matrix.** With `As = D A D`, `x = D z`,
+`bs = D b` (`D = diag(dinv)`): `A x − b = D⁻¹ (As z − bs)`, exactly. So compute the true residual
+as `(As z − bs) / dinv` elementwise — via the wrapper's `residual()` on `As`, no second
+conversion of the unscaled `A`. **Assert this identity numerically once** on the first ord
+(`np.allclose` against the existing `A @ x − b`, tight rtol) before trusting it anywhere.
+
+**Expected floating-point drift, stated up front so nobody panics:** a threaded SpMV changes
+summation order; GMRES trajectories may legitimately drift by a few iterations. The correctness
+gate is **iteration counts within ~±5% per ord and true residuals of the same character** — not
+bit-identity. An ord whose count jumps beyond that band is a bug signal: stop and investigate,
+do not average it away.
+
+**Executed.** `ThreadedMatrixT` added to `amgcl-wrapper.hpp` — deliberately a separate class from
+`RelaxationSmootherT`, not a reuse of it (a chebyshev smoother's constructor runs a power iteration
+for the spectral radius, pure waste for something that only ever needs `matvec()`/`residual()`).
+`build()` converts through `Backend::matrix` exactly like `RelaxationSmootherT`, even though this
+class never touches a relaxation constructor (so §22.4's specific ADL trap does not apply to it) —
+matching the proven conversion pattern rather than relying on the raw `crs_tuple` adapter's own
+narrower specializations. Declared in `.pxd`; exposed as `PyAMGCLMatrix` (`build`/`matvec`/
+`residual`) in `.pyx`. Verified bit-exact against `scipy.sparse` on a synthetic matrix before
+touching production code (`matvec`/`residual` max abs diff: `0.0`).
+
+**The `D⁻¹` residual identity (`A x − b = D⁻¹(As z − bs)`) was asserted numerically on a real ord
+before use**, per this section's own instruction and §20.2's cautionary precedent on scaled-space
+shortcuts: max abs diff between the direct `A @ x − b` and the scaled-space reconstruction was
+`5.25e-12` (`np.allclose` at `rtol=1e-8, atol=1e-10`: `True`) — confirmed, then wired in.
+
+In `blockamg.py`: `PyAMGCLMatrix` is built once per solve right after equilibration (an import
+alongside the existing local `PyAMGCLSolver` import, same file); `outerOperator =
+LinearOperator((n, n), matvec=threadedAs.matvec, dtype=As.dtype)` replaces `As` as both `gmres()`
+calls' first argument (main solve and the continuation re-solve); both true-residual computations
+now call `threadedAs.residual(bs, z) / dinv` instead of `A @ x − b`, so the *unscaled* full matrix
+`A` is no longer touched anywhere in the outer-loop hot path — only for `.nnz`/`.diagonal()` at
+equilibration, both O(1)/O(nnz)-once.
+
+**No floating-point drift band was needed in practice.** Every one of the 9 ords' outer iteration
+counts and true residuals came back **exactly** identical to the pre-change baseline (not merely
+within the pre-committed ±5% allowance) — the summation-order change from threading apparently
+did not perturb any of these 9 systems' GMRES trajectories enough to change a stopping decision.
+A pleasant outcome, not one to be assumed on other systems; the band stays in the record for future
+runs where it might matter.
+
+### 23.3 Coupling matvecs (conditional on the census)
+
+Only if bucket (b) ≥5%. Same wrapper, applied to each `offBlocks[(i, j)]` at split time; the
+sweep's `localResidual -= offBlocks[(i, j)] @ x[j]` becomes a wrapped matvec + subtraction (or
+extend the wrapper with `y -= A x` if the extra temporary shows up in the numbers — decide by
+measurement, not taste). Note the call count per outer iteration is
+`sweeps × nFields × (nFields−1) × (1 + symmetric)` — with the shipped symmetric sweep and two
+fields, that is 4 coupling matvecs per outer iteration; size the win accordingly before building.
+
+**Skipped.** §23.1's census measured bucket (b) at 3.1% across all 9 ords — below the 5% gate.
+Per the pre-committed rule, not attacked this round.
+
+### 23.4 Equilibration without SpGEMM (conditional on the census)
+
+Only if bucket (e) ≥5%. `(sp.diags(dinv) @ A @ sp.diags(dinv))` is two full-nnz SpGEMMs for what
+is elementwise scaling: `As.data = A.data * dinv[rowOfNnz] * dinv[A.indices]` with
+`rowOfNnz = np.repeat(np.arange(n), np.diff(A.indptr))` — same math, vectorized numpy, one pass.
+Assert `allclose` against the old construction once on the first ord. (Keep `.tocsr()` semantics
+identical: the input is already CSR at that point, `blockamg.py:371`.)
+
+**Skipped.** §23.1's census measured bucket (e) at 3.9% across all 9 ords — below the 5% gate.
+Per the pre-committed rule, not attacked this round.
+
+### 23.5 Full 9-ord offline replay + gates (executed)
+
+Primary A/B: **shipped default before vs. after this phase's changes**, same session, same 9
+ords, external wall. Because no algorithm changes, the bar is not the ≥20% algorithm-change bar:
+
+- **≥10% aggregate external wall** over the 9 ords,
+- **no ord regressing past ~1.02×**,
+- **iteration counts within ±5% per ord, true residuals same character** (the FP-drift band from
+  23.2),
+- the census table re-measured after, showing each attacked bucket actually shrank (no
+  whack-a-mole: a bucket that moved its cost elsewhere is a finding, not a win).
+
+On a pass, **one additional replay with `p1Maps` on**, recorded as a cross-reference into §22's
+record: the expected shrink of p-two-grid's relative advantage, measured rather than predicted.
+Whatever that number is, it does not gate this phase — but §22's ship-bar arithmetic must be
+updated to the new, faster baseline honestly (if p-two-grid falls back below parity, §22's record
+says so plainly).
+
+**Executed — clean pass on every gate.** Same 9 ords, same probe script, before (§22.4-quater's
+recorded baseline) vs. after this section's changes:
+
+| ord | shipped iters (before/after) | shipped wall (before → after) | per-ord ratio |
+|---|---|---|---|
+| 00002 | 66 / 66 | 22.12s → 20.80s | 1.063× |
+| 00003 | 164 / 164 | 48.04s → 37.30s | 1.288× |
+| 00004 | 62 / 62 | 20.86s → 16.79s | 1.242× |
+| 00005 | 51 / 51 | 17.21s → 14.41s | 1.194× |
+| 00006 | 55 / 55 | 18.14s → 15.22s | 1.192× |
+| 00007 | 53 / 53 | 17.58s → 14.86s | 1.183× |
+| 00008 | 54 / 54 | 17.87s → 14.99s | 1.192× |
+| 00009 | 23 / 23 | 10.10s → 8.87s | 1.139× |
+| 00010 | 50 / 50 | 16.81s → 14.12s | 1.191× |
+| **TOTAL** | | **188.75s → 157.37s** | **1.199×** |
+
+- **≥10% aggregate external wall**: cleared with room to spare — **19.9%** aggregate improvement.
+- **No ord regressing past ~1.02×**: cleared trivially — every single ord got *faster* (1.06×
+  smallest, 1.29× largest), zero regressions.
+- **Iteration counts within ±5%, true residuals same character**: cleared exactly, not just
+  within tolerance — every ord's outer iteration count and true residual are bit-for-bit identical
+  to the pre-change baseline (see 23.2's note: no measurable FP drift on these 9 systems).
+- **Census re-measured after, attacked bucket actually shrank**: single-ord recheck (00002) shows
+  bucket (h) (GMRES internals) fell from `8.40s` to `4.36s` alongside bucket (a) — a **larger** drop
+  than bucket (a) alone predicts, because `LinearOperator`-wrapping the threaded matvec apparently
+  removes more of scipy's own per-iteration overhead with the raw sparse matrix than the isolated
+  matvec-only measurement captured. A genuine bonus, not double-counted anywhere in the aggregate
+  numbers above (those are wall-clock, not bucket sums).
+
+**`p1Maps` cross-reference, on this same, now-faster shipped baseline:**
+
+| ord | p-two-grid iters | shipped wall | p-two-grid wall | speedup |
+|---|---|---|---|---|
+| 00002 | 53 | 20.80s | 16.20s | 1.28× |
+| 00003 | 136 | 37.30s | 34.70s | 1.07× |
+| 00004 | 56 | 16.79s | 17.03s | 0.99× |
+| 00005 | 48 | 14.41s | 15.16s | 0.95× |
+| 00006 | 50 | 15.22s | 15.53s | 0.98× |
+| 00007 | 57 | 14.86s | 17.12s | 0.87× |
+| 00008 | 53 | 14.99s | 16.04s | 0.93× |
+| 00009 | 22 | 8.87s | 9.44s | 0.94× |
+| 00010 | 22 | 14.12s | 9.54s | 1.48× |
+| **TOTAL** | | **157.37s** | **150.77s** | **1.044×** |
+
+Exactly the predicted mechanism: p-two-grid's aggregate advantage shrinks from `1.068×` (§22.4-ter,
+against the slower pre-§23 baseline) to `1.044×` (against this section's faster one) — the shared
+overhead this phase removed was part of what made p-two-grid's *relative* win look larger. Still
+above parity, not a failure of §22's work; §22's own ledger should read `1.044×` going forward as
+the live number, with `1.068×` understood as measured against a baseline this phase has since
+improved.
+
+### 23.6 Live gate + ship
+
+The pryout per §19.1/§21.0, back-to-back with unmodified `blockamg.inp`: trajectory identical
+(15/8/5/5 Newton iterations, cutbacks `0.0025`/`0.00125`/`0.000625`, `U_loading=0.021875`),
+externally timed win consistent with 23.5's margin. This changes the shipped default's hot path,
+so the live gate is mandatory, not optional. On a pass: ship (no user-facing option changes, so
+`linsolvers.rst` needs no edits; the new wrapper class gets its Doxygen per repo convention, and
+the existing `blockamg` testfiles must pass unchanged — they are the regression net here). On a
+fail at any gate: record the table and the mechanism, revert nothing blindly — a per-bucket win
+that fails the aggregate gate is still knowledge, and the census table stays either way.
+
+### Gotchas specific to this phase (beyond §8/§17/§19/§22)
+
+- **§22.4's ADL/`crs_tuple` trap** applies to any new class touching AMGCL relaxation/backend
+  constructors — convert through `Backend::matrix` first.
+- **The backend-matrix conversion re-runs every solve** (pattern churn, §3.1/§21.1). It appears
+  in every timing table as its own line or the numbers are not honest.
+- **FP drift is expected; bit-identity is not the gate** (23.2's band). But direction matters:
+  drift should be iteration-count noise, never a true-residual character change.
+- **Two thread pools** (§22.2): set and record `OMP_NUM_THREADS` *and* `OPENBLAS_NUM_THREADS` on
+  every arm.
+- **No bucket is trusted without an isolated cross-check** (§22.4-ter's lesson, now standing
+  policy). This includes the *new* buckets this phase adds.
+- **The `D⁻¹` residual identity is asserted numerically once before use** (23.2). Scaled-space
+  shortcuts have burned this document before (§20.2's continuation attempts) — verify, then use.
+
+### Out of scope for this phase
+
+Replacing scipy's outer GMRES itself (bucket (h) is measured and recorded as sizing input, not
+attacked — the PETSc/HPDDM route remains a future phase); Krylov recycling (GCRO-DR); matrix-free
+anything; the §21.2 Cython condensation kernel; p-two-grid's own remaining `~1.12×` gap
+(deliberately parked at §22.4-quater's stopping point — this phase will move that goalpost, and
+§22's record gets the honest update in 23.5, but chasing it is not this phase's job); D4.

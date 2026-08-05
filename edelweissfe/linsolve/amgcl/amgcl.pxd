@@ -103,3 +103,10 @@ cdef extern from "amgcl-wrapper.hpp":
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void applyStep(int n, const double* rhs, double* x) except +
         void residual(int n, const double* rhs, const double* x, double* r) except +
+
+    # A plain OpenMP-threaded matvec/residual, no smoother (§23.2) -- the outer GMRES operator.
+    cdef cppclass ThreadedMatrix:
+        ThreadedMatrix() except +
+        void build(int n, const int* ptr, const int* col, const double* val) except +
+        void matvec(int n, const double* x, double* y) except +
+        void residual(int n, const double* rhs, const double* x, double* r) except +

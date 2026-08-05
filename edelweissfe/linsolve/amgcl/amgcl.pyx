@@ -421,3 +421,61 @@ cdef class PyAMGCLRelaxationSmoother:
         cdef double[::1] r_ = r
         self.smoother.residual(n, &rhs_[0], &x_[0], &r_[0])
         return r
+
+
+cdef class PyAMGCLMatrix:
+    """A plain OpenMP-threaded matvec/residual wrapper, no smoother attached (§23.2, Phase 8).
+
+    The shipped default's outer GMRES operator (``gmres(As, bs, ...)`` in
+    :mod:`edelweissfe.linsolve.blockamg.blockamg`) previously called ``As`` directly as a
+    ``scipy.sparse`` CSR matrix -- not thread-parallel regardless of ``OMP_NUM_THREADS`` (the same
+    mechanism §22.4-ter found for the p-two-grid fine level's residual, here on the full coupled
+    system instead, ~15% of the shipped arm's own wall). Wrap ``As`` once per solve with
+    :meth:`build`, then pass ``scipy.sparse.linalg.LinearOperator(matvec=this.matvec)`` as the
+    operator instead of ``As`` itself.
+    """
+    cdef ThreadedMatrix* matrix
+
+    def __cinit__(self):
+        self.matrix = new ThreadedMatrix()
+
+    def __dealloc__(self):
+        if self.matrix != NULL:
+            del self.matrix
+
+    def build(self, object A):
+        """Convert A (scipy.sparse csr_matrix) once. Not amortized across solves -- this pattern's
+        sparsity churns every solve (§3.1/§21.1), so the conversion is paid fresh every call."""
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+
+        cdef int n = A.shape[0]
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef int[::1] indptr_ = indptr
+        cdef int[::1] indices_ = indices
+        cdef double[::1] data_ = data
+        self.matrix.build(n, &indptr_[0], &indices_[0], &data_[0])
+
+    def matvec(self, object x):
+        """Returns A @ x as a new float64 array."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        cdef int n = x_arr.shape[0]
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(n, dtype=np.float64)
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] y_ = y
+        self.matrix.matvec(n, &x_[0], &y_[0])
+        return y
+
+    def residual(self, object rhs, object x):
+        """Returns rhs - A @ x as a new float64 array."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        cdef int n = rhs_arr.shape[0]
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(n, dtype=np.float64)
+        cdef double[::1] rhs_ = rhs_arr
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] r_ = r
+        self.matrix.residual(n, &rhs_[0], &x_[0], &r_[0])
+        return r

@@ -365,7 +365,7 @@ class BlockAMGSolver(LinearSolver):
         return B / blockDinv[:, None]
 
     def __call__(self, A, b):
-        from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLSolver
+        from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLMatrix, PyAMGCLSolver
 
         self._solveCount += 1
         A = A.tocsr()
@@ -422,6 +422,18 @@ class BlockAMGSolver(LinearSolver):
 
             As = (sp.diags(dinv) @ A @ sp.diags(dinv)).tocsr()
             bs = dinv * b
+
+        # The outer GMRES operator SpMV and the true-residual check both otherwise run through a
+        # plain scipy.sparse CSR matvec on the full coupled system -- not OpenMP-threaded regardless
+        # of OMP_NUM_THREADS (the same mechanism PERF_LINSOLVE_INVESTIGATION.md §22.4-ter found for
+        # the p-two-grid fine level, here on As itself; census in §23.1 measured it at ~15% of this
+        # arm's own wall). This conversion is not amortized across solves -- As's sparsity pattern
+        # churns every solve (§3.1/§21.1) -- so it is paid fresh here every call, same as
+        # equilibration above.
+        with performancetiming.timeit("blockamg: threaded operator build"):
+            threadedAs = PyAMGCLMatrix()
+            threadedAs.build(As)
+        outerOperator = LinearOperator((n, n), matvec=threadedAs.matvec, dtype=As.dtype)
 
         # Off-diagonal couplings (for the sweep) are needed every solve regardless of refresh/reuse.
         with performancetiming.timeit("blockamg: off-diagonal split"):
@@ -510,7 +522,7 @@ class BlockAMGSolver(LinearSolver):
         with performancetiming.timeit("blockamg: outer GMRES"):
             history = []
             z, info = gmres(
-                As,
+                outerOperator,
                 bs,
                 M=preconditioner,
                 rtol=eta,
@@ -521,7 +533,10 @@ class BlockAMGSolver(LinearSolver):
                 callback_type="pr_norm",
             )
             x = dinv * z
-            trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
+            # A x - b = D^-1 (As z - bs) exactly (D = diag(dinv)) -- verified numerically against the
+            # direct A @ x - b computation on a real dumped system before use (§23.2). Rides on the
+            # same threaded operator built above; no second, unscaled full-system matvec.
+            trueResidual = np.linalg.norm(threadedAs.residual(bs, z) / dinv) / max(np.linalg.norm(b), 1e-300)
 
         # GMRES's own stopping check (callback_type="pr_norm") is on the *preconditioned* residual,
         # not the true one -- with an imperfect preconditioner (this one, by design, §17) the two can
@@ -551,7 +566,7 @@ class BlockAMGSolver(LinearSolver):
                 continuationEta *= 0.01
                 continuationHistory = []
                 z, info = gmres(
-                    As,
+                    outerOperator,
                     bs,
                     x0=z,
                     M=preconditioner,
@@ -563,7 +578,7 @@ class BlockAMGSolver(LinearSolver):
                     callback_type="pr_norm",
                 )
                 x = dinv * z
-                trueResidual = np.linalg.norm(A @ x - b) / max(np.linalg.norm(b), 1e-300)
+                trueResidual = np.linalg.norm(threadedAs.residual(bs, z) / dinv) / max(np.linalg.norm(b), 1e-300)
                 history.extend(continuationHistory)
                 self._log(
                     "debug",

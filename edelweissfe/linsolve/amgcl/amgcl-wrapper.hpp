@@ -432,6 +432,64 @@ public:
   }
 };
 
+// A plain OpenMP-threaded matrix wrapper, no smoother attached (§23.2, Phase 8): the shipped
+// default's outer GMRES operator SpMV (`gmres(As, bs, ...)` in blockamg.py) is a scipy CSR matvec on
+// the *full* coupled system -- larger than the 26.5M-nnz displacement free block §22.4-ter found
+// flat against `OMP_NUM_THREADS`, and by the same mechanism (scipy sparse matvec is single-threaded
+// C code). Census (§23.1) measured it at 14.6% of the shipped arm's total wall across all 9 ords,
+// clearing this phase's 5% attack threshold.
+//
+// Deliberately a separate class from RelaxationSmootherT, not a reuse of it: RelaxationSmootherT's
+// constructor runs a smoother build (chebyshev's power iteration for the spectral radius, etc.) --
+// pure waste for something that only ever needs matvec()/residual(). This class never constructs a
+// relaxation object, so §22.4's ADL/crs_tuple trap does not apply here; build() still converts
+// through Backend::matrix regardless, matching the proven pattern rather than relying on the raw
+// crs_tuple adapter's own (narrower) spmv/residual specializations.
+class ThreadedMatrixT {
+public:
+  typedef amgcl::backend::builtin< double > Backend;
+  typedef Backend::matrix                   BackendMatrix;
+
+  std::shared_ptr< BackendMatrix > A_;
+
+  // Build (convert) the matrix once per solve -- this pattern churns every solve (§3.1/§21.1), so
+  // there is no build-once/apply-many amortization across solves the way LinearSolverT's hierarchy
+  // gets; the conversion cost is paid fresh here every time and must be timed as part of this
+  // phase's own budget, not assumed free.
+  void build( int n, const int* ptr, const int* col, const double* val )
+  {
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    A_       = std::make_shared< BackendMatrix >( A );
+  }
+
+  // y <- A*x
+  void matvec( int n, const double* x, double* y )
+  {
+    if ( !A_ ) {
+      throw std::runtime_error( "matvec(): no matrix built yet -- call build() first" );
+    }
+    auto x_rng = amgcl::make_iterator_range( x, x + n );
+    auto y_rng = amgcl::make_iterator_range( y, y + n );
+    amgcl::backend::spmv( 1.0, *A_, x_rng, 0.0, y_rng );
+  }
+
+  // r <- rhs - A*x
+  void residual( int n, const double* rhs, const double* x, double* r )
+  {
+    if ( !A_ ) {
+      throw std::runtime_error( "residual(): no matrix built yet -- call build() first" );
+    }
+    auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
+    auto x_rng   = amgcl::make_iterator_range( x, x + n );
+    auto r_rng   = amgcl::make_iterator_range( r, r + n );
+    amgcl::backend::residual( rhs_rng, *A_, x_rng, r_rng );
+  }
+};
+
 // The default, unchanged double-precision wrapper, and the new float32 one added for §19.3.
 typedef LinearSolverT< double > LinearSolver;
 typedef LinearSolverT< float >  LinearSolverFloat;
@@ -443,3 +501,6 @@ typedef LinearSolverBlockT< amgcl::static_matrix< double, 3, 3 > > LinearSolverB
 
 // §22.4: standalone OpenMP-threaded relaxation smoother, see RelaxationSmootherT above.
 typedef RelaxationSmootherT RelaxationSmoother;
+
+// §23.2: standalone OpenMP-threaded matvec/residual, see ThreadedMatrixT above.
+typedef ThreadedMatrixT ThreadedMatrix;
