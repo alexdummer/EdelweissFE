@@ -72,6 +72,14 @@ has begun. Two cheap leads are now measured on the real model:**
   system size, since SciPy's SpGEMM must scan the left operand's full row range regardless of the
   right operand's sparsity. Ships as `useCachedMPCCondensation` (default `False`). D4 (the ≥1M-dof
   demonstration) remains the phase after.
+- **Phase 7 is planned, not started** ([§22](#22-phase-7-plan--p-multigrid-precondition-the-quadratic-displacement-block-through-a-p1-corner-node-operator)):
+  **p-multigrid for the displacement block** — precondition the quadratic serendipity operator
+  through a Galerkin-projected P1 corner-node operator (`A₁ = PᵀA₂P`, `P` purely topological),
+  AMG on `A₁`, Chebyshev smoothing on the quadratic level. Rationale: SA-AMG is known to degrade
+  on quadratic elasticity, and the in-house evidence (3-level hierarchies, ~18× first-level
+  coarsening, `eps_strong` needing 0.01) fits that signature; this is the standard high-order
+  remedy (low-order preconditioning), chosen over a P1 *rediscretization* because the Galerkin
+  projection inherits the damaged tangent, contact penalties, and MPC condensation for free.
 
 Phase 3 delivered: `inexactnewton` (Lead 1) and `blockamg` (Lead 3) are both committed, documented, and
 tested; `blockamg`'s default preconditioner was substantially retuned in [§17](#17-phases-ab-executed--the-13-needs-muelu-verdict-is-retracted)
@@ -2494,3 +2502,180 @@ own schema docstring auto-renders via `doc/source/documentation/solvers.rst`'s e
 3. Update this document as results land, in the style of §17–§20: record failures and their
    mechanisms with the same care as wins, and never change a shipped default without the ≥20%
    bar plus a live trajectory-identical gate.
+
+---
+
+## 22. Phase 7 plan — p-multigrid: precondition the quadratic displacement block through a P1 corner-node operator
+
+Planned (this session), not started. Decision (Matthias): pursue low-order preconditioning of the
+displacement block, the standard high-order-FEM remedy, on the hypothesis that the **quadratic
+serendipity discretization** (Quad8/Hexa20) is a root cause of the displacement-block AMG
+weakness this document has been fighting since §12. The in-house evidence fits the known
+signature of SA-AMG on quadratic elasticity (wide stencils, weak diagonal dominance, broken
+strength-of-connection heuristics): 3-level hierarchies with ~18× first-level coarsening (§17 A2),
+`eps_strong` needing the unusual 0.01 (§17 B2), and a smoother that only worked after manual
+spectral surgery (§17 B5).
+
+**The chosen construction: Galerkin corner-node restriction, NOT a P1 rediscretization.** An
+actual P1 reassembly would need a second tangent-consistent pass through materials (damaged
+tangents), contact penalties, and the MPC condensation — a shadow model. The Galerkin projection
+`A₁ = Pᵀ A₂ P` inherits all of that from the current condensed displacement block for free, and
+`P` is purely topological: **identity on corner nodes; each exclusive-midside node interpolated
+½/½ from its two edge-endpoint corner nodes** (the P1 function expressed in the serendipity
+basis), expanded per displacement component (`P_dof = kron(P_node, I_d)`, node-major layout, §4).
+
+**The preconditioner shape (classic p-two-grid):** one application =
+`ν` Chebyshev sweeps on the (equilibrated) quadratic operator `A₂` → restrict residual (`Pᵀ`) →
+one AMGCL V-cycle on `A₁` → prolong (`P`) → `ν` Chebyshev sweeps on `A₂`. AMG finally gets the
+operator class it is good at (P1 elasticity); the quadratic level only needs smoothing.
+
+**What "win" means.** The wall math is honest, not automatic: `PᵀA₂P` is an SpGEMM re-done every
+solve (the pattern churns, §21.1 — no caching), roughly offset by the cheaper hierarchy build on
+the ~4–8×-smaller `A₁`; per application, a V-cycle on `A₁` + fine Chebyshev is roughly comparable
+to today's V-cycle on `A₂`. **The projected win is iteration count and robustness** (healthy
+deep hierarchy instead of a shallow forced one), and it must clear the usual wall-clock bar to
+ship. All §19 execution notes and §21.0's measurement discipline (external wall timing,
+same-session interleaved arms) apply verbatim.
+
+### 22.1 Enabler — dump the P1 topology map (one small commit + one xeon run)
+
+A new env-var dump, `EDELWEISS_DUMP_P1MAP`, implemented next to and mirroring
+`EDELWEISS_DUMP_COORDS` (`nonlinearimplicitstatic.py:323` — same trigger point, same
+field-node-ordering alignment that the coords dump already verified against the dumped systems).
+For each node of each *vector* field, write one npz per dump event containing:
+
+- `isCorner[nNodes]` (bool): a node is a corner iff it is a corner node of **at least one**
+  element it belongs to. This rule is load-bearing under AMR: a hanging node can be a midside of
+  a coarse element *and* a corner of fine elements — corner status wins, the node stays in the
+  P1 space, and `P` remains purely topological (constraints are the condensed operator's
+  business, not `P`'s).
+- `edgeEndpoints[nNodes, 2]` (int, −1 for corners): for each exclusive-midside node, the two
+  edge-endpoint node indices, in the *field's node ordering* (the same ordering the coords dump
+  uses).
+
+Local corner/midside numbering: **verify against the element implementations in this repo**
+(`edelweissfe/elements/displacementelement/` for the pure-Python quads, Marmot's
+`DisplacementFiniteElement` docs for Hexa20) — do not trust remembered Abaqus conventions. Key
+the classification on nodes-per-element (8-node 2D, 20-node 3D); print the set of encountered
+element types and **hard-error on an unrecognized one**. Assert: every `edgeEndpoints` entry
+refers to a corner node (guaranteed by the ≥1-element rule — endpoints of a quadratic edge are
+corners of that same element); corners + exclusive-midsides = nNodes.
+
+Run once on xeon against the same model state as the 9 dumps (displacement field at 71553 nodes →
+`[0, 214659)` — the §13 coords-dump procedure describes catching the right snapshot). Sanity-check
+offline: `P` shape (214659 × 3·nCorners), row sums ≈ 1 per component, `P` restricted to corner
+dofs is the identity.
+
+### 22.2 Offline two-grid probe on the displacement block — the go/no-go (~half day)
+
+New ad-hoc probe on xeon (investigation dir, not checked in), on the §17/§20.1 testbed
+(`A_00_00002.npz` displacement diagonal block, equilibrated exactly as production does —
+project the **scaled** operator: `A₁ = Pᵀ As₂ P` with `P` unscaled; Galerkin absorbs the
+scaling).
+
+**Measure in production usage mode from the start — §20.1's trap, stated as a rule:** every arm
+is a *one-application-per-outer-iteration* preconditioner `M` inside outer
+`scipy gmres(M=100, rtol=1e-6)` on `As₂`. Never `.solve()` (AMGCL-native Krylov) — §20.1 proved a
+better standalone solver can be a worse single-shot preconditioner, and that mistake cost a wrong
+first pass already (`probe_201_block_isolated.log`).
+
+Implementation of the probe's `M`: hand-rolled Chebyshev on `As₂` (a plain matvec recurrence in
+scipy — **estimate the spectral radius with ~50 power iterations and use `lower=0.01`**, §17 B5's
+lesson: the cheap default estimate is exactly what made Chebyshev diverge before) wrapped around
+`build(A₁)`/`applyPreconditioner()` on the existing AMGCL wrapper. The serial scipy matvecs make
+the *wall* numbers pessimistic vs. a threaded production smoother — so record, per arm, the
+iteration count AND the decomposed per-application cost (fine-smoothing seconds vs. coarse-V-cycle
+seconds), and derive a projected-threaded wall alongside the measured one.
+
+Reference arms, same probe run, same session (`probe_201_block_isolated_v2.log`'s numbers for
+cross-checking only): production scalar default (96 iters / 6.37 s there) and §17's tuned
+d=8/npre=npost=2 (51 / 9.02 s).
+
+Sweep, small: fine `ν ∈ {1, 2}` × fine Chebyshev degree ∈ {2, 3, 5} × coarse-level config ∈
+{shipped scalar default, §17's d=8/npre=npost=2} — the coarse level is cheap, so the stronger
+config may win there. Two extra single columns: (a) coarse-level `set_nullspace` with the 3
+translations **on `A₁`** — RBMs measurably don't help on the quadratic condensed block (§11/§13),
+but a clean P1 Galerkin operator is a different animal and the column costs nothing; (b) one
+no-fine-smoothing row (pure `P V(A₁) Pᵀ`) — expected to stall (unsmoothed quadratic
+high-frequency error), recorded to confirm the mechanism.
+
+**The diagnostic that decides whether the hypothesis is even true:** `report()` on the `A₁`
+hierarchy. Expect a healthy SA hierarchy (4+ levels, ~3–4× coarsening, sane operator complexity)
+in place of the 3-level/18× pathology of §17 A2. **If SA on `A₁` is still shallow/degenerate, the
+quadratic-discretization hypothesis is falsified** — the real obstacle is then the
+contact-penalty/condensation structure surviving the projection — record it, stop the phase, and
+note that this redirects future effort to constraint-aware preconditioning (the low-rank
+penalty/Woodbury idea from the Phase-7 discussion), not to more AMG tuning.
+
+**Gate:** best two-grid arm beats the production default on the isolated block by **≥20%
+projected-threaded wall** (and no worse measured-serial than the §17 tuned arm), with iteration
+count materially below 96. Otherwise record and stop.
+
+### 22.3 Coupled offline validation (production code path, all 9 ords)
+
+Implement the two-grid as an opt-in per-field preconditioner variant inside
+`edelweissfe/linsolve/blockamg/blockamg.py` (a p-two-grid object holding `P`, the `A₁` AMGCL
+instance, and the fine Chebyshev; selected when a quadratic topology map is present *and* an
+option enables it). For this offline step the map is **injected by the probe** directly — the
+NIST plumbing waits for a pass. Replay all 9 dumped ords, same-session arms: shipped default vs.
+the two-grid variant, EW forcing + true-residual stopping on both (the shipped solver behaviour,
+§20.2). Watch the true-residual continuations — a different `M` changes the
+preconditioned/true-residual gap, and continuations are part of the honest cost (§20.2 step 1).
+
+**Bar (unchanged from every prior default change):** ≥20% aggregate external wall over the 9
+ords, no ord regressing past ~1.05×, true residuals no looser than the shipped default's.
+
+**Production fine-smoother decision (only after the bar clears):** the probe's serial scipy
+Chebyshev is a stand-in. The production form should be a threaded apply — preferred: extend the
+AMGCL wrapper with a standalone relaxation-as-preconditioner entry point
+(`relaxation::as_preconditioner`, the same additive `.hpp`/`.pxd`/`.pyx` pattern as
+`set_nullspace`/`build`/`report`; ~half day) so the fine sweeps run OpenMP-threaded like every
+other AMGCL kernel. A `prange` Cython SpMV is the fallback. Decide by measuring the serial
+version's share first — if fine smoothing is <15% of a coupled solve, ship the simple version and
+record the deferred optimization.
+
+### 22.4 Live gate, plumbing, and ship decision
+
+1. **NIST plumbing:** compute `isCorner`/`edgeEndpoints` at equation-system build, next to where
+   the field structure is already pushed (`nonlinearimplicitstatic.py:314`,
+   `LinearSolver.setFieldStructure`); `FieldBlock` (`edelweissfe/linsolve/base.py:46`) gains the
+   optional map. **Graceful degeneration is a hard requirement:** on a linear mesh every node is
+   a corner → `P = I` → the solver must skip the p-level and behave exactly as today
+   (`CantileverBeamQuad4BlockAMG` must pass unchanged).
+2. **New regression test:** a Quad8 `blockamg` testfile (clone `CantileverBeamQuad8`, the same
+   pattern `CantileverBeamQuad4BlockAMG` followed), exercising the p-two-grid path end-to-end
+   through the Newton loop. Registered, skipped where AMGCL is not built.
+3. **Live gate:** the pryout per §19.1/§21.0 — back-to-back with unmodified `blockamg.inp`,
+   trajectory identical (15/8/5/5, cutbacks `0.0025`/`0.00125`/`0.000625`,
+   `U_loading=0.021875`), externally timed win consistent with 22.3's margin.
+4. **Ship:** on a pass, default-on for vector fields that carry a quadratic map (scalar fields
+   and linear meshes untouched); docs in `doc/source/documentation/linsolvers.rst` (blockamg
+   section: the p-level, the topology-map requirement, the degeneration rule). On a fail at any
+   gate: record the table and the mechanism, default untouched, the enabler dump and the opt-in
+   variant stay (they are the infrastructure any future p-multigrid attempt needs).
+
+### Gotchas specific to this phase (beyond §8/§17/§19)
+
+- **§20.1's standalone-vs-embedded trap** is the reason 22.2 mandates one-shot-`M` measurement.
+  Do not report any `.solve()` numbers as evidence.
+- **Dirichlet identity rows survive into `A₁` smeared** (`Pᵀ·(identity row)·P` spreads ½-weights).
+  §17 B1's hazard was *symmetrization* across Dirichlet rows, which is not what Galerkin does —
+  but if `A₁` misbehaves (NaN from `applyPreconditioner`, §17's silent-NaN gotcha; stalls;
+  non-positive diagonal entries), mask Dirichlet rows/columns of `As₂` before projecting, per
+  §17 A1/B1, and re-run before drawing any conclusion.
+- **Scaling order is fixed by decree:** equilibrate first (production behaviour), then project
+  the scaled operator with the unscaled topological `P`. Do not scale `P`.
+- **The Chebyshev spectral estimate on `As₂` is the probe's own responsibility** (§17 B5): a bad
+  bound diverges. Power-iterate ~50 steps once per system; `lower=0.01`.
+- **`PᵀA₂P` cost counts.** It re-runs every solve (§21.1: the pattern churns; nothing to cache).
+  Time it separately in every probe table; it is part of the hierarchy-build budget, not free.
+- Element-local numbering must be **verified from this repo's element code**, not assumed from
+  Abaqus memory; the dump hard-errors on unrecognized element node counts.
+
+### Out of scope for this phase
+
+Matrix-free fine-level smoothing (the Jodlbauer/Langer/Wick route — the right long-term answer to
+the §18/§19.3 bandwidth wall, wrong scope for a probe-first phase); Krylov recycling (GCRO-DR —
+independent lever, own future phase, pilots cheaply via PETSc/HPDDM given `petsclu` already
+exists); the §21.2 Cython condensation kernel; D4 (still the phase after, on whatever
+configuration this phase leaves); everything §21.3 already lists.
