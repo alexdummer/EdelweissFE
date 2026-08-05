@@ -12,7 +12,7 @@ consult it for *why*, not to re-derive *what*.
 | **`blockamg`** | scipy `gmres` + a custom block-Gauss–Seidel preconditioner (one AMGCL AMG hierarchy per physical field) | **Shipped default** | — | `edelweissfe/linsolve/blockamg` |
 | **↳ threaded outer SpMV** (§23.2) | `blockamg`'s own inner matrix–vector product now runs OpenMP-threaded (all cores) instead of single-threaded scipy CSR | **Shipped**, live-gate-verified (§23.6) — this investigation's one delivered, proven win | **1.145–1.16× live**, 1.22–1.27× offline, vs. pre-fix `blockamg` | automatic, no config needed, already the default |
 | **p-two-grid** (`p1Maps`/`p1FieldNames`) | Swaps the per-field preconditioner for a genuine two-grid V-cycle (needs a corner/edge-midside topology map) | Opt-in, **parked at parity** (§22 series, §23.5) | ~1.01–1.04× vs. shipped, *combined with* the threaded SpMV above — not a real margin, not worth more tuning right now | opt-in via `p1FieldNames` in `blockamg.json`, never shipped as default |
-| **`lgmres`** | Swaps scipy's outer `gmres` loop for AMGCL's own native C++ GMRES variant, which also recycles Krylov search directions across separate Newton iterations instead of restarting from scratch | Opt-in, **offline-validated only, not live-gated, not yet attributed** (§23.7, task #29 pending) | **1.303×** faster than the (already-threaded) shipped default, offline — but bundles ≥3 distinct mechanisms not yet separated (native-code overhead removal, cross-iteration recycling, a different residual-check semantics); one ord regresses | opt-in via `outerSolver` in `blockamg.json` |
+| **`lgmres`** | Swaps scipy's outer `gmres` loop for AMGCL's own native C++ GMRES variant (Loose GMRES's own intra-call restart-cycle augmentation, not cross-Newton-iteration recycling — see below) | Opt-in, **offline-validated and attributed, not yet live-gated** (§23.7, §23.9 step 2/task #29 done) | **1.32–1.33×** faster than the (already-threaded) shipped default, offline — ablation shows the win is a robust, per-call algorithmic property (no cross-increment state to go stale); one easy ord (00009) still regresses, cause intrinsic to the algorithm, not recycling | opt-in via `outerSolver` in `blockamg.json` |
 
 **Net effect on what actually runs today, with zero config changes: `blockamg` is ~1.15× faster
 live than a year ago, on the same default it always shipped.** Everything else in the table is
@@ -4240,6 +4240,81 @@ for this outer solver. Three cheap, offline follow-ups before any live work:
    bites). This targets the regression's proposed cause directly, costs one boolean plumbed into
    `solve()`, and is testable on the same 9-ord harness (ords span increments, so the harness
    exercises the reset).
+
+**All three follow-ups executed (§23.9 step 2, offline, `probe_239_lgmres_ablation.py`, same 9-ord
+harness). The result overturns the original attribution, in a good way — the win turns out to be
+*more* robust than hoped, not less.**
+
+Implementation, additive and opt-in-gated (both branches): `LGMRESOuterSolverT::solve` (`amgcl-
+wrapper.hpp`) gained a `resetOnce` parameter that temporarily flips the underlying
+`amgcl::solver::lgmres` object's own `prm.always_reset` to `true` for exactly one call, then restores
+it — reusing AMGCL's own already-correct reset mechanism (verified directly in `lgmres.hpp`:
+`if (prm.always_reset) outer_v.clear();` is the literal first statement of `operator()`) rather than
+touching `outer_v`/`outer_v_data` directly. Threaded through Cython
+(`PyAMGCLLGMRESSolver.solve(..., resetOnce=False)`) to a new `blockamg.py` constructor option,
+`lgmresResetOnNewIncrement` (default `False`, so §23.7's original behavior is unchanged unless
+explicitly turned on) — when `True`, `resetOnce=newIncrement` is passed on the main solve call only
+(never on the true-residual continuation retry, which warm-restarts the *same* outer solve, not a
+new increment). Also added: `BlockAMGSolver._lastContinuations` bookkeeping (mirrors the existing
+`_lastOuterIters`), exposing the count Fable's item 1 needed without re-deriving it from log text.
+
+| ord | scipy it/cont | lgmres AR=F it/cont | lgmres AR=T it/cont | lgmres +newIncReset it/cont |
+|---|---|---|---|---|
+| 00002 | 66/1 | 50/1 | 50/1 | 50/1 |
+| 00003 | 164/2 | 109/2 | 109/2 | 109/2 |
+| 00004 | 62/1 | 52/1 | 52/1 | 52/1 |
+| 00005 | 51/1 | 48/1 | 48/1 | 48/1 |
+| 00006 | 55/1 | 50/1 | 50/1 | 50/1 |
+| 00007 | 53/1 | 37/1 | 37/1 | 37/1 |
+| 00008 | 54/1 | 39/1 | 39/1 | 39/1 |
+| 00009 | 23/0 | 35/1 | 35/1 | 35/1 |
+| 00010 | 50/1 | 36/1 | 36/1 | 36/1 |
+| **TOTAL wall** | **158.71s** | **120.60s** | **120.41s** | **119.01s** |
+| **speedup vs. scipy** | 1.000× | 1.316× | 1.318× | 1.334× |
+
+**Finding 1 — item 2's ablation: recycling contributes nothing measurable.** `always_reset=True` and
+`always_reset=False` produce **bit-identical iteration counts on every single ord**, and wall-clock
+within noise (120.41s vs 120.60s, <0.2% apart). Cross-Newton-iteration Krylov recycling — §23.7's
+headline second mechanism, the entire reason `always_reset=False` was chosen as this codebase's
+default over AMGCL's own upstream default — is doing **nothing** on this harness. This falsifies
+half of §23.7's original attribution outright, not just leaves it unconfirmed.
+
+**Finding 2 — item 1's continuation-count check argues against the stopping-semantics theory too.**
+Fable's hypothesis predicted lgmres's continuation count would be ~0 (right-preconditioning avoids
+the preconditioned-vs-true-residual gap that forces scipy's continuations). The data says the
+opposite: lgmres needs a continuation on **9 of 9** ords (including ord 00009, the one ord where
+*scipy* needed zero) — total 10 continuations vs. scipy's 9. If right-preconditioning were closing
+that gap, lgmres's count should be lower, not equal-or-higher.
+
+**So what actually explains the 1.3×?** By elimination: AMGCL's Loose GMRES has a *second*,
+distinct augmentation mechanism this document's original framing conflated with cross-call
+recycling — LGMRES augments each restart cycle with vectors from the *previous restart cycle within
+the same call* (the classical Baker/Jessup/Manteuffel algorithm), entirely independent of
+`always_reset` (which only governs whether `outer_v` survives *across* separate `operator()` calls).
+`always_reset=True` still clears `outer_v` at the top of every call but leaves this intra-call
+mechanism fully active — which is exactly why AR=True matches AR=False: neither setting touches the
+thing actually doing the work. Combined with native C++ orchestration replacing scipy's serial
+Python bookkeeping (§23.7's first, uncontested mechanism), this fully accounts for the win with no
+contribution from anything cross-Newton-iteration-shaped.
+
+**Finding 3 — item 3's fix candidate is provably inert, for the same reason.** `lgmresResetOnNewIncrement=True`
+matches AR=False and AR=True on every ord, including 00009 (35 iterations, 1 continuation, all
+three arms, exactly). It cannot fix a mechanism that was never active — there is no stale
+cross-increment recycled subspace to reset, so ord 00009's regression must be intrinsic to
+right-preconditioned LGMRES's behavior on this specific easy, low-iteration system, not a recycling
+artifact. Not investigated further this round; not disqualifying (every harder ord still wins).
+
+**Net effect on ship-readiness: better than before this ablation, not worse.** The original plan
+worried a live gate might expose a fragile, history-dependent mechanism (a stale subspace carried
+across an increment boundary causing a surprise). That mechanism does not exist — the entire
+measured win is a robust, per-call algorithmic property (a better restarted-Krylov variant, faster
+orchestration), with no cross-Newton-iteration state to go stale, drift, or behave differently
+depending on solve order. `lgmresResetOnNewIncrement` and the continuation-count bookkeeping stay in
+the codebase (harmless, documented, available if a future problem's recycling behavior differs from
+this one's), but neither is needed to justify proceeding — the simplest config (`outerSolver=
+"amgcl_lgmres"`, defaults otherwise) is exactly as good as every variant tried. **§23.9 step 2 is
+closed; nothing blocks moving to a live gate for `lgmres` next**, subject to the same fixed-thread-
+count, trajectory-verified methodology §23.6 just used.
 
 ### 23.8 A live benchmark methodology finding — PARDISO's thread-count-dependent trajectory (aborted, not yet root-caused)
 
