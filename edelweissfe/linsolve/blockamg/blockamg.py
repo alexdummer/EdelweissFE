@@ -181,6 +181,13 @@ class BlockAMGSolver(LinearSolver):
     fieldPreconds
         Optional mapping of field name to an AMGCL preconditioner parameter tree, overriding the
         dimension-based default for that field.
+    p1Maps
+        Optional mapping of field name to a ``(isCorner, edgeEndpoints)`` P1 topology map (§22.1,
+        :func:`edelweissfe.numerics.p1topology.buildP1Map`). A vector field named here gets a
+        :class:`~edelweissfe.linsolve.blockamg.ptwogrid.PTwoGridPreconditioner` (§22) instead of
+        the single-level AMGCL default -- the map's presence *is* the opt-in, matching
+        ``fieldPreconds``'s own by-presence convention. For this offline-validation step (§22.3)
+        the map is injected directly; NIST plumbing (§22.4) is not wired up yet.
     etaMin, etaMax
         Clamp on the Eisenstat--Walker forcing tolerance (ignored if ``outerTol`` is given). ``etaMax``
         is also the tolerance used whenever there is no residual history to base a ratio on (the first
@@ -228,6 +235,7 @@ class BlockAMGSolver(LinearSolver):
         sweeps: int = 1,
         symmetric: bool = True,
         fieldPreconds: dict = None,
+        p1Maps: dict = None,
         etaMin: float = 1.0e-6,
         etaMax: float = 3.0e-4,
         ewGamma: float = 0.9,
@@ -244,6 +252,7 @@ class BlockAMGSolver(LinearSolver):
         self._sweeps = sweeps
         self._symmetric = symmetric
         self._fieldPreconds = fieldPreconds or {}
+        self._p1Maps = p1Maps or {}
         self._etaMin = etaMin
         self._etaMax = etaMax
         self._ewGamma = ewGamma
@@ -431,6 +440,18 @@ class BlockAMGSolver(LinearSolver):
                 preconditioners = []
                 for i, block in enumerate(blocks):
                     isVectorField = block.dimension > 1
+                    if isVectorField and block.name in self._p1Maps:
+                        # p-two-grid (§22): the map's presence for this field is the opt-in.
+                        from edelweissfe.linsolve.blockamg.ptwogrid import (
+                            PTwoGridPreconditioner,
+                        )
+
+                        isCorner, edgeEndpoints = self._p1Maps[block.name]
+                        solver = PTwoGridPreconditioner(isCorner, edgeEndpoints)
+                        solver.build(diagBlocks[i], dinv[slices[i]])
+                        preconditioners.append(solver)
+                        continue
+
                     precondParams = dict(
                         self._fieldPreconds.get(
                             block.name, _DEFAULT_VECTOR_PRECOND if isVectorField else _DEFAULT_SCALAR_PRECOND
