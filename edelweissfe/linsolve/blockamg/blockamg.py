@@ -174,6 +174,25 @@ class BlockAMGSolver(LinearSolver):
         default since §20.2) uses adaptive forcing instead -- see ``etaMin``/``etaMax`` below.
     outerRestart, outerMaxiter
         The outer GMRES restart length and maximum restart cycles.
+    outerSolver
+        ``"scipy"`` (default, unchanged) uses ``scipy.sparse.linalg.gmres`` as before. ``"amgcl_lgmres"``
+        (§23.7, opt-in) uses AMGCL's own native ``amgcl::solver::lgmres`` instead, at both outer-solve
+        call sites (the main solve and the true-residual continuation retry below) -- see
+        ``edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for why: scipy's own
+        GMRES orchestration (Arnoldi/Gram-Schmidt/restart bookkeeping) was found to be the single
+        largest unaddressed cost bucket on the outer loop (PERF_LINSOLVE_INVESTIGATION.md §23.1's
+        census, ~38% of solve wall), out of that phase's own scope but the sizing input for this one.
+        Not yet built or live-validated -- see §23.7.
+    lgmresM, lgmresK, lgmresAlwaysReset
+        Only used when ``outerSolver == "amgcl_lgmres"``: forwarded to AMGCL's own ``lgmres::params``
+        fields ``M`` (inner iterations per outer restart, default ``30``), ``K`` (recycled/augmented
+        vectors carried between restarts, default ``3``), and ``always_reset`` (default ``False`` here
+        -- *not* AMGCL's own upstream default of ``True``: the entire reason to prefer ``lgmres`` over
+        plain GMRES in this class is to keep its recycled Krylov vectors alive *across* the outer
+        Newton-iteration solves that reuse the same persistent solver instance, per
+        ``LGMRESOuterSolverT``'s own doc comment; defaulting to AMGCL's own ``True`` here would silently
+        discard that benefit on every call while still paying the callback-per-apply overhead, a strictly
+        worse outcome than the scipy path with nothing to show for it).
     sweeps
         Block Gauss-Seidel sweeps per preconditioner application.
     symmetric
@@ -241,6 +260,10 @@ class BlockAMGSolver(LinearSolver):
         outerTol: float = None,
         outerRestart: int = 100,
         outerMaxiter: int = 8,
+        outerSolver: str = "scipy",
+        lgmresM: int = 30,
+        lgmresK: int = 3,
+        lgmresAlwaysReset: bool = False,
         sweeps: int = 1,
         symmetric: bool = True,
         fieldPreconds: dict = None,
@@ -259,6 +282,12 @@ class BlockAMGSolver(LinearSolver):
         self._outerTol = outerTol
         self._outerRestart = outerRestart
         self._outerMaxiter = outerMaxiter
+        if outerSolver not in ("scipy", "amgcl_lgmres"):
+            raise ValueError("outerSolver must be 'scipy' or 'amgcl_lgmres', got {:!r}".format(outerSolver))
+        self._outerSolver = outerSolver
+        self._lgmresM = lgmresM
+        self._lgmresK = lgmresK
+        self._lgmresAlwaysReset = lgmresAlwaysReset
         self._sweeps = sweeps
         self._symmetric = symmetric
         self._fieldPreconds = fieldPreconds or {}
@@ -292,6 +321,17 @@ class BlockAMGSolver(LinearSolver):
         self._lastNnz = None
         self._lastOuterIters = None
         self._refreshNext = False
+
+        # The persistent AMGCL lgmres outer-solver instance (§23.7, only used when outerSolver ==
+        # "amgcl_lgmres"), and the problem size it was built for. Unlike the per-field AMG
+        # hierarchies above, this is deliberately *not* torn down and rebuilt whenever mustRefresh
+        # fires -- see edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp's LGMRESOuterSolverT for why: its
+        # whole point is to keep its own recycled Krylov vectors alive across every solve over this
+        # BlockAMGSolver's lifetime, regardless of whether the AMG hierarchies themselves were
+        # refreshed that solve. It is only rebuilt on an actual size change (see __call__), the one
+        # condition under which AMGCL's own preallocated scratch vectors are no longer valid.
+        self._lgmresSolver = None
+        self._lgmresN = None
 
     def _log(self, level: str, message: str) -> None:
         """Emit ``message`` through the injected Journal (see ``setJournal``, inherited from
@@ -399,6 +439,21 @@ class BlockAMGSolver(LinearSolver):
         blocks = self._resolveBlocks(n)
         slices = [slice(block.start, block.stop) for block in blocks]
         b = np.asarray(b).reshape(n)
+
+        if self._outerSolver == "amgcl_lgmres" and (self._lgmresSolver is None or n != self._lgmresN):
+            # A size change invalidates AMGCL's own preallocated Arnoldi/augmentation-vector scratch
+            # (fixed at construction, see LGMRESOuterSolverT/PyAMGCLLGMRESSolver) -- the same condition
+            # mustRefresh tracks below for the AMG hierarchies (n != self._n), reused here. Note this
+            # constructs independently of mustRefresh: a hierarchy refresh alone (e.g. a residual jump)
+            # must *not* rebuild this object, since keeping its recycled Krylov vectors alive across
+            # exactly those Newton-iteration boundaries is the entire reason to use it.
+            from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLLGMRESSolver
+
+            self._lgmresSolver = PyAMGCLLGMRESSolver(
+                n,
+                {"M": self._lgmresM, "K": self._lgmresK, "always_reset": self._lgmresAlwaysReset},
+            )
+            self._lgmresN = n
 
         fieldNames = [block.name for block in blocks]
         if fieldNames != self._fieldsAnnounced:
@@ -545,19 +600,35 @@ class BlockAMGSolver(LinearSolver):
         else:
             eta = self._forcingTolerance(residualNorm, newIncrement)
 
+        # outerSolver == "amgcl_lgmres" (§23.7, opt-in, not the default): both outer-solve call sites
+        # below (this one and the true-residual continuation retry) dispatch to AMGCL's own native
+        # amgcl::solver::lgmres (self._lgmresSolver, built/reused above) instead of
+        # scipy.sparse.linalg.gmres. lgmres's own `maxiter` bounds *all* Arnoldi steps across every
+        # internal restart, unlike scipy's separate restart/maxiter (restart cycles) knobs -- passing
+        # outerRestart * outerMaxiter through as a single total-iteration budget is a generous
+        # translation between the two, not an attempt at matching scipy's semantics bit-for-bit (out of
+        # scope for this first pass, see PERF_LINSOLVE_INVESTIGATION.md §23.7). blockGaussSeidel itself
+        # is reused unchanged for both paths -- it already has exactly the "1D array in, 1D array out"
+        # shape AMGCL's callback needs, with no LinearOperator indirection required.
         with performancetiming.timeit("blockamg: outer GMRES"):
             history = []
-            z, info = gmres(
-                outerOperator,
-                bs,
-                M=preconditioner,
-                rtol=eta,
-                atol=0.0,
-                restart=self._outerRestart,
-                maxiter=self._outerMaxiter,
-                callback=lambda residualNorm: history.append(residualNorm),
-                callback_type="pr_norm",
-            )
+            if self._outerSolver == "scipy":
+                z, info = gmres(
+                    outerOperator,
+                    bs,
+                    M=preconditioner,
+                    rtol=eta,
+                    atol=0.0,
+                    restart=self._outerRestart,
+                    maxiter=self._outerMaxiter,
+                    callback=lambda residualNorm: history.append(residualNorm),
+                    callback_type="pr_norm",
+                )
+                outerIters = len(history)
+            else:
+                z = self._lgmresSolver.solve(As, bs, blockGaussSeidel, eta, self._outerRestart * self._outerMaxiter)
+                outerIters = self._lgmresSolver.lastIterations
+                info = 0 if self._lgmresSolver.lastError <= eta else 1
             x = dinv * z
             # A x - b = D^-1 (As z - bs) exactly (D = diag(dinv)) -- verified numerically against the
             # direct A @ x - b computation on a real dumped system before use (§23.2). Rides on the
@@ -590,34 +661,46 @@ class BlockAMGSolver(LinearSolver):
             while trueResidual > eta and continuations < self._trueResidualMaxContinuations:
                 continuations += 1
                 continuationEta *= 0.01
-                continuationHistory = []
-                z, info = gmres(
-                    outerOperator,
-                    bs,
-                    x0=z,
-                    M=preconditioner,
-                    rtol=continuationEta,
-                    atol=0.0,
-                    restart=self._outerRestart,
-                    maxiter=self._outerMaxiter,
-                    callback=lambda residualNorm: continuationHistory.append(residualNorm),
-                    callback_type="pr_norm",
-                )
+                if self._outerSolver == "scipy":
+                    continuationHistory = []
+                    z, info = gmres(
+                        outerOperator,
+                        bs,
+                        x0=z,
+                        M=preconditioner,
+                        rtol=continuationEta,
+                        atol=0.0,
+                        restart=self._outerRestart,
+                        maxiter=self._outerMaxiter,
+                        callback=lambda residualNorm: continuationHistory.append(residualNorm),
+                        callback_type="pr_norm",
+                    )
+                    continuationIters = len(continuationHistory)
+                else:
+                    z = self._lgmresSolver.solve(
+                        As,
+                        bs,
+                        blockGaussSeidel,
+                        continuationEta,
+                        self._outerRestart * self._outerMaxiter,
+                        x0=z,
+                    )
+                    continuationIters = self._lgmresSolver.lastIterations
+                    info = 0 if self._lgmresSolver.lastError <= continuationEta else 1
                 x = dinv * z
                 trueResidual = np.linalg.norm(threadedAs.residual(bs, z) / dinv) / max(np.linalg.norm(b), 1e-300)
-                history.extend(continuationHistory)
+                outerIters += continuationIters
                 self._log(
                     "debug",
                     "blockamg:   continuation {:}/{:} eta={:.1e} +{:}it res={:.1e}".format(
                         continuations,
                         self._trueResidualMaxContinuations,
                         continuationEta,
-                        len(continuationHistory),
+                        continuationIters,
                         trueResidual,
                     ),
                 )
 
-        outerIters = len(history)
         if self._lastOuterIters is not None and outerIters > self._hierarchyStalenessFactor * self._lastOuterIters:
             self._refreshNext = True
         self._lastOuterIters = outerIters
