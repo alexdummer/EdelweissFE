@@ -55,11 +55,12 @@ def createSolver(opts) -> Callable:
             :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver` and
             PERF_LINSOLVE_INVESTIGATION.md §19.2.
         ``outerSolver``, ``lgmresM``, ``lgmresK``, ``lgmresAlwaysReset``, ``lgmresResetOnNewIncrement``
-            ``outerSolver`` selects the outer Krylov solve: ``"scipy"`` (default, unchanged) or
-            ``"amgcl_lgmres"`` (§23.7, opt-in -- AMGCL's own native ``amgcl::solver::lgmres`` in place
-            of ``scipy.sparse.linalg.gmres``). The other four are only used with ``"amgcl_lgmres"``;
-            see :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver` for their meaning.
-            **Not yet live-validated** -- see PERF_LINSOLVE_INVESTIGATION.md §23.7/§23.9.
+            ``outerSolver`` selects the outer Krylov solve: ``"amgcl_lgmres"`` (default, §23.7/§23.9 --
+            AMGCL's own native ``amgcl::solver::lgmres`` in place of ``scipy.sparse.linalg.gmres``,
+            live-gated at 8/16/32 threads, faster than scipy at every thread count and increasingly so)
+            or ``"scipy"`` (the prior default, kept as a fallback/opt-out). The other four are only used
+            with ``"amgcl_lgmres"``; see :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`
+            for their meaning.
         ``etaMin``, ``etaMax``, ``ewGamma``, ``ewAlpha``, ``residualGrowthFactor``,
         ``hierarchyStalenessFactor``
             Knobs for the adaptive outer tolerance and the per-field AMG hierarchy reuse across Newton

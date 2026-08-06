@@ -552,13 +552,17 @@ private:
 //
 // One instance is meant to be constructed once per BlockAMGSolver and reused for that solver's entire
 // lifetime, not rebuilt per solve like the per-field AMG hierarchies (see blockamg.py's own
-// mustRefresh bookkeeping for those). This is deliberate, not an oversight: lgmres::params'
-// `always_reset = false` keeps the solver's internal recycled/augmented Krylov vectors (`outer_v`)
-// alive *across* separate operator() calls on the same instance -- AMGCL's own doc comment on `K`
-// names "solving multiple similar problems" / "non-stationary problems with slowly changing
-// coefficients" as the intended use, which is exactly a sequence of Newton iterations' outer solves.
-// Rebuilding a fresh lgmres object every solve would discard exactly the state this class exists to
-// keep, leaving no reason to prefer it over plain GMRES at all.
+// mustRefresh bookkeeping for those). This persistence is independent of `always_reset` (PERF_
+// LINSOLVE_INVESTIGATION.md §23.9): it is what lets tol/maxiter be mutated per call onto the same
+// underlying object (see below) without paying construction cost every solve, and it is what
+// `always_reset=false` would use *if* enabled -- but §23.9's attribution ablation found cross-call
+// recycling (`outer_v` surviving across separate operator() calls, AMGCL's own doc comment on `K`
+// naming "solving multiple similar problems" as the intended use) contributes nothing measurable on
+// 9 representative systems and, on a live pryout trajectory, actively compounds a struggling solve's
+// poorly-conditioned subspace into a much more expensive (and once, NaN) subsequent one. `blockamg.py`
+// now defaults `always_reset=True` (AMGCL's own upstream default) accordingly -- this class still
+// earns its keep over plain scipy GMRES from threading and lgmres's own intra-call restart-cycle
+// augmentation alone (independent of `always_reset`, see the ablation), not from cross-call memory.
 //
 // The system matrix itself is *not* cached across calls the way the AMG hierarchies are -- it is
 // rebuilt fresh in every solve() call from the raw CSR arrays, exactly like ThreadedMatrixT above
@@ -591,7 +595,7 @@ public:
   int                       n_;
 
   // Constructed once for a fixed problem size n. json_params is lgmres::params' own sub-tree, e.g.
-  // {"M": 30, "K": 3, "always_reset": false} -- forwarded 1:1 to amgcl::solver::lgmres::params'
+  // {"M": 30, "K": 3, "always_reset": true} -- forwarded 1:1 to amgcl::solver::lgmres::params'
   // ptree constructor with no translation layer, matching every field name AMGCL itself uses (M, K,
   // always_reset, pside, maxiter, tol, abstol, ns_search, verbose). tol/maxiter passed here only set
   // the *initial* defaults; solve() overrides both on every call (see the class comment above) --

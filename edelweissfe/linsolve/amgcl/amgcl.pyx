@@ -548,11 +548,17 @@ cdef class PyAMGCLLGMRESSolver:
     :func:`_lgmresPrecondApplyTrampoline`, called once per Arnoldi vector.
 
     One instance should be constructed once per ``BlockAMGSolver`` and reused for that solver's entire
-    lifetime (see ``blockamg.py``'s construction site), not rebuilt per solve: with ``always_reset:
-    false``, this is what lets AMGCL's own recycled/augmented Krylov vectors survive *across* separate
-    :meth:`solve` calls -- the entire point of using ``lgmres`` here instead of plain GMRES. The
-    problem size ``n`` is fixed at construction (AMGCL preallocates every scratch vector for it); a
-    field-structure/dof-count change needs a fresh instance.
+    lifetime (see ``blockamg.py``'s construction site), not rebuilt per solve -- this lets tol/maxiter
+    be mutated per call onto the same object without paying construction cost every solve (see
+    :meth:`solve`), independent of ``always_reset``. ``always_reset: false`` would additionally let
+    AMGCL's own recycled/augmented Krylov vectors survive *across* separate :meth:`solve` calls, but
+    PERF_LINSOLVE_INVESTIGATION.md §23.9's attribution ablation and live gate found that recycling
+    contributes nothing measurable and can actively compound a struggling solve's poorly-conditioned
+    subspace into a much more expensive (or NaN) subsequent one -- ``blockamg.py`` now defaults
+    ``always_reset=True`` accordingly; this class still earns its keep over plain scipy GMRES from
+    threading and lgmres's own intra-call restart-cycle augmentation alone. The problem size ``n`` is
+    fixed at construction (AMGCL preallocates every scratch vector for it); a field-structure/dof-count
+    change needs a fresh instance.
     """
     cdef LGMRESOuterSolver* solver
     cdef readonly int n

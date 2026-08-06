@@ -175,24 +175,30 @@ class BlockAMGSolver(LinearSolver):
     outerRestart, outerMaxiter
         The outer GMRES restart length and maximum restart cycles.
     outerSolver
-        ``"scipy"`` (default, unchanged) uses ``scipy.sparse.linalg.gmres`` as before. ``"amgcl_lgmres"``
-        (§23.7, opt-in) uses AMGCL's own native ``amgcl::solver::lgmres`` instead, at both outer-solve
-        call sites (the main solve and the true-residual continuation retry below) -- see
-        ``edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for why: scipy's own
-        GMRES orchestration (Arnoldi/Gram-Schmidt/restart bookkeeping) was found to be the single
+        ``"amgcl_lgmres"`` (default, §23.7/§23.9) uses AMGCL's own native ``amgcl::solver::lgmres`` at
+        both outer-solve call sites (the main solve and the true-residual continuation retry below) --
+        see ``edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for why: scipy's
+        own GMRES orchestration (Arnoldi/Gram-Schmidt/restart bookkeeping) was found to be the single
         largest unaddressed cost bucket on the outer loop (PERF_LINSOLVE_INVESTIGATION.md §23.1's
-        census, ~38% of solve wall), out of that phase's own scope but the sizing input for this one.
-        Not yet built or live-validated -- see §23.7.
+        census, ~38% of solve wall). Live-gated at 8/16/32 threads (§23.9 step 3): trajectory-identical
+        to the prior scipy default, no NaN (after the ``lgmresAlwaysReset`` fix), and increasingly
+        faster than scipy as thread count grows (1.01x/1.07x/2.18x at 8/16/32 -- scipy's own
+        orchestration anti-scales past one NUMA node on this hardware, lgmres does not). ``"scipy"``
+        uses ``scipy.sparse.linalg.gmres`` instead, kept as a fallback/opt-out, not removed.
     lgmresM, lgmresK, lgmresAlwaysReset
         Only used when ``outerSolver == "amgcl_lgmres"``: forwarded to AMGCL's own ``lgmres::params``
         fields ``M`` (inner iterations per outer restart, default ``30``), ``K`` (recycled/augmented
-        vectors carried between restarts, default ``3``), and ``always_reset`` (default ``False`` here
-        -- *not* AMGCL's own upstream default of ``True``: the entire reason to prefer ``lgmres`` over
-        plain GMRES in this class is to keep its recycled Krylov vectors alive *across* the outer
-        Newton-iteration solves that reuse the same persistent solver instance, per
-        ``LGMRESOuterSolverT``'s own doc comment; defaulting to AMGCL's own ``True`` here would silently
-        discard that benefit on every call while still paying the callback-per-apply overhead, a strictly
-        worse outcome than the scipy path with nothing to show for it).
+        vectors carried between restarts, default ``3``), and ``always_reset`` (default ``True`` here,
+        matching AMGCL's own upstream default -- *not* the original §23.7 choice of ``False``. That
+        choice assumed keeping the recycled Krylov vectors alive *across* separate outer solves was a
+        real, additional win on top of threading; the §23.9 attribution ablation found it contributes
+        *nothing* measurable on 9 representative dumped systems (bit-identical iteration counts
+        whether reset or not), and the live gate then found it actively *harmful* on a real pryout
+        trajectory -- a solve that already struggled (125 outer iterations, "possible preconditioner
+        degradation") left a poorly-conditioned recycled subspace that, left unreset, compounded into
+        a subsequent solve needing 428 iterations (vs. 159 with ``always_reset=True``) and, in the
+        original live run, an outright NaN. There is no evidence recycling ever helps here, and clear
+        evidence it can hurt badly -- so this now defaults to AMGCL's own choice.
     lgmresResetOnNewIncrement
         Only used when ``outerSolver == "amgcl_lgmres"``. When ``True``, the recycled Krylov vectors are
         discarded (one-shot, via the ``resetOnce`` parameter to ``PyAMGCLLGMRESSolver.solve``) exactly on
@@ -268,10 +274,10 @@ class BlockAMGSolver(LinearSolver):
         outerTol: float = None,
         outerRestart: int = 100,
         outerMaxiter: int = 8,
-        outerSolver: str = "scipy",
+        outerSolver: str = "amgcl_lgmres",
         lgmresM: int = 30,
         lgmresK: int = 3,
-        lgmresAlwaysReset: bool = False,
+        lgmresAlwaysReset: bool = True,
         lgmresResetOnNewIncrement: bool = False,
         sweeps: int = 1,
         symmetric: bool = True,
@@ -621,7 +627,8 @@ class BlockAMGSolver(LinearSolver):
         else:
             eta = self._forcingTolerance(residualNorm, newIncrement)
 
-        # outerSolver == "amgcl_lgmres" (§23.7, opt-in, not the default): both outer-solve call sites
+        # outerSolver == "amgcl_lgmres" (§23.7/§23.9, the default since the live gate passed): both
+        # outer-solve call sites
         # below (this one and the true-residual continuation retry) dispatch to AMGCL's own native
         # amgcl::solver::lgmres (self._lgmresSolver, built/reused above) instead of
         # scipy.sparse.linalg.gmres. lgmres's own `maxiter` bounds *all* Arnoldi steps across every
