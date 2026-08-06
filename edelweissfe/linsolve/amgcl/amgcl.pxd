@@ -137,10 +137,10 @@ cdef extern from "amgcl-wrapper.hpp":
                    double& error,
                    bint resetOnce) except +
 
-    # §24 (task #31, scoping probe, not yet wired into the live driver): OpenMP-threaded
-    # sparse-matrix product/sum, for edelweissfe/numerics/mpctransformation.py's T^T K T + C
-    # condensation, currently scipy CSR (single-threaded). Square matrices only -- see
-    # SpGEMMHelperT's own comment for why.
+    # §24 (task #31): OpenMP-threaded sparse-matrix product/sum, wired into
+    # edelweissfe/numerics/mpctransformation.py's T^T K T + C condensation as an opt-in alternative
+    # (useAmgclSpgemm/useAmgclMPCCondensation) to the plain expression's scipy CSR (single-threaded)
+    # routines. Square matrices only -- see SpGEMMHelperT's own comment for why.
     cdef cppclass SpGEMMHelper:
         SpGEMMHelper() except +
         void product(int aN, const int* aPtr, const int* aCol, const double* aVal,

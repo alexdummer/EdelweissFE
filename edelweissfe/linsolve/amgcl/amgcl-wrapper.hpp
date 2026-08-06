@@ -491,14 +491,15 @@ public:
   }
 };
 
-// §24 (task #31, scoping only -- not yet wired into the live driver): exposes AMGCL's own
-// OpenMP-threaded sparse-matrix-matrix product and sparse-matrix addition
-// (amgcl::backend::builtin's product()/sum(), verified directly against the installed headers:
-// spgemm_saad/spgemm_rmerge both carry `#pragma omp parallel`/`#pragma omp for`, and so does sum())
-// as a scoping probe for edelweissfe/numerics/mpctransformation.py's `T^T @ K @ T + C` condensation,
-// currently done via scipy's own single-threaded CSR sparse routines -- the same class of gap
-// ThreadedMatrixT (above) closed for the outer GMRES matvec and RelaxationSmootherT closed for AMG
-// relaxation. Deliberately generic (two raw CSR matrices in, one CSR matrix out) rather than
+// §24 (task #31): exposes AMGCL's own OpenMP-threaded sparse-matrix-matrix product and
+// sparse-matrix addition (amgcl::backend::builtin's product()/sum(), verified directly against the
+// installed headers: spgemm_saad/spgemm_rmerge both carry `#pragma omp parallel`/`#pragma omp for`,
+// and so does sum()). Wired into edelweissfe/numerics/mpctransformation.py's `T^T @ K @ T + C`
+// condensation as an opt-in alternative (`useAmgclSpgemm`/`useAmgclMPCCondensation`, default False
+// pending a live gate at more thread counts) to the plain expression's scipy CSR sparse routines --
+// the same class of gap ThreadedMatrixT (above) closed for the outer GMRES matvec and
+// RelaxationSmootherT closed for AMG relaxation. Deliberately generic (two raw CSR matrices in, one
+// CSR matrix out) rather than
 // specific to the T^T K T + C expression itself: the caller composes `product()`/`sum()` calls
 // (e.g. `KT = product(K, T)`, `Kt_noC = product(T^T, KT)`, `Kt = sum(1, Kt_noC, 1, C)`), passing
 // T^T as its own already-transposed CSR array (scipy's own `.T.tocsr()` is a cheap O(nnz)
@@ -508,11 +509,13 @@ public:
 // probe measuring one call at a time, not a class meant to be composed into a multi-step pipeline
 // internally; chaining happens in Python, one call per step, exactly like the comment above shows.
 //
-// Square matrices only (n x n) -- the only shape this scoping probe or its target expression
-// (T^T K T + C, every factor nDof x nDof) ever needs. Uses the same 4-tuple adapter construction
-// every other class in this header uses (n, ptr_range, col_range, val_range) -- verified directly
-// against amgcl/adapter/crs_tuple.hpp that this adapter's own cols_impl returns the same `n` as
-// rows_impl (i.e. it only ever represents a square matrix), so there is no separate ncols to plumb.
+// Square matrices only (n x n) -- the only shape this class or its target expression (T^T K T + C,
+// every factor nDof x nDof) ever needs. Uses the same 4-tuple adapter construction every other class
+// in this header uses (n, ptr_range, col_range, val_range) -- verified directly against amgcl/
+// adapter/crs_tuple.hpp that this adapter's own cols_impl returns the same `n` as rows_impl (i.e. it
+// only ever represents a square matrix), so there is no separate ncols to plumb per matrix. The two
+// operands still need equal size for product()/sum() to be dimensionally valid, though -- checked
+// explicitly in both (see there), not left as a comment-only assumption.
 class SpGEMMHelperT {
 public:
   typedef amgcl::backend::builtin< double > Backend;
@@ -530,7 +533,10 @@ public:
     return BackendMatrix( A );
   }
 
-  // result_ <- A * B (both n x n)
+  // result_ <- A * B (both n x n). aN == bN is required for a square A*B to even be dimensionally
+  // valid (A's ncols must equal B's nrows) -- enforced here, not just documented, since amgcl::
+  // backend::product() itself trusts its inputs and would otherwise read/write out of bounds on a
+  // mismatched pair rather than fail cleanly.
   void product( int           aN,
                 const int*    aPtr,
                 const int*    aCol,
@@ -540,12 +546,18 @@ public:
                 const int*    bCol,
                 const double* bVal )
   {
+    if ( aN != bN ) {
+      throw std::runtime_error( "SpGEMMHelperT::product(): shape mismatch -- A is " + std::to_string( aN ) + "x" +
+                                std::to_string( aN ) + ", B is " + std::to_string( bN ) + "x" + std::to_string( bN ) +
+                                " (square matrices of equal size required)." );
+    }
     BackendMatrix A = makeMatrix( aN, aPtr, aCol, aVal );
     BackendMatrix B = makeMatrix( bN, bPtr, bCol, bVal );
     result_         = amgcl::backend::product( A, B, /*sort=*/true );
   }
 
-  // result_ <- alpha*A + beta*B (both n x n, same shape)
+  // result_ <- alpha*A + beta*B (both n x n, same shape) -- see product()'s comment on why aN == bN
+  // is enforced rather than only documented.
   void sum( double        alpha,
             int           aN,
             const int*    aPtr,
@@ -557,6 +569,11 @@ public:
             const int*    bCol,
             const double* bVal )
   {
+    if ( aN != bN ) {
+      throw std::runtime_error( "SpGEMMHelperT::sum(): shape mismatch -- A is " + std::to_string( aN ) + "x" +
+                                std::to_string( aN ) + ", B is " + std::to_string( bN ) + "x" + std::to_string( bN ) +
+                                " (square matrices of equal size required)." );
+    }
     BackendMatrix A = makeMatrix( aN, aPtr, aCol, aVal );
     BackendMatrix B = makeMatrix( bN, bPtr, bCol, bVal );
     result_         = amgcl::backend::sum( alpha, A, beta, B, /*sort=*/true );
@@ -747,10 +764,23 @@ public:
     // boundaries (where a stale recycled subspace is hypothesized to cost pure overhead, §23.7's
     // ord-00009 finding), keep recycling within an increment's own Newton sequence (AMGCL's own
     // intended use for K, and where every other ord showed recycling helping, not hurting).
-    bool savedAlwaysReset = solver_->prm.always_reset;
-    if ( resetOnce ) {
-      solver_->prm.always_reset = true;
-    }
+    // RAII, not a plain save/mutate/restore: `(*solver_)(...)` below can throw (AMGCL internals,
+    // e.g. an allocation failure -- not a Python exception from the preconditioner callback, which
+    // never becomes a C++ exception here, see PyLGMRESPrecondT/the trampoline). A bare save-then-
+    // restore-at-the-end would leave `always_reset` permanently flipped on the persistent, reused
+    // `solver_` object if that call threw, silently changing every subsequent solve()'s recycling
+    // behaviour. This guard restores unconditionally, on every exit path.
+    struct AlwaysResetGuard {
+      Solver::params& prm_;
+      bool            saved_;
+      AlwaysResetGuard( Solver::params& prm, bool resetOnce ) : prm_( prm ), saved_( prm.always_reset )
+      {
+        if ( resetOnce ) {
+          prm_.always_reset = true;
+        }
+      }
+      ~AlwaysResetGuard() { prm_.always_reset = saved_; }
+    } alwaysResetGuard( solver_->prm, resetOnce );
 
     int  nnz = ptr[n];
     auto A   = std::make_tuple( n,
@@ -774,8 +804,6 @@ public:
     std::tie( itersOut, errorOut ) = ( *solver_ )( Amat, precond, rhs_rng, x_rng );
     iters                          = static_cast< int >( itersOut );
     error                          = errorOut;
-
-    solver_->prm.always_reset = savedAlwaysReset;
   }
 };
 

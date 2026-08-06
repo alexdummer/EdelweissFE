@@ -686,17 +686,17 @@ cdef class PyAMGCLLGMRESSolver:
 
 
 cdef class PyAMGCLSpGEMM:
-    """§24 (task #31) scoping probe: OpenMP-threaded sparse-matrix product/sum, wrapping AMGCL's own
+    """§24 (task #31): OpenMP-threaded sparse-matrix product/sum, wrapping AMGCL's own
     ``amgcl::backend::builtin::product()``/``sum()`` -- verified directly (not assumed) against the
     installed headers that both are OpenMP-parallel (``spgemm_saad``/``spgemm_rmerge`` and ``sum()``
     itself each carry ``#pragma omp parallel``/``#pragma omp for``).
 
-    Scoping target: :mod:`edelweissfe.numerics.mpctransformation`'s ``T^T @ K @ T + C`` condensation,
-    currently two ``scipy.sparse`` CSR products plus one CSR addition, all single-threaded (SciPy's
-    own sparse routines carry no OpenMP parallelism at all). This class does not replace that
-    computation itself -- see the offline probe this class was built for -- it only exposes the two
-    primitives (``product``, ``sum``) generically, one call at a time, matching
-    ``SpGEMMHelperT``'s own design (square matrices only; compose calls in Python).
+    Used by :meth:`~edelweissfe.numerics.mpctransformation.MultiPointConstraintTransformation.
+    _transformSystemMatrixAmgcl` as an opt-in alternative (``useAmgclSpgemm``/
+    ``useAmgclMPCCondensation``) to the plain ``T^T @ K @ T + C`` expression's ``scipy.sparse`` CSR
+    products/addition, all single-threaded (SciPy's own sparse routines carry no OpenMP parallelism
+    at all). This class exposes the two primitives (``product``, ``sum``) generically, one call at a
+    time, matching ``SpGEMMHelperT``'s own design (square matrices only; compose calls in Python).
     """
     cdef SpGEMMHelper* helper
 
@@ -709,6 +709,13 @@ cdef class PyAMGCLSpGEMM:
 
     def _copyOut(self):
         cdef int nRows = self.helper.resultNRows()
+        cdef int nCols = self.helper.resultNCols()
+        if nRows != nCols:
+            raise AssertionError(
+                "PyAMGCLSpGEMM: result is {:}x{:}, not square -- product()/sum() are only defined "
+                "for square, equal-size inputs (enforced in SpGEMMHelperT::product/sum), so this "
+                "should be unreachable.".format(nRows, nCols)
+            )
         cdef int nnz = self.helper.resultNnz()
         cdef np.ndarray[np.int32_t, ndim=1, mode="c"] ptrOut = np.empty(nRows + 1, dtype=np.int32)
         cdef np.ndarray[np.int32_t, ndim=1, mode="c"] colOut = np.empty(nnz, dtype=np.int32)
