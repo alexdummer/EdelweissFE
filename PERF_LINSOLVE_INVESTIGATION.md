@@ -13,6 +13,7 @@ consult it for *why*, not to re-derive *what*.
 | **↳ threaded outer SpMV** (§23.2) | `blockamg`'s own inner matrix–vector product now runs OpenMP-threaded (all cores) instead of single-threaded scipy CSR | **Shipped**, live-gate-verified (§23.6) — this investigation's one delivered, proven win | **1.145–1.16× live**, 1.22–1.27× offline, vs. pre-fix `blockamg` | automatic, no config needed, already the default |
 | **p-two-grid** (`p1Maps`/`p1FieldNames`) | Swaps the per-field preconditioner for a genuine two-grid V-cycle (needs a corner/edge-midside topology map) | Opt-in, **parked at parity** (§22 series, §23.5) | ~1.01–1.04× vs. shipped, *combined with* the threaded SpMV above — not a real margin, not worth more tuning right now | opt-in via `p1FieldNames` in `blockamg.json`, never shipped as default |
 | **`lgmres`** | Swaps scipy's outer `gmres` loop for AMGCL's own native C++ GMRES variant (Loose GMRES's own intra-call restart-cycle augmentation, not cross-Newton-iteration recycling — see below) | **Shipped default** (§23.10) | Live-gated at 8/16/32 threads: trajectory-identical to the prior default, no NaN (after the `lgmresAlwaysReset=True` fix), **1.01×/1.07×/2.18×** faster than the old scipy default at 8/16/32 threads respectively — scipy's own orchestration anti-scales past one NUMA node on this 2-socket hardware, lgmres does not | default; `outerSolver="scipy"` kept as a fallback |
+| **MPC condensation via AMGCL** (§24) | Threads `T^T K T + C` (multi-point-constraint condensation, on every solve of any model with hanging-node/tie MPCs) via AMGCL's OpenMP-threaded `product()`/`sum()` instead of single-threaded scipy CSR | Opt-in, live-gate-verified at 16 threads only | **2.4–2.6× faster** than the plain expression offline; **7.3% faster end-to-end** live, on top of the already-shipped `lgmres` default | opt-in via `useAmgclMPCCondensation` (NIST solver option) |
 
 **Net effect on what actually runs today, with zero config changes: `blockamg` is ~1.15× faster
 live than a year ago, on the same default it always shipped.** Everything else in the table is
@@ -4542,3 +4543,91 @@ with the "looser-but-within-tolerance" residual character both `lgmres` (§23.7)
 (§22.3/§22.4) have independently shown elsewhere in this document — not treated as a correctness
 concern, recorded honestly as an unconfirmed (not re-verified) minor divergence rather than
 silently reported as byte-identical.
+
+## 24. The serial MPC transformation, threaded via AMGCL's own SpGEMM (task #31, executed; ships as opt-in)
+
+Direct question from Matthias: "the serial MPC transformation — could that be parallelized
+easily?" `mpctransformation.py`'s `T^T @ K @ T + C` condensation runs on every linear solve of any
+model with hanging-node/tie MPCs (this pryout model always has one) — measured live at 119.0s/44
+calls (§23.10's PARDISO log), ~12% of total wall-clock — and does so entirely through SciPy's own
+CSR sparse routines, which carry **no OpenMP parallelism at all** (verified: this is the same class
+of gap §23.2 already closed for the outer GMRES matvec and §22.4 for AMG relaxation, just not yet
+touched here).
+
+**AMGCL already ships a threaded replacement, unused until now.** Checked directly against the
+installed headers (not assumed): `amgcl::backend::builtin::product()` dispatches to
+`spgemm_saad`/`spgemm_rmerge` depending on thread count, and **both** carry
+`#pragma omp parallel`/`#pragma omp for` (`detail/spgemm.hpp`); `sum()` (sparse-matrix addition, for
+the `+ C` term) is likewise explicitly threaded. `SpGEMMHelperT`/`PyAMGCLSpGEMM` (new,
+`amgcl-wrapper.hpp`/`amgcl.pxd`/`amgcl.pyx`) wraps both generically — two square CSR matrices in,
+one out — mirroring the existing `ThreadedMatrixT`/`RelaxationSmootherT`/`LGMRESOuterSolverT`
+pattern rather than writing new parallel C++.
+
+**Offline-measured on the reference 280k-dof model (`EDELWEISS_DUMP_MPC`, 3 real dumped calls):**
+
+| arm | total (3 calls) | per call |
+|---|---|---|
+| plain expression (`T^T K T + C` via SciPy, the default) | 7.834s | ~2.6s |
+| cached-pattern value scatter (§21.2 B2, since removed — see below) | 37.258s | ~12.4s |
+| **AMGCL-threaded (`product()`/`sum()`)** | **3.046s** | **~1.0–1.5s** |
+
+**AMGCL-threaded is 2.4–2.6× faster than the plain expression**, correctness-verified to
+`max|delta|=2.9e-10` relative to a `~2e7` matrix scale (floating-point precision, not
+approximation).
+
+**One real caveat, checked rather than assumed: AMGCL's `product()`/`sum()` leave far more raw nnz
+than SciPy's own routines** (54.3M vs. the plain expression's 34.2M on the reference model) — SciPy
+silently drops an output entry whenever its accumulated contributions sum to exactly zero; AMGCL's
+routines do not do this pruning. Checked directly, not assumed: of the 20.1M extra entries,
+**20,102,955 are bit-exact zero** and the other 20 are floating-point noise at ~1e-19 relative
+scale — `eliminate_zeros()` closes the gap to within 5 entries of the plain expression's own
+pattern, at ~6% extra cost (`0.088s` against `~1.46s` of SpGEMM calls).
+
+**Whether to eliminate those zeros before solving, and where: not a new question, already answered
+by this codebase.** `NIST.applyDirichletK` already calls `eliminate_zeros()` immediately after the
+MPC transform, gated by `pruneCondensedMatrixZeros` (default `True`), for exactly two documented
+reasons that predate this section: **(a) PARDISO** — its own comment states its reordering on these
+path-dependent condensed systems is sensitive enough to extra explicit-zero structural entries to
+visibly drift from the converged reference path if they are kept; **(b) `blockamg`** — its
+hierarchy-reuse gates on raw `A.nnz` (`patternChanged`/`mustRefresh`), and exact-cancellation zero
+*positions* are not guaranteed stable call-to-call (the same phenomenon the now-removed
+cached-condensation path's own union-pattern construction documented), so leaving them in risks
+spurious, expensive hierarchy rebuilds unrelated to any real preconditioner-quality change. Given
+both, the AMGCL path does **not** call `eliminate_zeros()` itself — that would double the pruning
+cost under the default config, since `applyDirichletK`'s existing call already does it, uniformly
+for both condensation strategies, immediately downstream.
+
+**Live-gated at 16 threads (fixed thread count, on top of the already-shipped `lgmres` default):**
+no NaN, trajectory byte-identical to the reference, `Job computation time` **918.48s** / external
+wall **928.44s** (cross-check 0.989) — **7.3% faster end-to-end** than plain `lgmres` alone
+(985.29s/995.17s). The `mpc transform system matrix` bucket itself: `45.38s/44 calls = 1.03s/call`,
+matching the offline estimate. `useAmgclMPCCondensation` (NIST solver option) / `useAmgclSpgemm`
+(`MultiPointConstraintTransformation` constructor) — **off by default pending a live gate at more
+thread counts** (only 16 tested so far, unlike `lgmres`'s full 8/16/32 sweep).
+
+**A live point requested directly, combining every feature shipped this round:**
+`useAmgclMPCCondensation=True` layered on the current default (`lgmres`, `always_reset=True`), 16
+threads — passes cleanly (no NaN, trajectory-identical, the numbers above).
+
+### 24.1 Cleanup: the cached-pattern condensation is removed, not kept alongside AMGCL
+
+Direct instruction from Matthias, after seeing three condensation strategies accumulate side by
+side in one file ("I am afraid that we end up with a Frankenstein-Spaghetti code"): the
+cached-pattern value scatter (§21.2 B2, `_transformSystemMatrixCached`/`_buildCacheAndScatter`/
+`_scatterPositions`, `useCachedCondensation`/`useCachedMPCCondensation`) is **removed entirely**
+rather than kept as a third, not-recommended option next to the new AMGCL path. It was already
+known slower than the plain expression (~1.7×, §21.2 B3) when it shipped; the AMGCL path now
+dominates it on every axis measured (correctness, speed) — there was no remaining argument for
+keeping it. `_D`/`_S`/`_SBool` and the S-touching-term decomposition machinery, only ever used by
+the removed path, are removed with it. `EDELWEISS_MPC_ASSERT_EXACT`'s cross-check is repointed at
+the AMGCL path (its new "needs validation" role) rather than deleted — the mechanism itself
+(compare an alternative expression against the plain one to floating-point precision) is generic
+infrastructure, not specific to whichever path currently needs the scrutiny.
+`tests/test_mpc_cached_condensation.py` (entirely scoped to the removed feature) is replaced by
+`tests/test_mpc_amgcl_spgemm.py`: the general MPC-construction tests (chained records, zero slave
+DOFs) are ported; the cached-path-specific bug regressions (scatter-map corruption, exact-zero
+cancellation in the union pattern) have no equivalent in a path with no cache to corrupt and are
+not ported. Net: two condensation strategies (plain, default; AMGCL, opt-in pending its live gate)
+instead of three, −214 lines. Full test suites re-run clean after the removal (same two
+pre-existing, unrelated failures as before: `MeshPlot`/missing LaTeX, `NodeToDeformableSurfaceContactPullOut`
+which does not use MPC constraints at all).
