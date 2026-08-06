@@ -12,7 +12,7 @@ consult it for *why*, not to re-derive *what*.
 | **`blockamg`** | scipy `gmres` + a custom block-Gauss–Seidel preconditioner (one AMGCL AMG hierarchy per physical field) | **Shipped default** | — | `edelweissfe/linsolve/blockamg` |
 | **↳ threaded outer SpMV** (§23.2) | `blockamg`'s own inner matrix–vector product now runs OpenMP-threaded (all cores) instead of single-threaded scipy CSR | **Shipped**, live-gate-verified (§23.6) — this investigation's one delivered, proven win | **1.145–1.16× live**, 1.22–1.27× offline, vs. pre-fix `blockamg` | automatic, no config needed, already the default |
 | **p-two-grid** (`p1Maps`/`p1FieldNames`) | Swaps the per-field preconditioner for a genuine two-grid V-cycle (needs a corner/edge-midside topology map) | Opt-in, **parked at parity** (§22 series, §23.5) | ~1.01–1.04× vs. shipped, *combined with* the threaded SpMV above — not a real margin, not worth more tuning right now | opt-in via `p1FieldNames` in `blockamg.json`, never shipped as default |
-| **`lgmres`** | Swaps scipy's outer `gmres` loop for AMGCL's own native C++ GMRES variant (Loose GMRES's own intra-call restart-cycle augmentation, not cross-Newton-iteration recycling — see below) | Opt-in, **offline-validated and attributed, not yet live-gated** (§23.7, §23.9 step 2/task #29 done) | **1.32–1.33×** faster than the (already-threaded) shipped default, offline — ablation shows the win is a robust, per-call algorithmic property (no cross-increment state to go stale); one easy ord (00009) still regresses, cause intrinsic to the algorithm, not recycling | opt-in via `outerSolver` in `blockamg.json` |
+| **`lgmres`** | Swaps scipy's outer `gmres` loop for AMGCL's own native C++ GMRES variant (Loose GMRES's own intra-call restart-cycle augmentation, not cross-Newton-iteration recycling — see below) | **Shipped default** (§23.10) | Live-gated at 8/16/32 threads: trajectory-identical to the prior default, no NaN (after the `lgmresAlwaysReset=True` fix), **1.01×/1.07×/2.18×** faster than the old scipy default at 8/16/32 threads respectively — scipy's own orchestration anti-scales past one NUMA node on this 2-socket hardware, lgmres does not | default; `outerSolver="scipy"` kept as a fallback |
 
 **Net effect on what actually runs today, with zero config changes: `blockamg` is ~1.15× faster
 live than a year ago, on the same default it always shipped.** Everything else in the table is
@@ -4416,3 +4416,129 @@ trajectory confound.
 point, now at parity on a faster baseline — the honest reading is that §23's wins ate its margin);
 another config sweep of any kind before the live gate lands (offline margins are established;
 what's missing is live confirmation, not more offline decimals).
+
+### 23.10 Step 3 — the lgmres live gate, a real NaN, root-caused and fixed, and a scaling surprise (executed; lgmres now ships as the default)
+
+Executed §23.9's step 3 (the live gate) at fixed 16 threads first, per the standing methodology.
+**It failed on the first attempt** — a real, reproducible NaN, not a trajectory mismatch. This
+section records the failure, the (initially wrong) diagnosis, the correct root cause, the fix, and
+the re-validated live gate that followed — including an unplanned but decisive scaling finding.
+
+**The failure.** `blockamg_lgmres.inp` (unmodified `blockamg.inp` except `linsolverConfigFile`),
+16 threads: trajectory matched the reference through the first cutback, then solve #4 needed 800
+outer iterations (`self._outerRestart * self._outerMaxiter`, i.e. it never converged) and returned
+NaN. The driver's existing NaN handling caught it and cut back further rather than crashing, but
+the *next* retry NaN'd again, and the one after that too — three consecutive breakdowns, each
+cutting back harder, never recovering. Aborted rather than let it grind indefinitely.
+
+**Root-causing it took two wrong turns before the real mechanism, both worth recording.**
+
+1. *First hypothesis (wrong): the offline-ablation-proven-inert recycling mattered after all,*
+   via a dramatic residual-scale collapse (`‖b‖` dropped ~5900× across the cutback) that the 9-ord
+   harness never sampled. A 2-call and then a full 4-call replay of the exact dumped matrices
+   through a persistent solver instance, matching the failing config exactly, **did not reproduce
+   the NaN** — it converged, just needing more iterations than normal (109, then later 428 once a
+   second bug was found — see below). The replay's *own* iteration count at an earlier, unrelated
+   solve (107) didn't even match the live log's (125), which briefly suggested run-to-run
+   floating-point nondeterminism (§23.8's PARDISO-trajectory class of problem) as the explanation
+   for everything — a plausible-sounding dead end.
+2. **The actual bug: a reproduction-script config mismatch, not nondeterminism.** The reproduction
+   script hardcoded `lgmresM=100` (copied from the §23.5/§23.7 offline harness) while the *live*
+   config (`blockamg_lgmres.json`) left `lgmresM` at its default, `30`. Different `M` genuinely
+   changes LGMRES's restart-cycle size and therefore its iteration counts — the 107-vs-125
+   discrepancy was simply two different, both-working configurations, not FP noise. Caught only
+   because the numbers should have matched exactly and didn't; flagged directly by review ("that
+   cannot be right, we are talking about complete failure, not slightly different results") — a
+   fair challenge that the nondeterminism story was reached for too early, before checking the
+   mundane explanation first.
+3. **With `lgmresM=30` corrected, the replay lines up exactly** (0/125/50 iterations at ordinals
+   0/1/2, bit-identical to the live log) and reveals the real mechanism at ordinal 3: **428**
+   iterations (not NaN, but a massive outlier — every other solve on this trajectory needs 25-125).
+   Ablating recycling on this *specific* pathological transition (unlike the 9-ord harness, where
+   it was inert) shows a clean, monotonic dose-response: `lgmresResetOnNewIncrement=True` → 248
+   iterations; `always_reset=True` (full reset every call) → 159. **Solve #2 already struggled
+   live (125 iterations, "possible preconditioner degradation")** — with `always_reset=False`
+   (the original §23.7 default), that struggling solve's poorly-conditioned recycled Krylov
+   subspace is never discarded and compounds into every subsequent solve, culminating in 428
+   iterations here and, in the original live run's exact floating-point path, an outright NaN.
+   428 iterations is already close enough to the 800-iteration ceiling that a small perturbation
+   plausibly explains why the original run tipped over into NaN while this replay merely got very
+   expensive — but that residual gap does not weaken the finding: 428 iterations is itself
+   unacceptable regardless of whether it technically converges.
+
+**Fix: `lgmresAlwaysReset`'s default flips from `False` to `True`** (commit on
+`feat/amgcl-lgmres-outer-solver`), matching AMGCL's own upstream default and reversing §23.7's
+original choice. That choice assumed cross-call recycling was a real, additional win; §23.9 step 2's
+ablation already found it contributes *nothing* measurable on the 9-ord harness, and this finding
+now shows it can be actively harmful — so there is no remaining argument for keeping it off.
+Verified offline first (the corrected replay's default config now reads 159 iterations, exactly
+matching the explicit `always_reset=True` arm) before touching xeon again. Stale comments in
+`amgcl-wrapper.hpp`/`amgcl.pyx` asserting cross-call recycling was "the entire point" of using
+`lgmres` were corrected in the same commit — they are no longer true and would have misled the next
+reader.
+
+**Live gate, re-run with the fix, at 8/16/32 threads — all three pass cleanly.**
+
+| threads | `Job computation time` | external wall | NaN? | trajectory |
+|---|---|---|---|---|
+| 8 | 1209.16s | 1218.90s | none | byte-identical to reference |
+| 16 | 985.29s | 995.17s | none | byte-identical to reference |
+| 32 | 842.85s | 852.77s | none | byte-identical to reference |
+
+Solve #4 (the formerly-NaNing solve) now needs exactly 159 iterations at every thread count,
+matching the offline verification precisely. **`lgmres` vs. the old scipy default, same thread
+count:** 1.01× (8 threads), 1.07× (16 threads), 2.18× (32 threads).
+
+**An unplanned but decisive scaling finding, from a direct user request to also compare against
+scipy's own known 16→32 regression (§23.6 found the shipped scipy default at 1839s/32 threads vs.
+1051s/16 threads — *slower*, not faster).** Completing the matrix with a scipy 8-thread run and
+this section's own three lgmres runs:
+
+| | t8 | t16 | t32 | t8→t16 | t16→t32 |
+|---|---|---|---|---|---|
+| scipy (old default) | 1224.36s / 1234.02s | 1051.44s / 1061.38s | 1839.05s / 1849.25s | 1.16× faster | **0.57× — 75% slower** |
+| lgmres (new default) | 1209.16s / 1218.90s | 985.29s / 995.17s | 842.85s / 852.77s | 1.23× faster | 1.17× faster, still improving |
+
+(`Job computation time` / external wall in each cell.) **scipy's own orchestration falls off a
+cliff exactly at 32 threads; `lgmres`, using the identical underlying threaded matvec/AMG-apply
+backend, does not — it keeps improving.** xeon's topology (`lscpu`): 2 sockets × 18 cores, NUMA
+split exactly at core 18 (`node0: 0-17`, `node1: 18-35`) — 16 threads stays inside one socket, 32
+necessarily crosses both. Since both solvers share the same threaded compute kernels, the anti-
+scaling cannot be a property of the hardware or those kernels alone; it is specific to something in
+scipy's own orchestration path.
+
+**Leading candidate mechanism, not yet isolated.** §22.2 already found (months earlier in this
+document) that numpy/scipy's own OpenBLAS thread pool runs uncoordinated alongside AMGCL's OpenMP
+pool — `run_bench.sh` sets both `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS` to the same value.
+scipy's GMRES performs many small vector operations (dot products, norms, orthogonalization) through
+numpy/BLAS every iteration; `lgmres`'s fully native C++ orchestration never calls back into BLAS at
+all. At 32 threads that is a plausible path to up to 64 threads contending for 36 physical cores
+specifically during scipy's own bookkeeping (compounded by cross-socket scheduling), while `lgmres`
+only ever spawns the one AMGCL OpenMP pool. This fits every fact gathered so far but has **not been
+isolated** — the clean next step, if this is revisited, is re-running scipy at 32 threads with
+`OPENBLAS_NUM_THREADS=1` to see whether that alone closes the gap. Recorded as an open item, not a
+confirmed diagnosis — do not cite this mechanism as settled.
+
+**Ship decision: `lgmres` is now the default `outerSolver`** (`BlockAMGSolver.__init__`'s
+`outerSolver` parameter, commit on `feat/amgcl-lgmres-outer-solver`). Both regression testfiles
+(`CantileverBeamQuad4BlockAMG`, `AMGCL`) pass unchanged with the new default. `outerSolver="scipy"`
+remains available as an explicit fallback/opt-out, not removed.
+
+**One additional live point, requested directly: `lgmres` (now default) combined with p-two-grid
+(`p1FieldNames`), 16 threads.** `blockamg_p1.json` (`p1FieldNames: ["displacement"]`, no
+`outerSolver` override) now picks up `amgcl_lgmres` automatically via the new default — the first
+time these two features have been live-tested together. No NaN, no regression against the
+already-fixed default. `Job computation time` **1002.68s**, external wall **1012.61s** (cross-check
+0.990) — **1.7% cheaper** than plain `lgmres` without p1 (985.29s/995.17s) on both metrics, a small
+but real win layered on top.
+
+**Trajectory: one single-Newton-iteration divergence, not a full mismatch** ("Converged in 8
+iteration(s)" in the reference vs. "Converged in 9" here, at one point; every cutback, every other
+increment, and the final `U_loading` match exactly). Per the standing protocol this warrants a
+reduced-increment retry to check whether it is a real divergence or noise — a retry was started,
+then stopped on direct instruction: at ~15s/linear-solve, halving load step 2's increment would
+roughly double its solve count just to chase a single extra iteration that is already consistent
+with the "looser-but-within-tolerance" residual character both `lgmres` (§23.7) and p-two-grid
+(§22.3/§22.4) have independently shown elsewhere in this document — not treated as a correctness
+concern, recorded honestly as an unconfirmed (not re-verified) minor divergence rather than
+silently reported as byte-identical.
