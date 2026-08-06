@@ -683,3 +683,86 @@ cdef class PyAMGCLLGMRESSolver:
         self.lastIterations = iters
         self.lastError = error
         return x
+
+
+cdef class PyAMGCLSpGEMM:
+    """§24 (task #31) scoping probe: OpenMP-threaded sparse-matrix product/sum, wrapping AMGCL's own
+    ``amgcl::backend::builtin::product()``/``sum()`` -- verified directly (not assumed) against the
+    installed headers that both are OpenMP-parallel (``spgemm_saad``/``spgemm_rmerge`` and ``sum()``
+    itself each carry ``#pragma omp parallel``/``#pragma omp for``).
+
+    Scoping target: :mod:`edelweissfe.numerics.mpctransformation`'s ``T^T @ K @ T + C`` condensation,
+    currently two ``scipy.sparse`` CSR products plus one CSR addition, all single-threaded (SciPy's
+    own sparse routines carry no OpenMP parallelism at all). This class does not replace that
+    computation itself -- see the offline probe this class was built for -- it only exposes the two
+    primitives (``product``, ``sum``) generically, one call at a time, matching
+    ``SpGEMMHelperT``'s own design (square matrices only; compose calls in Python).
+    """
+    cdef SpGEMMHelper* helper
+
+    def __cinit__(self):
+        self.helper = new SpGEMMHelper()
+
+    def __dealloc__(self):
+        if self.helper != NULL:
+            del self.helper
+
+    def _copyOut(self):
+        cdef int nRows = self.helper.resultNRows()
+        cdef int nnz = self.helper.resultNnz()
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] ptrOut = np.empty(nRows + 1, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] colOut = np.empty(nnz, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] valOut = np.empty(nnz, dtype=np.float64)
+        cdef int[::1] ptrOut_ = ptrOut
+        cdef int[::1] colOut_ = colOut
+        cdef double[::1] valOut_ = valOut
+        self.helper.copyResult(&ptrOut_[0], &colOut_[0], &valOut_[0])
+        return scipy.sparse.csr_matrix((valOut, colOut, ptrOut), shape=(nRows, nRows))
+
+    def product(self, object A, object B):
+        """Returns A @ B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+        if not scipy.sparse.isspmatrix_csr(B):
+            B = B.tocsr()
+
+        cdef int aN = A.shape[0]
+        cdef int bN = B.shape[0]
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
+        cdef int[::1] aPtr_ = aPtr
+        cdef int[::1] aCol_ = aCol
+        cdef double[::1] aVal_ = aVal
+        cdef int[::1] bPtr_ = bPtr
+        cdef int[::1] bCol_ = bCol
+        cdef double[::1] bVal_ = bVal
+        self.helper.product(aN, &aPtr_[0], &aCol_[0], &aVal_[0], bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        return self._copyOut()
+
+    def sum(self, double alpha, object A, double beta, object B):
+        """Returns alpha*A + beta*B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+        if not scipy.sparse.isspmatrix_csr(B):
+            B = B.tocsr()
+
+        cdef int aN = A.shape[0]
+        cdef int bN = B.shape[0]
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
+        cdef int[::1] aPtr_ = aPtr
+        cdef int[::1] aCol_ = aCol
+        cdef double[::1] aVal_ = aVal
+        cdef int[::1] bPtr_ = bPtr
+        cdef int[::1] bCol_ = bCol
+        cdef double[::1] bVal_ = bVal
+        self.helper.sum(alpha, aN, &aPtr_[0], &aCol_[0], &aVal_[0], beta, bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        return self._copyOut()

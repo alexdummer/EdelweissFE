@@ -491,6 +491,95 @@ public:
   }
 };
 
+// §24 (task #31, scoping only -- not yet wired into the live driver): exposes AMGCL's own
+// OpenMP-threaded sparse-matrix-matrix product and sparse-matrix addition
+// (amgcl::backend::builtin's product()/sum(), verified directly against the installed headers:
+// spgemm_saad/spgemm_rmerge both carry `#pragma omp parallel`/`#pragma omp for`, and so does sum())
+// as a scoping probe for edelweissfe/numerics/mpctransformation.py's `T^T @ K @ T + C` condensation,
+// currently done via scipy's own single-threaded CSR sparse routines -- the same class of gap
+// ThreadedMatrixT (above) closed for the outer GMRES matvec and RelaxationSmootherT closed for AMG
+// relaxation. Deliberately generic (two raw CSR matrices in, one CSR matrix out) rather than
+// specific to the T^T K T + C expression itself: the caller composes `product()`/`sum()` calls
+// (e.g. `KT = product(K, T)`, `Kt_noC = product(T^T, KT)`, `Kt = sum(1, Kt_noC, 1, C)`), passing
+// T^T as its own already-transposed CSR array (scipy's own `.T.tocsr()` is a cheap O(nnz)
+// relayout, not a second SpGEMM, so there is nothing to gain by transposing on this side too).
+//
+// Holds at most one result at a time (the most recent product()/sum() call) -- this is a scoping
+// probe measuring one call at a time, not a class meant to be composed into a multi-step pipeline
+// internally; chaining happens in Python, one call per step, exactly like the comment above shows.
+//
+// Square matrices only (n x n) -- the only shape this scoping probe or its target expression
+// (T^T K T + C, every factor nDof x nDof) ever needs. Uses the same 4-tuple adapter construction
+// every other class in this header uses (n, ptr_range, col_range, val_range) -- verified directly
+// against amgcl/adapter/crs_tuple.hpp that this adapter's own cols_impl returns the same `n` as
+// rows_impl (i.e. it only ever represents a square matrix), so there is no separate ncols to plumb.
+class SpGEMMHelperT {
+public:
+  typedef amgcl::backend::builtin< double > Backend;
+  typedef Backend::matrix                   BackendMatrix;
+
+  std::shared_ptr< BackendMatrix > result_;
+
+  static BackendMatrix makeMatrix( int n, const int* ptr, const int* col, const double* val )
+  {
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    return BackendMatrix( A );
+  }
+
+  // result_ <- A * B (both n x n)
+  void product( int           aN,
+                const int*    aPtr,
+                const int*    aCol,
+                const double* aVal,
+                int           bN,
+                const int*    bPtr,
+                const int*    bCol,
+                const double* bVal )
+  {
+    BackendMatrix A = makeMatrix( aN, aPtr, aCol, aVal );
+    BackendMatrix B = makeMatrix( bN, bPtr, bCol, bVal );
+    result_         = amgcl::backend::product( A, B, /*sort=*/true );
+  }
+
+  // result_ <- alpha*A + beta*B (both n x n, same shape)
+  void sum( double        alpha,
+            int           aN,
+            const int*    aPtr,
+            const int*    aCol,
+            const double* aVal,
+            double        beta,
+            int           bN,
+            const int*    bPtr,
+            const int*    bCol,
+            const double* bVal )
+  {
+    BackendMatrix A = makeMatrix( aN, aPtr, aCol, aVal );
+    BackendMatrix B = makeMatrix( bN, bPtr, bCol, bVal );
+    result_         = amgcl::backend::sum( alpha, A, beta, B, /*sort=*/true );
+  }
+
+  int resultNRows() const { return result_ ? static_cast< int >( result_->nrows ) : 0; }
+  int resultNCols() const { return result_ ? static_cast< int >( result_->ncols ) : 0; }
+  int resultNnz() const { return result_ ? static_cast< int >( result_->nnz ) : 0; }
+
+  // Copies the most recent result's CSR arrays into caller-owned buffers (sized resultNRows()+1,
+  // resultNnz(), resultNnz() respectively) -- the result_ shared_ptr keeps owning its own storage
+  // regardless, so this is a copy-out, not a transfer of ownership.
+  void copyResult( int* ptrOut, int* colOut, double* valOut ) const
+  {
+    if ( !result_ ) {
+      throw std::runtime_error( "SpGEMMHelperT::copyResult(): no result yet -- call product() or sum() first" );
+    }
+    std::copy( result_->ptr, result_->ptr + result_->nrows + 1, ptrOut );
+    std::copy( result_->col, result_->col + result_->nnz, colOut );
+    std::copy( result_->val, result_->val + result_->nnz, valOut );
+  }
+};
+
 // §23.7: bridges AMGCL's own native amgcl::solver::lgmres (an outer Krylov solve running entirely on
 // the OpenMP-threaded builtin backend) to blockamg.py's Python-level block Gauss-Seidel preconditioner
 // (the same closure the shipped scipy.sparse.linalg.gmres path already uses), via a plain C
@@ -707,3 +796,6 @@ typedef ThreadedMatrixT ThreadedMatrix;
 
 // §23.7: AMGCL's own native outer Krylov solve (lgmres), see LGMRESOuterSolverT above.
 typedef LGMRESOuterSolverT LGMRESOuterSolver;
+
+// §24 (task #31, scoping): OpenMP-threaded SpGEMM/sparse-sum probe, see SpGEMMHelperT above.
+typedef SpGEMMHelperT SpGEMMHelper;
