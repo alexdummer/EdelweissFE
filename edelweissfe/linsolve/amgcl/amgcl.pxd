@@ -110,3 +110,44 @@ cdef extern from "amgcl-wrapper.hpp":
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void matvec(int n, const double* x, double* y) except +
         void residual(int n, const double* rhs, const double* x, double* r) except +
+
+    # Callback signature bridging AMGCL's native lgmres Krylov loop back into a Python-level
+    # preconditioner (§23.7) -- see amgcl-wrapper.hpp's own comment on PyPrecondApplyFn/
+    # PyLGMRESPrecondT for why this is a bare function pointer + opaque context rather than a
+    # Cython-overridden C++ virtual method.
+    ctypedef void (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
+
+    # AMGCL's own native outer Krylov solve (§23.7), in place of scipy.sparse.linalg.gmres. Persists
+    # its recycled/augmented Krylov vectors across solve() calls on the same instance whenever
+    # always_reset is set to false in the constructor's params -- see LGMRESOuterSolverT's own
+    # comment for why this class is meant to be built once per BlockAMGSolver, not once per solve.
+    cdef cppclass LGMRESOuterSolver:
+        LGMRESOuterSolver(int n, const char* json_params) except +
+        void solve(int n,
+                   const int* ptr,
+                   const int* col,
+                   const double* val,
+                   const double* rhs,
+                   double* x,
+                   double tol,
+                   int maxiter,
+                   PyPrecondApplyFn applyFn,
+                   void* ctx,
+                   int& iters,
+                   double& error,
+                   bint resetOnce) except +
+
+    # §24 (task #31, scoping probe, not yet wired into the live driver): OpenMP-threaded
+    # sparse-matrix product/sum, for edelweissfe/numerics/mpctransformation.py's T^T K T + C
+    # condensation, currently scipy CSR (single-threaded). Square matrices only -- see
+    # SpGEMMHelperT's own comment for why.
+    cdef cppclass SpGEMMHelper:
+        SpGEMMHelper() except +
+        void product(int aN, const int* aPtr, const int* aCol, const double* aVal,
+                     int bN, const int* bPtr, const int* bCol, const double* bVal) except +
+        void sum(double alpha, int aN, const int* aPtr, const int* aCol, const double* aVal,
+                 double beta, int bN, const int* bPtr, const int* bCol, const double* bVal) except +
+        int resultNRows() except +
+        int resultNCols() except +
+        int resultNnz() except +
+        void copyResult(int* ptrOut, int* colOut, double* valOut) except +

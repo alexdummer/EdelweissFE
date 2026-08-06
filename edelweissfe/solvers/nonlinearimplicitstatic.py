@@ -129,16 +129,21 @@ class NISTSchema:
         dtype=bool,
         default=True,
     )
-    useCachedMPCCondensation: bool | None = schemaField(
+    useAmgclMPCCondensation: bool | None = schemaField(
         description=(
-            "Condense the multi-point-constraint system matrix as a cached-pattern value scatter "
-            "(§21.2 B2) instead of the direct T^T K T + C expression. Correctness-equivalent "
-            "(validated on the full test suites plus a live 280k-dof contact+AMR+tie model, "
-            "byte-for-byte trajectory match) but measured slower on that same model -- the "
-            "SpGEMMs it restricts to the eliminated DOFs' rows still cost proportional to the "
-            "full system size, not to the (typically much smaller) number of eliminated DOFs. "
-            "Off by default until that asymmetry is addressed or a model is found where it wins; "
-            "exists as an opt-in for experimentation."
+            "Condense the multi-point-constraint system matrix via the direct T^T K T + C "
+            "expression, but through AMGCL's own OpenMP-threaded product()/sum() (§24, task #31) "
+            "instead of SciPy's single-threaded CSR sparse routines. Offline-measured on the "
+            "reference 280k-dof model at ~2.4-2.6x faster than the direct SciPy expression, "
+            "correctness-verified to floating-point precision. Leaves ~1.6x more raw nnz than the "
+            "plain expression (AMGCL's product()/sum() do not prune exact-cancellation zeros the "
+            "way SciPy's do) -- not eliminated at the MPC-transform step itself, since "
+            "applyDirichletK already prunes immediately after, gated by the existing "
+            "pruneCondensedMatrixZeros option (default True), uniformly for both condensation "
+            "strategies; that gate exists precisely because PARDISO's reordering on these path-"
+            "dependent condensed systems is known to drift with unpruned explicit-zero structural "
+            "entries, and blockamg's hierarchy-reuse gates on raw nnz. Off by default pending a "
+            "live gate (offline-validated only so far)."
         ),
         dtype=bool,
         default=False,
@@ -171,7 +176,7 @@ class NIST(NonlinearSolverBase):
         "linsolver": "pardiso",
         "linsolverConfigFile": "",
         "pruneCondensedMatrixZeros": True,
-        "useCachedMPCCondensation": False,
+        "useAmgclMPCCondensation": False,
     }
 
     def __init__(self, jobInfo, journal, **kwargs):

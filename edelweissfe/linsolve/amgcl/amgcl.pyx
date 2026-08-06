@@ -479,3 +479,290 @@ cdef class PyAMGCLMatrix:
         cdef double[::1] r_ = r
         self.matrix.residual(n, &rhs_[0], &x_[0], &r_[0])
         return r
+
+
+cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
+    """The C-callable trampoline bridging amgcl::solver::lgmres's per-``apply()`` Precond callback
+    (§23.7) back into Python -- passed to :class:`LGMRESOuterSolver` as a bare function pointer (see
+    ``amgcl-wrapper.hpp``'s ``PyPrecondApplyFn``/``PyLGMRESPrecondT``).
+
+    ``ctx`` is the calling :class:`PyAMGCLLGMRESSolver` instance itself, cast to ``void*`` and back --
+    Cython's own documented pattern for passing a Python object through an opaque C callback context.
+    No manual ``PyObject*`` reference counting is needed: ``ctx`` only ever points at ``self`` from the
+    *same*, still-on-stack :meth:`PyAMGCLLGMRESSolver.solve` call that constructed it (see there), so
+    its lifetime is strictly nested inside this function's own call and never outlives it.
+
+    Declared ``noexcept`` and *not* ``nogil``: every call into this function happens nested inside
+    :meth:`PyAMGCLLGMRESSolver.solve`'s own C++ call, made from a plain ``def`` method that never
+    releases the GIL (matching every other AMGCL wrapper method in this module -- the GIL only blocks
+    *other* Python threads from running during the solve; AMGCL's own OpenMP worker threads never touch
+    a Python object, so they are unaffected either way). Not releasing the GIL around the C++ call was
+    a deliberate choice, not an oversight: doing so would require re-acquiring it here (``with gil:``)
+    on every single preconditioner application -- the hottest inner loop this whole class exists to
+    speed up -- for a benefit (letting unrelated Python threads run during one linear solve) this
+    codebase's actual threading model does not use.
+
+    A Python exception raised by the preconditioner callable cannot propagate through this C
+    function-pointer boundary (there is no C++ exception handler on the AMGCL side expecting one), so
+    it is caught here and stashed on the calling instance instead; :meth:`PyAMGCLLGMRESSolver.solve`
+    re-raises it once the (now-abandoned) AMGCL call returns. ``x`` is zeroed on that path so the
+    (about-to-be-discarded) AMGCL iteration continues on defined, if meaningless, numbers rather than
+    whatever uninitialized/stale data happened to be there.
+    """
+    cdef PyAMGCLLGMRESSolver self = <PyAMGCLLGMRESSolver> ctx
+    cdef Py_ssize_t i
+    # rhs arrives as a `const double*` (it is AMGCL's own internal Arnoldi-vector storage, never meant
+    # to be written through) -- copied element-by-element into a fresh, ordinary (non-const) numpy
+    # array rather than wrapped in a zero-copy memoryview, which would need casting away the pointer's
+    # constness. n is at most the outer Krylov restart length, so this copy is not the cost driver
+    # here -- the Python-level preconditioner call below is.
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr = np.empty(n, dtype=np.float64)
+    cdef double[::1] xView
+    try:
+        for i in range(n):
+            rhsArr[i] = rhs[i]
+        result = self._precondCallable(rhsArr)
+        xView = np.ascontiguousarray(result, dtype=np.float64)
+        if xView.shape[0] != n:
+            raise ValueError(
+                "PyAMGCLLGMRESSolver: preconditioner callable returned a vector of length {:} for an "
+                "input of length {:}".format(xView.shape[0], n)
+            )
+        for i in range(n):
+            x[i] = xView[i]
+    except BaseException as exc:
+        self._pendingException = exc
+        for i in range(n):
+            x[i] = 0.0
+
+
+cdef class PyAMGCLLGMRESSolver:
+    """AMGCL's own native ``amgcl::solver::lgmres`` as blockamg.py's outer Krylov solve (§23.7), in
+    place of ``scipy.sparse.linalg.gmres`` -- see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for
+    the full motivation and design reasoning (this class is a thin Cython shell around it).
+
+    Bridges the field-split block Gauss-Seidel preconditioner
+    (:mod:`edelweissfe.linsolve.blockamg.blockamg`'s ``blockGaussSeidel`` closure, dispatching to
+    per-field :class:`PyAMGCLSolver`/:class:`~edelweissfe.linsolve.blockamg.ptwogrid.
+    PTwoGridPreconditioner` objects) to AMGCL's native ``Precond`` interface via
+    :func:`_lgmresPrecondApplyTrampoline`, called once per Arnoldi vector.
+
+    One instance should be constructed once per ``BlockAMGSolver`` and reused for that solver's entire
+    lifetime (see ``blockamg.py``'s construction site), not rebuilt per solve -- this lets tol/maxiter
+    be mutated per call onto the same object without paying construction cost every solve (see
+    :meth:`solve`), independent of ``always_reset``. ``always_reset: false`` would additionally let
+    AMGCL's own recycled/augmented Krylov vectors survive *across* separate :meth:`solve` calls, but
+    PERF_LINSOLVE_INVESTIGATION.md §23.9's attribution ablation and live gate found that recycling
+    contributes nothing measurable and can actively compound a struggling solve's poorly-conditioned
+    subspace into a much more expensive (or NaN) subsequent one -- ``blockamg.py`` now defaults
+    ``always_reset=True`` accordingly; this class still earns its keep over plain scipy GMRES from
+    threading and lgmres's own intra-call restart-cycle augmentation alone. The problem size ``n`` is
+    fixed at construction (AMGCL preallocates every scratch vector for it); a field-structure/dof-count
+    change needs a fresh instance.
+    """
+    cdef LGMRESOuterSolver* solver
+    cdef readonly int n
+    """The fixed problem size this instance was constructed for."""
+    cdef readonly int lastIterations
+    """The iteration count AMGCL's lgmres reported for the most recent solve, -1 before the first."""
+    cdef readonly double lastError
+    """The relative (preconditioned) residual AMGCL's lgmres reported for the most recent solve, NaN
+    before the first."""
+    cdef object _precondCallable
+    cdef object _pendingException
+
+    def __cinit__(self, int n, dict params=None):
+        """
+        n
+            The fixed problem size this instance is built for.
+        params
+            AMGCL's own ``lgmres::params`` field names, forwarded verbatim as JSON (``M``, ``K``,
+            ``always_reset``, ``pside``, ``maxiter``, ``tol``, ``abstol``, ``ns_search``, ``verbose``)
+            -- unlike :class:`PyAMGCLSolver`, there is no ``precond``/``solver`` nesting here, since
+            this wraps a single ``amgcl::solver::lgmres`` object directly, not ``amgcl::make_solver``.
+            ``maxiter``/``tol`` given here only set the *initial* defaults -- :meth:`solve` overrides
+            both on every call (see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT`` for why).
+        """
+        if params is None:
+            params = {}
+        self.n = n
+        self.lastIterations = -1
+        self.lastError = float("nan")
+        self._precondCallable = None
+        self._pendingException = None
+
+        cdef bytes json_bytes = json.dumps(params).encode("utf-8")
+        cdef const char* c_json = json_bytes
+        self.solver = new LGMRESOuterSolver(n, c_json)
+
+    def __dealloc__(self):
+        if self.solver != NULL:
+            del self.solver
+
+    def solve(self, object A, object rhs, object applyPreconditioner, double tol, int maxiter, object x0=None,
+              bint resetOnce=False):
+        """
+        A
+            scipy.sparse.csr_matrix, this solve's (equilibrated) full coupled operator -- converted
+            fresh every call (its pattern churns every solve, same as :class:`PyAMGCLMatrix`; only the
+            recycled Krylov *vectors* persist across calls, never a cached matrix conversion).
+        rhs
+            array-like, converted to 1D float64 (C-contiguous).
+        applyPreconditioner
+            A Python callable, ``residual (1D float64 array) -> correction (1D float64 array)`` --
+            exactly :mod:`~edelweissfe.linsolve.blockamg.blockamg`'s ``blockGaussSeidel`` closure's own
+            shape. Called once per Arnoldi vector via :func:`_lgmresPrecondApplyTrampoline`; any
+            exception it raises is re-raised here once the (now-abandoned) AMGCL call returns.
+        tol, maxiter
+            This call's relative residual tolerance and maximum total Arnoldi iterations (across every
+            internal restart -- AMGCL's own ``maxiter`` semantics differ from scipy's restart x maxiter,
+            see blockamg.py's call site). Mutates the underlying ``amgcl::solver::lgmres`` object's own
+            ``prm`` in place rather than reconstructing it, so the recycled Krylov vectors survive.
+        x0
+            Optional initial guess (warm start), e.g. blockamg.py's true-residual continuation retry.
+            Defaults to zero.
+        resetOnce
+            §23.9 step 2: discard this instance's recycled/augmented Krylov vectors for this call only
+            (by temporarily flipping the underlying solver's ``prm.always_reset`` to true and restoring
+            it immediately after -- see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT::solve`` for why
+            this reuses AMGCL's own reset mechanism rather than touching ``outer_v`` directly), without
+            discarding this persistent instance itself. Default ``False`` -- recycling continues
+            uninterrupted unless a caller explicitly asks for a one-shot reset.
+        """
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+
+        cdef int n = A.shape[0]
+        if n != self.n:
+            raise ValueError(
+                "PyAMGCLLGMRESSolver: matrix size {:} does not match the size {:} this instance was "
+                "constructed for -- construct a fresh instance on any field-structure/size "
+                "change.".format(n, self.n)
+            )
+
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x
+        if x0 is None:
+            x = np.zeros(n, dtype=np.float64)
+        else:
+            x = np.ascontiguousarray(x0, dtype=np.float64).copy()
+
+        cdef int[::1] indptr_ = indptr
+        cdef int[::1] indices_ = indices
+        cdef double[::1] data_ = data
+        cdef double[::1] rhs_ = rhs_arr
+        cdef double[::1] x_ = x
+
+        cdef int iters = 0
+        cdef double error = 0.0
+
+        # self is passed through as the callback's opaque context, cast to void* and back in
+        # _lgmresPrecondApplyTrampoline -- see that function's own docstring for why this needs no
+        # manual PyObject* reference counting (self is kept alive by this very call's own stack frame
+        # for as long as the cast pointer is in use).
+        self._precondCallable = applyPreconditioner
+        self._pendingException = None
+        cdef void* ctx = <void*> self
+        try:
+            self.solver.solve(
+                n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0],
+                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, resetOnce
+            )
+        finally:
+            self._precondCallable = None
+
+        if self._pendingException is not None:
+            exc = self._pendingException
+            self._pendingException = None
+            raise exc
+
+        self.lastIterations = iters
+        self.lastError = error
+        return x
+
+
+cdef class PyAMGCLSpGEMM:
+    """§24 (task #31) scoping probe: OpenMP-threaded sparse-matrix product/sum, wrapping AMGCL's own
+    ``amgcl::backend::builtin::product()``/``sum()`` -- verified directly (not assumed) against the
+    installed headers that both are OpenMP-parallel (``spgemm_saad``/``spgemm_rmerge`` and ``sum()``
+    itself each carry ``#pragma omp parallel``/``#pragma omp for``).
+
+    Scoping target: :mod:`edelweissfe.numerics.mpctransformation`'s ``T^T @ K @ T + C`` condensation,
+    currently two ``scipy.sparse`` CSR products plus one CSR addition, all single-threaded (SciPy's
+    own sparse routines carry no OpenMP parallelism at all). This class does not replace that
+    computation itself -- see the offline probe this class was built for -- it only exposes the two
+    primitives (``product``, ``sum``) generically, one call at a time, matching
+    ``SpGEMMHelperT``'s own design (square matrices only; compose calls in Python).
+    """
+    cdef SpGEMMHelper* helper
+
+    def __cinit__(self):
+        self.helper = new SpGEMMHelper()
+
+    def __dealloc__(self):
+        if self.helper != NULL:
+            del self.helper
+
+    def _copyOut(self):
+        cdef int nRows = self.helper.resultNRows()
+        cdef int nnz = self.helper.resultNnz()
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] ptrOut = np.empty(nRows + 1, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] colOut = np.empty(nnz, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] valOut = np.empty(nnz, dtype=np.float64)
+        cdef int[::1] ptrOut_ = ptrOut
+        cdef int[::1] colOut_ = colOut
+        cdef double[::1] valOut_ = valOut
+        self.helper.copyResult(&ptrOut_[0], &colOut_[0], &valOut_[0])
+        return scipy.sparse.csr_matrix((valOut, colOut, ptrOut), shape=(nRows, nRows))
+
+    def product(self, object A, object B):
+        """Returns A @ B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+        if not scipy.sparse.isspmatrix_csr(B):
+            B = B.tocsr()
+
+        cdef int aN = A.shape[0]
+        cdef int bN = B.shape[0]
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
+        cdef int[::1] aPtr_ = aPtr
+        cdef int[::1] aCol_ = aCol
+        cdef double[::1] aVal_ = aVal
+        cdef int[::1] bPtr_ = bPtr
+        cdef int[::1] bCol_ = bCol
+        cdef double[::1] bVal_ = bVal
+        self.helper.product(aN, &aPtr_[0], &aCol_[0], &aVal_[0], bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        return self._copyOut()
+
+    def sum(self, double alpha, object A, double beta, object B):
+        """Returns alpha*A + beta*B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+        if not scipy.sparse.isspmatrix_csr(B):
+            B = B.tocsr()
+
+        cdef int aN = A.shape[0]
+        cdef int bN = B.shape[0]
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
+        cdef int[::1] aPtr_ = aPtr
+        cdef int[::1] aCol_ = aCol
+        cdef double[::1] aVal_ = aVal
+        cdef int[::1] bPtr_ = bPtr
+        cdef int[::1] bCol_ = bCol
+        cdef double[::1] bVal_ = bVal
+        self.helper.sum(alpha, aN, &aPtr_[0], &aCol_[0], &aVal_[0], beta, bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        return self._copyOut()

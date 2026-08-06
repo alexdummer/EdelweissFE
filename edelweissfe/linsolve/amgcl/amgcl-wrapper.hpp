@@ -7,6 +7,7 @@
 #include <amgcl/make_solver.hpp>
 #include <amgcl/preconditioner/runtime.hpp>
 #include <amgcl/relaxation/runtime.hpp>
+#include <amgcl/solver/lgmres.hpp>
 #include <amgcl/solver/runtime.hpp>
 #include <amgcl/value_type/static_matrix.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -490,6 +491,294 @@ public:
   }
 };
 
+// §24 (task #31, scoping only -- not yet wired into the live driver): exposes AMGCL's own
+// OpenMP-threaded sparse-matrix-matrix product and sparse-matrix addition
+// (amgcl::backend::builtin's product()/sum(), verified directly against the installed headers:
+// spgemm_saad/spgemm_rmerge both carry `#pragma omp parallel`/`#pragma omp for`, and so does sum())
+// as a scoping probe for edelweissfe/numerics/mpctransformation.py's `T^T @ K @ T + C` condensation,
+// currently done via scipy's own single-threaded CSR sparse routines -- the same class of gap
+// ThreadedMatrixT (above) closed for the outer GMRES matvec and RelaxationSmootherT closed for AMG
+// relaxation. Deliberately generic (two raw CSR matrices in, one CSR matrix out) rather than
+// specific to the T^T K T + C expression itself: the caller composes `product()`/`sum()` calls
+// (e.g. `KT = product(K, T)`, `Kt_noC = product(T^T, KT)`, `Kt = sum(1, Kt_noC, 1, C)`), passing
+// T^T as its own already-transposed CSR array (scipy's own `.T.tocsr()` is a cheap O(nnz)
+// relayout, not a second SpGEMM, so there is nothing to gain by transposing on this side too).
+//
+// Holds at most one result at a time (the most recent product()/sum() call) -- this is a scoping
+// probe measuring one call at a time, not a class meant to be composed into a multi-step pipeline
+// internally; chaining happens in Python, one call per step, exactly like the comment above shows.
+//
+// Square matrices only (n x n) -- the only shape this scoping probe or its target expression
+// (T^T K T + C, every factor nDof x nDof) ever needs. Uses the same 4-tuple adapter construction
+// every other class in this header uses (n, ptr_range, col_range, val_range) -- verified directly
+// against amgcl/adapter/crs_tuple.hpp that this adapter's own cols_impl returns the same `n` as
+// rows_impl (i.e. it only ever represents a square matrix), so there is no separate ncols to plumb.
+class SpGEMMHelperT {
+public:
+  typedef amgcl::backend::builtin< double > Backend;
+  typedef Backend::matrix                   BackendMatrix;
+
+  std::shared_ptr< BackendMatrix > result_;
+
+  static BackendMatrix makeMatrix( int n, const int* ptr, const int* col, const double* val )
+  {
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    return BackendMatrix( A );
+  }
+
+  // result_ <- A * B (both n x n)
+  void product( int           aN,
+                const int*    aPtr,
+                const int*    aCol,
+                const double* aVal,
+                int           bN,
+                const int*    bPtr,
+                const int*    bCol,
+                const double* bVal )
+  {
+    BackendMatrix A = makeMatrix( aN, aPtr, aCol, aVal );
+    BackendMatrix B = makeMatrix( bN, bPtr, bCol, bVal );
+    result_         = amgcl::backend::product( A, B, /*sort=*/true );
+  }
+
+  // result_ <- alpha*A + beta*B (both n x n, same shape)
+  void sum( double        alpha,
+            int           aN,
+            const int*    aPtr,
+            const int*    aCol,
+            const double* aVal,
+            double        beta,
+            int           bN,
+            const int*    bPtr,
+            const int*    bCol,
+            const double* bVal )
+  {
+    BackendMatrix A = makeMatrix( aN, aPtr, aCol, aVal );
+    BackendMatrix B = makeMatrix( bN, bPtr, bCol, bVal );
+    result_         = amgcl::backend::sum( alpha, A, beta, B, /*sort=*/true );
+  }
+
+  int resultNRows() const { return result_ ? static_cast< int >( result_->nrows ) : 0; }
+  int resultNCols() const { return result_ ? static_cast< int >( result_->ncols ) : 0; }
+  int resultNnz() const { return result_ ? static_cast< int >( result_->nnz ) : 0; }
+
+  // Copies the most recent result's CSR arrays into caller-owned buffers (sized resultNRows()+1,
+  // resultNnz(), resultNnz() respectively) -- the result_ shared_ptr keeps owning its own storage
+  // regardless, so this is a copy-out, not a transfer of ownership.
+  void copyResult( int* ptrOut, int* colOut, double* valOut ) const
+  {
+    if ( !result_ ) {
+      throw std::runtime_error( "SpGEMMHelperT::copyResult(): no result yet -- call product() or sum() first" );
+    }
+    std::copy( result_->ptr, result_->ptr + result_->nrows + 1, ptrOut );
+    std::copy( result_->col, result_->col + result_->nnz, colOut );
+    std::copy( result_->val, result_->val + result_->nnz, valOut );
+  }
+};
+
+// §23.7: bridges AMGCL's own native amgcl::solver::lgmres (an outer Krylov solve running entirely on
+// the OpenMP-threaded builtin backend) to blockamg.py's Python-level block Gauss-Seidel preconditioner
+// (the same closure the shipped scipy.sparse.linalg.gmres path already uses), via a plain C
+// function-pointer callback + opaque context set from Cython.
+//
+// Motivation (PERF_LINSOLVE_INVESTIGATION.md §23.1's census): with the outer operator SpMV already
+// threaded (§23.2, ThreadedMatrixT above), the single largest remaining bucket in the shipped arm's
+// own solve wall (~38%, bucket (h), "GMRES internals by subtraction") is scipy's *own* GMRES
+// orchestration -- Arnoldi/Gram-Schmidt/restart bookkeeping -- which is unavoidably serial CPython
+// regardless of any matvec/preconditioner threading, and scales with the square of the restart length.
+// §23 explicitly parked this out of its own scope as the sizing input for a follow-up phase; this is
+// that follow-up's first pass.
+//
+// Why a C function pointer + void* context, not a Cython-overridden C++ virtual method: lgmres's
+// Precond parameter (see amgcl/solver/lgmres.hpp's operator()) is a compile-time template argument,
+// not a runtime-polymorphic base pointer -- nothing inside lgmres itself ever needs to swap
+// preconditioner *implementations* through a common interface, so a virtual base class would only add
+// a vtable/RTTI and an extra indirection for no benefit. A bare function pointer needs neither and
+// keeps this header entirely free of any Python/Cython dependency, matching every other class here.
+
+// Callback signature: one preconditioner application, x <- M^-1 rhs, where M is whatever
+// blockamg.py's own block Gauss-Seidel closure computes for this solve. `ctx` is an opaque pointer to
+// whatever Cython-side state the callback needs (the calling PyAMGCLLGMRESSolver instance, in
+// practice) -- this header never interprets it as anything other than a pass-through argument. `n` is
+// duplicated here (also known to the caller) purely so the callback does not need to reach back into
+// any C++-side state to learn it.
+typedef void ( *PyPrecondApplyFn )( void* ctx, int n, const double* rhs, double* x );
+
+// Adapts a PyPrecondApplyFn callback to amgcl::solver::lgmres's Precond interface: a single const
+// apply(rhs, x) method (see amgcl/solver/precond_side.hpp's spmv() -- with the default
+// preconditioning side `right` that this class assumes, apply() is the *only* thing lgmres ever calls
+// on a Precond object; see LGMRESOuterSolverT's own comment for why `right` is not overridden here).
+//
+// rhs/x are written directly against amgcl::backend::builtin<double>::vector (numa_vector<double>),
+// not kept as a generic template parameter: lgmres calls apply() exclusively on its own internal
+// Arnoldi/augmentation-vector storage (vs[j], outer_v entries, the final correction dx), which is
+// always exactly this concrete type for the Backend this class is built for -- there is no second
+// vector type apply() is ever actually called with in this codebase's usage, so templating it, as
+// amgcl::preconditioner::dummy does for genuine backend-portability, would cost readability for no
+// real flexibility gained here.
+class PyLGMRESPrecondT {
+public:
+  PyLGMRESPrecondT( PyPrecondApplyFn applyFn, void* ctx, int n ) : applyFn_( applyFn ), ctx_( ctx ), n_( n ) {}
+
+  void apply( const amgcl::backend::builtin< double >::vector& rhs, amgcl::backend::builtin< double >::vector& x ) const
+  {
+    applyFn_( ctx_, n_, rhs.data(), x.data() );
+  }
+
+private:
+  PyPrecondApplyFn applyFn_;
+  void*            ctx_;
+  int              n_;
+};
+
+// Wraps amgcl::solver::lgmres<builtin<double>> as blockamg.py's outer Krylov solve, in place of
+// scipy.sparse.linalg.gmres, at both of that path's call sites (the main solve and the true-residual
+// continuation retry -- see blockamg.py's __call__).
+//
+// One instance is meant to be constructed once per BlockAMGSolver and reused for that solver's entire
+// lifetime, not rebuilt per solve like the per-field AMG hierarchies (see blockamg.py's own
+// mustRefresh bookkeeping for those). This persistence is independent of `always_reset` (PERF_
+// LINSOLVE_INVESTIGATION.md §23.9): it is what lets tol/maxiter be mutated per call onto the same
+// underlying object (see below) without paying construction cost every solve, and it is what
+// `always_reset=false` would use *if* enabled -- but §23.9's attribution ablation found cross-call
+// recycling (`outer_v` surviving across separate operator() calls, AMGCL's own doc comment on `K`
+// naming "solving multiple similar problems" as the intended use) contributes nothing measurable on
+// 9 representative systems and, on a live pryout trajectory, actively compounds a struggling solve's
+// poorly-conditioned subspace into a much more expensive (and once, NaN) subsequent one. `blockamg.py`
+// now defaults `always_reset=True` (AMGCL's own upstream default) accordingly -- this class still
+// earns its keep over plain scipy GMRES from threading and lgmres's own intra-call restart-cycle
+// augmentation alone (independent of `always_reset`, see the ablation), not from cross-call memory.
+//
+// The system matrix itself is *not* cached across calls the way the AMG hierarchies are -- it is
+// rebuilt fresh in every solve() call from the raw CSR arrays, exactly like ThreadedMatrixT above
+// (the pattern churns every solve regardless, §3.1/§21.1, so there is nothing to amortize). lgmres's
+// own header comment explicitly names this usage pattern too: "The system matrix may differ from the
+// matrix used during initialization[...] used for the solution of non-stationary problems with
+// slowly changing coefficients."
+//
+// tol/maxiter are *not* baked into the params this instance was constructed with -- they are set on
+// every solve() call by mutating the underlying amgcl::solver::lgmres object's own public `prm`
+// member directly (see solve() below). This is what lets a single persistent instance still honour a
+// different Eisenstat--Walker forcing tolerance and true-residual-continuation tolerance on every
+// call (blockamg.py's `eta`/`continuationEta`) without reconstructing the object and losing the
+// recycled Krylov vectors `always_reset=false` exists to keep -- rebuild-per-call and reuse-across-
+// calls are mutually exclusive if tol/maxiter could only be set at construction, so mutating `prm` in
+// place is what reconciles them.
+//
+// The problem size n is fixed at construction (lgmres preallocates every scratch vector -- Arnoldi
+// basis, augmentation vectors -- for a fixed n in its own constructor); a field-structure or dof-count
+// change (AMR, a new increment with a resized system) needs a fresh instance. blockamg.py's Python
+// side already tracks exactly this condition for the AMG hierarchies (mustRefresh's `n != self._n`)
+// and reuses that same signal to decide when to rebuild this object too.
+class LGMRESOuterSolverT {
+public:
+  typedef amgcl::backend::builtin< double > Backend;
+  typedef amgcl::solver::lgmres< Backend >  Solver;
+  typedef Backend::matrix                   BackendMatrix;
+
+  std::unique_ptr< Solver > solver_;
+  int                       n_;
+
+  // Constructed once for a fixed problem size n. json_params is lgmres::params' own sub-tree, e.g.
+  // {"M": 30, "K": 3, "always_reset": true} -- forwarded 1:1 to amgcl::solver::lgmres::params'
+  // ptree constructor with no translation layer, matching every field name AMGCL itself uses (M, K,
+  // always_reset, pside, maxiter, tol, abstol, ns_search, verbose). tol/maxiter passed here only set
+  // the *initial* defaults; solve() overrides both on every call (see the class comment above) --
+  // included anyway so a caller that never overrides them still gets sane, explicit values rather
+  // than silently depending on AMGCL's own defaults.
+  LGMRESOuterSolverT( int n, const char* json_params ) : n_( n )
+  {
+    boost::property_tree::ptree prm;
+    std::string                 json_str( json_params );
+    if ( !json_str.empty() ) {
+      std::stringstream ss( json_str );
+      boost::property_tree::read_json( ss, prm );
+    }
+    Solver::params p( prm );
+    solver_.reset( new Solver( static_cast< size_t >( n ), p ) );
+  }
+
+  // x <- A^-1 rhs, right-preconditioned by the callback (applyFn/ctx), continuing this instance's own
+  // recycled/augmented Krylov vectors from any previous solve() call unless always_reset was
+  // requested at construction. x provides the initial guess on input (matching amgcl::solver::
+  // lgmres::operator()'s own x0-in/solution-out contract -- callers doing a warm-started continuation
+  // retry, as blockamg.py's true-residual continuation loop does, must pre-fill x themselves) and
+  // holds the solution on output. tol/maxiter are applied to this call (and every subsequent one,
+  // until next changed) by mutating the underlying solver's own public `prm` member in place -- see
+  // the class comment above for why this, rather than reconstructing the object, is required to keep
+  // both per-call tolerances and cross-call Krylov-vector recycling at the same time.
+  void solve( int              n,
+              const int*       ptr,
+              const int*       col,
+              const double*    val,
+              const double*    rhs,
+              double*          x,
+              double           tol,
+              int              maxiter,
+              PyPrecondApplyFn applyFn,
+              void*            ctx,
+              int&             iters,
+              double&          error,
+              bool             resetOnce = false )
+  {
+    if ( n != n_ ) {
+      throw std::runtime_error( "LGMRESOuterSolverT::solve(): n=" + std::to_string( n ) + " does not match the size " +
+                                std::to_string( n_ ) +
+                                " this instance was constructed for -- construct a fresh instance on "
+                                "any field-structure/size change (blockamg.py's own mustRefresh "
+                                "condition already detects this for the AMG hierarchies; the same "
+                                "signal is reused here)." );
+    }
+
+    solver_->prm.tol     = tol;
+    solver_->prm.maxiter = static_cast< size_t >( maxiter );
+
+    // §23.9 step 2 (the ord-00009 fix candidate, Fable's review): a caller-requested one-shot reset
+    // of the recycled/augmented Krylov vectors (`outer_v`), without discarding the persistent solver_
+    // object or reconstructing it. AMGCL's own operator() clears outer_v itself, unconditionally,
+    // whenever prm.always_reset is true (verified directly in lgmres.hpp: the very first statement in
+    // operator()) -- so flipping it true for exactly this one call and restoring it immediately after
+    // reuses that already-correct mechanism instead of reaching into outer_v/outer_v_data directly.
+    // blockamg.py wires this to its own `newIncrement` signal: reset across increment/cutback
+    // boundaries (where a stale recycled subspace is hypothesized to cost pure overhead, §23.7's
+    // ord-00009 finding), keep recycling within an increment's own Newton sequence (AMGCL's own
+    // intended use for K, and where every other ord showed recycling helping, not hurting).
+    bool savedAlwaysReset = solver_->prm.always_reset;
+    if ( resetOnce ) {
+      solver_->prm.always_reset = true;
+    }
+
+    int  nnz = ptr[n];
+    auto A   = std::make_tuple( n,
+                              amgcl::make_iterator_range( ptr, ptr + n + 1 ),
+                              amgcl::make_iterator_range( col, col + nnz ),
+                              amgcl::make_iterator_range( val, val + nnz ) );
+    // Converted through Backend::matrix, not passed as the raw adapter tuple -- the same ADL trap
+    // §22.4/§23.2 already found and documented above: amgcl::solver::lgmres's operator() calls
+    // backend::residual()/backend::spmv() on A via ADL-found amgcl::backend overloads that only
+    // resolve against amgcl::backend::crs<...>, not the raw std::tuple adapter (amgcl/adapter/
+    // crs_tuple.hpp).
+    BackendMatrix Amat( A );
+
+    PyLGMRESPrecondT precond( applyFn, ctx, n );
+
+    auto rhs_rng = amgcl::make_iterator_range( rhs, rhs + n );
+    auto x_rng   = amgcl::make_iterator_range( x, x + n );
+
+    size_t itersOut;
+    double errorOut;
+    std::tie( itersOut, errorOut ) = ( *solver_ )( Amat, precond, rhs_rng, x_rng );
+    iters                          = static_cast< int >( itersOut );
+    error                          = errorOut;
+
+    solver_->prm.always_reset = savedAlwaysReset;
+  }
+};
+
 // The default, unchanged double-precision wrapper, and the new float32 one added for §19.3.
 typedef LinearSolverT< double > LinearSolver;
 typedef LinearSolverT< float >  LinearSolverFloat;
@@ -504,3 +793,9 @@ typedef RelaxationSmootherT RelaxationSmoother;
 
 // §23.2: standalone OpenMP-threaded matvec/residual, see ThreadedMatrixT above.
 typedef ThreadedMatrixT ThreadedMatrix;
+
+// §23.7: AMGCL's own native outer Krylov solve (lgmres), see LGMRESOuterSolverT above.
+typedef LGMRESOuterSolverT LGMRESOuterSolver;
+
+// §24 (task #31, scoping): OpenMP-threaded SpGEMM/sparse-sum probe, see SpGEMMHelperT above.
+typedef SpGEMMHelperT SpGEMMHelper;
