@@ -29,14 +29,25 @@
 import os
 
 import numpy as np
-from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse import csr_matrix
 
 from edelweissfe.utils import performancetiming
 
-#: Set to enable a per-epoch cross-check of :meth:`MultiPointConstraintTransformation.transformSystemMatrix`'s
-#: cached-pattern value scatter against the legacy ``T^T @ K @ T + C`` expression it replaces (§21.2 B2).
-#: Expensive (recomputes the legacy expression every call it fires on) -- development/CI use only.
+#: Set to enable a per-call cross-check of :meth:`MultiPointConstraintTransformation.transformSystemMatrix`'s
+#: AMGCL-threaded expression (§24, ``useAmgclSpgemm``) against the plain SciPy ``T^T @ K @ T + C``
+#: expression it is an alternative to. Expensive (recomputes the plain expression every call it fires
+#: on) -- development/CI use only.
 _ASSERT_EXACT_ENV_VAR = "EDELWEISS_MPC_ASSERT_EXACT"
+
+#: Set to a directory to dump the raw K plus this transformation's own T/D/S/C matrices for the
+#: first few calls to :meth:`MultiPointConstraintTransformation.transformSystemMatrix` -- an offline
+#: harness for the SpGEMM-threading scoping in PERF_LINSOLVE_INVESTIGATION.md §24 (task #31): unlike
+#: the linsolve-level ``linsolveDumps`` harness (whose dumps are already-condensed ``Kt``), this
+#: needs the *pre*-condensation K and T/D/S/C themselves. Capped (see ``_DUMP_MPC_MAX_CALLS``) --
+#: `K` on this model is hundreds of MB uncompressed, and this is a diagnostic tool, not a feature.
+_DUMP_MPC_ENV_VAR = "EDELWEISS_DUMP_MPC"
+_DUMP_MPC_MAX_CALLS = 3
+_dumpMpcCallsWritten = 0
 
 """
 Master-slave condensation (Abaqus-style DOF elimination) of linear multi-point constraints
@@ -130,23 +141,36 @@ class MultiPointConstraintTransformation:
         instances of a model.
     nDof
         The total size of the equation system.
-    useCachedCondensation
-        Compute ``transformSystemMatrix`` as a cached-pattern value scatter (§21.2 B2) instead of
-        the direct ``Tᵀ K T + C`` expression. Correctness-equivalent (validated: full
-        edelweiss-only/marmot suites plus a live 280k-dof contact+AMR+tie model, byte-for-byte
-        trajectory match, both PARDISO and blockamg) but measured **slower** on that same model
-        (§21.2 B3: ~4.6 s/call vs ~2.75 s/call) -- the "S-touching" SpGEMMs it restricts to the
-        eliminated DOFs' rows still cost proportional to `K`'s own size, not to the (tiny) number of
-        eliminated rows, since SciPy's SpGEMM must scan the full left operand regardless of the
-        right operand's sparsity. Default ``False`` (the direct expression) until that asymmetry is
-        addressed (e.g. a Cython numeric-only kernel) or a model is found where it actually wins.
+    useAmgclSpgemm
+        Compute ``transformSystemMatrix`` as the direct ``Tᵀ K T + C`` expression, but via AMGCL's
+        own OpenMP-threaded ``product()``/``sum()`` (§24, task #31) instead of SciPy's single-
+        threaded CSR sparse routines -- SciPy's sparse module carries no OpenMP parallelism at all,
+        the same gap already closed elsewhere for the outer GMRES matvec (§23.2) and AMG relaxation
+        (§22.4). Offline-measured on the reference 280k-dof model: **~2.4–2.6x faster** than the
+        direct expression (``~1.4–1.5 s/call`` vs ``~2.4–2.7 s/call``), correctness-verified to
+        floating-point precision.
+
+        AMGCL's ``product()``/``sum()`` do not eliminate exact-cancellation zeros the way SciPy's
+        own sparse routines do -- confirmed directly that the extra entries are >99.9999% bit-exact
+        zero (20,102,955 of 20,102,975 on the reference model, the rest floating-point noise at
+        ~1e-19 relative scale), so this method leaves noticeably more raw nnz (~1.6x) than the plain
+        expression. **Not** pruned here: :meth:`~edelweissfe.solvers.nonlinearimplicitstatic.NIST.
+        applyDirichletK` already calls ``eliminate_zeros()`` immediately after this, gated by the
+        existing ``pruneCondensedMatrixZeros`` option (default ``True``, uniformly for both
+        expressions) -- that gate exists precisely because PARDISO's reordering on these
+        path-dependent condensed systems is known to drift with unpruned explicit-zero structural
+        entries, and because ``blockamg``'s hierarchy-reuse gates on raw ``nnz``. Pruning here too
+        would double that cost under the default config; setting ``pruneCondensedMatrixZeros=False``
+        together with this option carries the same, now-larger, unpruned pattern into the solve,
+        same as it already does for the plain expression -- verify the load path if combining the
+        two. Default ``False`` pending a live gate (offline validation only so far).
     """
 
     def __init__(
         self,
         records: list[tuple[int, list[tuple[int, float]]]],
         nDof: int,
-        useCachedCondensation: bool = False,
+        useAmgclSpgemm: bool = False,
     ):
         slaveDofs = [slaveDof for slaveDof, _ in records]
 
@@ -200,53 +224,7 @@ class MultiPointConstraintTransformation:
         cVals = np.concatenate([np.ones(len(self.slaveDofIndices)), -np.array(wVals)])
         self._C = csr_matrix((cVals, (cRows, cCols)), shape=(nDof, nDof))
 
-        # §21.2 B2: T = D + S, D diagonal (1 on independent DOFs, 0 on slaves), S the slave rows only
-        # (T's own entries, minus the independent-DOF identity part -- reuses tRows/tCols/tVals's
-        # already-computed slave-row tail rather than rebuilding it). This lets
-        # transformSystemMatrix() compute the dominant, identity-heavy term (D^T K D) as a cheap
-        # values-only elementwise scale instead of a full nDof x nDof SpGEMM, and restricts the
-        # genuine SpGEMMs to the tiny S operand (~nEliminatedDof rows).
-        self._D = np.ones(nDof)
-        self._D[self.slaveDofIndices] = 0.0
-        # slice from an explicit non-negative start, not `-nSlaveEntries:` -- with zero slave DOFs
-        # (nSlaveEntries == 0, a legitimate case: a system assembled before any hanging-node/tie
-        # constraint exists yet) `arr[-0:]` is `arr[0:]`, the *entire* array, not empty.
-        nSlaveEntries = len(wVals)
-        sliceStart = len(tVals) - nSlaveEntries
-        self._S = csr_matrix((tVals[sliceStart:], (tRows[sliceStart:], tCols[sliceStart:])), shape=(nDof, nDof))
-        # a boolean-dtype twin of S, used only for the value-blind structural pass that builds the
-        # cached union pattern (§21.2 B2/B3): SciPy's *numeric* SpGEMM eliminates an output entry
-        # whenever the several contributions accumulating into it happen to sum to exactly zero --
-        # true even when every contributing factor is individually nonzero, and forcing all values
-        # to a uniform placeholder (e.g. 1.0) does not avoid this, since the placeholder sum can
-        # itself cancel at positions where the real weighted sum would not (or vice versa) -- verified
-        # directly with a 2-contribution toy SpGEMM. Boolean dtype sidesteps this entirely: SciPy's
-        # sparse matmul uses logical OR/AND for bool operands, so an entry that is structurally
-        # reachable through *any* contribution is always True, never cancelled.
-        self._SBool = csr_matrix(
-            (np.ones(self._S.nnz, dtype=bool), self._S.indices.copy(), self._S.indptr.copy()),
-            shape=(nDof, nDof),
-            dtype=bool,
-        )
-
-        self._useCachedCondensation = useCachedCondensation
-
-        # transformSystemMatrix()'s cache: identity markers for the K pattern the cache was built for
-        # (K.indices/K.indptr are the csrGenerator's own persistent, in-place-updated arrays when no
-        # further pruning intervenes upstream -- verified directly, not assumed, §21.2 B1), the union
-        # output pattern (a value-blind structural superset, safe for the whole epoch -- §21.2 B2/B3),
-        # DKD's own scatter position into it (stable, no SpGEMM involved), and C's contribution
-        # pre-scattered (constant for this object's entire lifetime, since C never changes after
-        # __init__). The three S-touching terms' scatter positions are deliberately not cached here
-        # -- see `_buildCacheAndScatter`'s docstring.
-        self._cachedKIndices = None
-        self._cachedKIndptr = None
-        self._cachedKRowOfNnz = None
-        self._unionIndices = None
-        self._unionIndptr = None
-        self._unionKeys = None
-        self._term1ScatterMap = None
-        self._cBaseData = None
+        self._useAmgclSpgemm = useAmgclSpgemm
 
     @property
     def nEliminatedDof(self) -> int:
@@ -273,105 +251,18 @@ class MultiPointConstraintTransformation:
 
     @performancetiming.timeit("mpc transform system matrix")
     def _transformSystemMatrixLegacy(self, K: csr_matrix) -> csr_matrix:
-        """The original, un-cached ``T^T @ K @ T + C`` expression -- kept only as the reference for
-        :envvar:`EDELWEISS_MPC_ASSERT_EXACT` (§21.2 B2); not on the production hot path."""
+        """The plain ``T^T @ K @ T + C`` expression via SciPy's own (single-threaded) sparse
+        routines -- the default condensation strategy."""
         KT = self._T.T @ K
         Kt = KT @ self._T
         Kt = (Kt + self._C).tocsr()
         Kt.sort_indices()
         return Kt
 
-    def _buildCacheAndScatter(self, K, kRowOfNnz, dkdData) -> None:
-        """Build (and cache) the union output pattern -- a safe structural superset valid for
-        *every* call within this `K`-pattern epoch, not just this one -- plus term1's (DKD's) and
-        C's scatter positions into it.
-
-        The three S-touching terms (DKS, S^T KD, S^T K S) are deliberately **not** scattered here,
-        even though this method only runs once per epoch: their own output nnz can legitimately
-        grow or shrink call to call within the *same* K pattern, because SciPy's CSR @ CSR product
-        eliminates an output entry whenever its accumulated contributions happen to sum to exactly
-        zero -- true even with every individual contribution nonzero, and this includes an
-        independent DOF's raw K-value crossing through exact zero between Newton iterations, which
-        is routine, not exotic (verified directly: recomputing a failing AMR case's `term2` with the
-        cache-build call's own frozen values reproduced the cache-build nnz exactly; only
-        substituting the later call's actual values changed it). A positionally-fixed scatter map
-        for those terms is therefore unsound. What *is* epoch-stable is the union pattern itself,
-        provided it is built from a value-blind structural pass -- which must use **boolean**-dtype
-        operands, not floats forced to a uniform placeholder: a uniform placeholder's own
-        contributions can still cancel to exactly zero at positions where the real weighted sum
-        would not (verified directly with a toy 2-contribution SpGEMM), so it is not actually a safe
-        superset. Boolean dtype sidesteps this: SciPy's sparse matmul uses logical OR/AND for bool
-        operands, so a structurally reachable entry is always True, never cancelled -- so callers
-        scatter terms 2-4 fresh, every call, via a cheap `searchsorted` into this cached union (see
-        `transformSystemMatrix`). term1 (DKD) has no such issue: its positions are exactly `K`'s own
-        (no SpGEMM involved), so its scatter map is safe to cache and reuse unconditionally.
-        """
-        n = self.nDof
-
-        dRowBool = self._D[kRowOfNnz] != 0
-        dColBool = self._D[K.indices] != 0
-        DKBool = csr_matrix((dRowBool, K.indices, K.indptr), shape=(n, n), dtype=bool)
-        KDBool = csr_matrix((dColBool, K.indices, K.indptr), shape=(n, n), dtype=bool)
-        KBool = csr_matrix((np.ones(len(K.data), dtype=bool), K.indices, K.indptr), shape=(n, n), dtype=bool)
-        term2Bool = (DKBool @ self._SBool).tocsr()
-        term3Bool = (self._SBool.T @ KDBool).tocsr()
-        term4Bool = (self._SBool.T @ KBool @ self._SBool).tocsr()
-
-        termRows = [kRowOfNnz]
-        termCols = [K.indices]
-        for term in (term2Bool, term3Bool, term4Bool):
-            termRows.append(np.repeat(np.arange(n), np.diff(term.indptr)))
-            termCols.append(term.indices)
-
-        cRow = np.repeat(np.arange(n), np.diff(self._C.indptr))
-
-        allRows = np.concatenate(termRows + [cRow])
-        allCols = np.concatenate(termCols + [self._C.indices])
-        allData = np.zeros(len(allRows))  # positions only -- this pass never contributes values
-
-        # coo_matrix -> tocsr() sums duplicate (row, col) entries and sorts indices canonically in
-        # one pass -- exactly the pattern-construction work the legacy path paid every call via
-        # "+ C, tocsr, sort indices"; here it is paid once per epoch.
-        union = coo_matrix((allData, (allRows, allCols)), shape=(n, n)).tocsr()
-        union.sum_duplicates()
-        union.sort_indices()
-
-        self._unionIndices = union.indices.copy()
-        self._unionIndptr = union.indptr.copy()
-
-        # CSR with sorted-within-row indices, rows visited in increasing order, means row*n + col is
-        # monotonically increasing across the *entire* flattened array -- so a single vectorized
-        # searchsorted (not a per-row loop) locates any term's entries within the union.
-        unionRowOfNnz = np.repeat(np.arange(n), np.diff(union.indptr))
-        self._unionKeys = unionRowOfNnz.astype(np.int64) * n + union.indices.astype(np.int64)
-
-        term1Keys = kRowOfNnz.astype(np.int64) * n + K.indices.astype(np.int64)
-        self._term1ScatterMap = self._scatterPositions(term1Keys)
-
-        cKeys = cRow.astype(np.int64) * n + self._C.indices.astype(np.int64)
-        cPositions = self._scatterPositions(cKeys)
-        self._cBaseData = np.zeros(len(self._unionKeys), dtype=np.float64)
-        self._cBaseData[cPositions] += self._C.data
-
-    def _scatterPositions(self, keys: np.ndarray) -> np.ndarray:
-        """Locate `keys` (``row * nDof + col``) within the cached union pattern via a vectorized
-        `searchsorted`, asserting every key is an *exact* match -- by construction (the union is a
-        structural superset of any term's actual pattern within the epoch, §21.2 B2/B3), a miss
-        means the scatter mechanism itself is broken, not a numerical tolerance issue -- fail
-        loudly, always, not just once per epoch."""
-        positions = np.searchsorted(self._unionKeys, keys)
-        if not np.array_equal(self._unionKeys[positions], keys):
-            raise AssertionError(
-                "mpctransformation: a term's (row, col) key was not found in the union pattern -- "
-                "the cached-pattern value scatter's own bookkeeping is broken, not a numerical "
-                "tolerance issue."
-            )
-        return positions
-
     def _assertExact(self, K: csr_matrix, result: csr_matrix) -> None:
-        """:envvar:`EDELWEISS_MPC_ASSERT_EXACT` cross-check: the cached value-scatter result must
-        match the legacy ``T^T K T + C`` expression to within a matrix-norm-relative tolerance
-        (entry-relative fails on cancellation-tiny entries) -- §21.2 B2/B3."""
+        """:envvar:`EDELWEISS_MPC_ASSERT_EXACT` cross-check: the AMGCL-threaded result must match
+        the plain ``T^T K T + C`` expression to within a matrix-norm-relative tolerance
+        (entry-relative fails on cancellation-tiny entries)."""
         legacy = self._transformSystemMatrixLegacy(K)
         diff = (result - legacy).tocsr()
         maxDiff = np.max(np.abs(diff.data)) if diff.nnz else 0.0
@@ -383,108 +274,76 @@ class MultiPointConstraintTransformation:
         if maxDiff > 1e-9 * scale:
             raise AssertionError(
                 "mpctransformation: EDELWEISS_MPC_ASSERT_EXACT caught a real mismatch between the "
-                "cached value-scatter result and the legacy T^T K T + C expression: max|delta|={:.3e}, "
+                "AMGCL-threaded result and the plain T^T K T + C expression: max|delta|={:.3e}, "
                 "tolerance={:.3e} (1e-9 x max|data|={:.3e}).".format(maxDiff, 1e-9 * scale, scale)
             )
+
+    def _dumpForOfflineProbe(self, K: csr_matrix) -> None:
+        """Write this call's raw `K` plus `T`/`C` to :envvar:`EDELWEISS_DUMP_MPC`'s directory,
+        capped at `_DUMP_MPC_MAX_CALLS` process-wide -- see that env var's own comment.
+        """
+        global _dumpMpcCallsWritten
+        directory = os.environ.get(_DUMP_MPC_ENV_VAR)
+        if not directory or _dumpMpcCallsWritten >= _DUMP_MPC_MAX_CALLS:
+            return
+        from scipy.sparse import save_npz
+
+        os.makedirs(directory, exist_ok=True)
+        stem = "{:03d}".format(_dumpMpcCallsWritten)
+        save_npz(os.path.join(directory, "K_{:}.npz".format(stem)), K.tocsr(), compressed=False)
+        save_npz(os.path.join(directory, "T_{:}.npz".format(stem)), self._T, compressed=False)
+        save_npz(os.path.join(directory, "C_{:}.npz".format(stem)), self._C, compressed=False)
+        _dumpMpcCallsWritten += 1
+        print(
+            "mpctransformation: dumped call {:} ({:} rows, {:} nnz K) to {:} ({:}/{:} used)".format(
+                stem, K.shape[0], K.nnz, directory, _dumpMpcCallsWritten, _DUMP_MPC_MAX_CALLS
+            ),
+            flush=True,
+        )
 
     def transformSystemMatrix(self, K: csr_matrix) -> csr_matrix:
         """Condense the system matrix: :math:`\\tilde{K} = T^T K \\, T + C`.
 
-        Dispatches to the cached-pattern value scatter (§21.2 B2) or the direct expression
-        depending on ``useCachedCondensation`` (constructor argument) -- see the class docstring
-        for why the cached path is not the default despite being correctness-equivalent.
+        Dispatches to the AMGCL-threaded expression (§24, ``useAmgclSpgemm``) or the plain SciPy
+        expression (default) -- see the class docstring for why the AMGCL path is not yet the
+        default despite being faster (pending a live gate).
         """
-        if self._useCachedCondensation:
-            return self._transformSystemMatrixCached(K)
+        self._dumpForOfflineProbe(K)
+        if self._useAmgclSpgemm:
+            result = self._transformSystemMatrixAmgcl(K)
+            if os.environ.get(_ASSERT_EXACT_ENV_VAR):
+                self._assertExact(K, result)
+            return result
         return self._transformSystemMatrixLegacy(K)
 
     @performancetiming.timeit("mpc transform system matrix")
-    def _transformSystemMatrixCached(self, K: csr_matrix) -> csr_matrix:
-        """Condense the system matrix via a cached-pattern value scatter (§21.2 B2), instead of the
-        direct two-SpGEMM expression :meth:`_transformSystemMatrixLegacy` computes.
-        With :math:`T = D + S` (:math:`D` diagonal, 1 on independent DOFs, 0 on slaves; :math:`S` the
-        slave rows only, structurally zero elsewhere):
-
-        .. math::
-            T^T K T + C \\;=\\; D K D \\;+\\; D K S \\;+\\; S^T K D \\;+\\; S^T K S \\;+\\; C
-
-        :math:`DKD` is :math:`K`'s own pattern with values masked -- a cheap elementwise operation,
-        no SpGEMM. The three :math:`S`-touching terms are SpGEMMs restricted to :math:`S`'s
-        ``nEliminatedDof`` *output* rows, but **not** cheap in practice (§21.2 B3, measured on a real
-        280k-dof model): SciPy's CSR @ CSR must still scan the *left* operand's full row range (all
-        of `K`'s own nnz) to find which rows intersect `S`'s tiny nonzero-row support, so their cost
-        tracks `K`'s own size, not `S`'s -- on that model they alone cost more than
-        :meth:`_transformSystemMatrixLegacy`'s entire per-call cost, which is why this path is not
-        the default (see the class docstring). The expensive union-pattern
-        construction is cached, built once per epoch whenever `K`'s own pattern changes (checked by
-        array *identity*, not equality -- §21.2 B1 verified the csrGenerator returns the same
-        `indices`/`indptr` objects by reference every iteration when no pruning intervenes
-        upstream). `DKD`'s own scatter position into that union is likewise cached -- it has no
-        SpGEMM involved, so its positions are always exactly `K`'s own. The three S-touching terms'
-        positions are *not* cached, even though the union is: SciPy's CSR @ CSR product drops a
-        candidate output entry whenever every contributing factor is exactly zero, and an
-        independent DOF's raw `K` value crossing through exact zero between Newton iterations is
-        routine (not exotic) even while `K`'s *pattern* stays fixed -- so those three terms'
-        positions are recomputed fresh every call via a cheap `searchsorted` into the cached union
-        (itself built from a value-blind structural pass, so it is a safe superset for the whole
-        epoch regardless of any one call's incidental zeros).
-
-        Parameters
-        ----------
-        K
-            The assembled system matrix.
-
-        Returns
-        -------
-        csr_matrix
-            The condensed system matrix, same size, with the constraint equations in the slave rows.
-            A fresh, independent array triple every call -- never aliases the cached union pattern,
-            since downstream code (Dirichlet zeroing, ``eliminate_zeros()``) mutates its result in
-            place, and the cache must survive that untouched.
+    def _transformSystemMatrixAmgcl(self, K: csr_matrix) -> csr_matrix:
+        """Condense the system matrix via the same direct :math:`T^T K \\, T + C` expression
+        :meth:`_transformSystemMatrixLegacy` computes, but through AMGCL's own OpenMP-threaded
+        ``product()``/``sum()`` (§24, task #31) instead of SciPy's single-threaded CSR sparse
+        routines -- see ``useAmgclSpgemm``'s own constructor-argument docstring for the measured
+        speedup and the ``eliminate_zeros()`` rationale.
         """
-        n = self.nDof
-        patternChanged = (
-            self._cachedKIndices is None or K.indices is not self._cachedKIndices or K.indptr is not self._cachedKIndptr
-        )
+        from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLSpGEMM
 
-        with performancetiming.timeit("mpc: D K D (values only)"):
-            if patternChanged or self._cachedKRowOfNnz is None:
-                kRowOfNnz = np.repeat(np.arange(n), np.diff(K.indptr))
-            else:
-                kRowOfNnz = self._cachedKRowOfNnz
-            dkdData = K.data * self._D[kRowOfNnz] * self._D[K.indices]
-
-        with performancetiming.timeit("mpc: S-touching SpGEMMs"):
-            dkData = K.data * self._D[kRowOfNnz]
-            DK = csr_matrix((dkData, K.indices, K.indptr), shape=(n, n))
-            kdData = K.data * self._D[K.indices]
-            KD = csr_matrix((kdData, K.indices, K.indptr), shape=(n, n))
-            term2 = (DK @ self._S).tocsr()
-            term3 = (self._S.T @ KD).tocsr()
-            term4 = (self._S.T @ K @ self._S).tocsr()
-
-        if patternChanged:
-            with performancetiming.timeit("mpc: build union pattern"):
-                self._buildCacheAndScatter(K, kRowOfNnz, dkdData)
-                self._cachedKIndices = K.indices
-                self._cachedKIndptr = K.indptr
-                self._cachedKRowOfNnz = kRowOfNnz
-
-        with performancetiming.timeit("mpc: value scatter"):
-            freshData = self._cBaseData.copy()
-            freshData[self._term1ScatterMap] += dkdData
-            for term in (term2, term3, term4):
-                rowOfNnz = np.repeat(np.arange(n), np.diff(term.indptr))
-                keys = rowOfNnz.astype(np.int64) * n + term.indices.astype(np.int64)
-                positions = self._scatterPositions(keys)
-                freshData[positions] += term.data
-
-        result = csr_matrix((freshData, self._unionIndices.copy(), self._unionIndptr.copy()), shape=(n, n))
-
-        if os.environ.get(_ASSERT_EXACT_ENV_VAR):
-            self._assertExact(K, result)
-
-        return result
+        helper = PyAMGCLSpGEMM()
+        KT = helper.product(K, self._T)
+        KtNoC = helper.product(self._T.T.tocsr(), KT)
+        Kt = helper.sum(1.0, KtNoC, 1.0, self._C)
+        # No eliminate_zeros() here, deliberately -- not because it is unneeded (AMGCL's
+        # product()/sum() leave far more exact-cancellation zeros unpruned than SciPy's own SpGEMM
+        # does, confirmed directly (§24): 54.3M nnz here vs. the plain expression's 34.2M on the
+        # reference model, with >99.9999% of that gap being bit-exact zero, not numerical
+        # approximation), but because NISTSolver.applyDirichletK already does this immediately
+        # after, gated by pruneCondensedMatrixZeros (default True), uniformly for both condensation
+        # strategies -- that gate exists precisely because PARDISO's reordering on these
+        # path-dependent condensed systems is sensitive to extra explicit-zero structural entries
+        # (nonlinearimplicitstatic.py's own documented, previously-observed drift), and because
+        # blockamg's hierarchy-reuse gates on raw nnz (an unpruned, possibly call-to-call-unstable
+        # zero count would risk spurious hierarchy rebuilds independent of any PARDISO concern).
+        # Pruning here too would only double that work under the default config.
+        Kt.sort_indices()
+        return Kt
 
     @performancetiming.timeit("mpc transform residual")
     def transformResidual(self, R: np.ndarray, dU: np.ndarray) -> np.ndarray:
