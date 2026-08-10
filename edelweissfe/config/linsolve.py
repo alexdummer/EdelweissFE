@@ -72,9 +72,23 @@ def getLinSolverByName(linsolverName, opts):
 
         return PardisoSolver(reuseSymbolicFactorization=reuseSymbolicFactorization)
     elif linsolverName.lower() == "panuapardiso":
-        from edelweissfe.linsolve.panuapardiso.panuapardiso import panuaPardisoSolve
+        from edelweissfe.linsolve.panuapardiso.panuapardiso import PanuaPardisoSolver
 
-        return panuaPardisoSolve
+        # same caveat as for the MKL variant above: reuse of the symbolic
+        # factorization is opt-in via opts["reuseSymbolicFactorization"] = True.
+        # Panua PARDISO additionally needs its thread count explicitly, which defaults
+        # to OMP_NUM_THREADS and can be overridden via opts["numThreads"].
+        if isinstance(opts, Mapping):
+            reuseSymbolicFactorization = bool(opts.get("reuseSymbolicFactorization", False))
+            numThreads = opts.get("numThreads", None)
+        else:
+            reuseSymbolicFactorization = False
+            numThreads = None
+
+        return PanuaPardisoSolver(
+            reuseSymbolicFactorization=reuseSymbolicFactorization,
+            numThreads=numThreads,
+        )
     elif linsolverName.lower() == "klu":
         from edelweissfe.linsolve.klu.klu import kluSolve
 

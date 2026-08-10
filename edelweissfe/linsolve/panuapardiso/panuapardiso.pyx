@@ -30,14 +30,18 @@
 This module provides an interface to the commercial Panua PARDISO solver.
 It is only available, if the PARDISO solver is installed on the system.
 You can get the binaries from https://panua.ch/. A license is required to use the solver.
+
+The interface mirrors the one of the Intel MKL PARDISO solver in
+:mod:`edelweissfe.linsolve.pardiso.pardiso`: a stateful :class:`PanuaPardisoSolver`
+class with optional reuse of the symbolic factorization, plus the one-shot
+convenience function :func:`panuaPardisoSolve`.
 """
 
 import os
 
 import numpy as np
-cimport numpy as np
 
-from edelweissfe.linsolve.pardiso.pardiso import setParameter
+cimport numpy as np
 
 
 cdef extern from "pardiso.h" nogil:
@@ -48,86 +52,318 @@ cdef extern from "pardiso.h" nogil:
     void pardisoinit(void*, int*, int*, int*, double*, int*)
 
 
-def panuaPardisoSolve(A, b):
-    """
-    Solve the linear system Ax = b using the Panua PARDISO solver.
+# Panua PARDISO prints a license banner on every pardisoinit unless this is set.
+# It is queried by the library at call time, so setting it once at import is enough.
+os.environ["PARDISOLICMESSAGE"] = "1"
 
-    Parameters
-    ----------
-    A : scipy.sparse.csr_matrix
-        The matrix A of the linear system.
-    b : numpy.ndarray
-        The right-hand side of the linear system.
+
+def _defaultNumThreads():
+    """
+    Determine the number of threads Panua PARDISO should use.
+
+    Panua PARDISO requires the thread count to be passed explicitly via ``iparm[2]``
+    and expects it to agree with ``OMP_NUM_THREADS``. If that variable is unset, fall
+    back to the number of CPUs available to this process, which is what the OpenMP
+    runtime would pick by itself.
 
     Returns
     -------
-    numpy.ndarray
-        The solution x of the linear system.
+    int
+        The number of threads.
     """
 
-    # prepare matrix
-    cdef int rows = A.shape[0]
-    cdef double[::1] data = A.data
-    cdef int[::1] indices = A.indices + 1  # pardiso uses fortran 1-based indexing
-    cdef int[::1] indptr = A.indptr + 1  # pardiso uses fortran 1-based indexing
+    ompNumThreads = os.environ.get("OMP_NUM_THREADS")
 
-    # prepare rhs
-    cdef double[::1, :] b_ = b.reshape((rows, -1), order="F")
-    cdef int nRhs = b_.shape[1]
+    if ompNumThreads:
+        try:
+            threads = int(ompNumThreads)
+        except ValueError:
+            threads = 0
 
-    # prepare solution vector
-    cdef double[::1, :] x = np.zeros_like(b_, order="F")
+        if threads > 0:
+            return threads
 
-    # initialize solver
-    cdef long int *pt[64]  # internal solver memory pointer
-    cdef int[64] iparm  # parameters for pardiso
-    cdef double[64] dparm  # parameters for pardiso
-    cdef int mtype = 11  # real and unsymmetric matrix
-    cdef int solver = 0  # use sparse direct solver
-    cdef int error = 0  # initialize error flag
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
 
-    # check license and initialize the solver
-    os.environ["PARDISOLICMESSAGE"] = "1"  # don't print license message
-    pardisoinit(pt, &mtype, &solver, iparm, dparm, &error)
 
-    # set parameters
-    cdef int maxfct = 5  # maximum number of numerical factorizations
-    cdef int mnum = 1  # which factorization to use
-    cdef int msglvl = 0  # print statistical information
-    cdef int idum = 0  # integer dummy variable
-    cdef double ddum = 0  # double dummy variable
+cdef class PanuaPardisoSolver:
+    """
+    Stateful interface to the Panua PARDISO solver.
 
-    # set custom parameters for pardiso
-    iparm = setParameter(iparm, 0, 0)  # use default values
+    The reordering and symbolic factorization (PARDISO phase 11) depend only on the
+    sparsity pattern of the system matrix, so it is in principle safe to compute it
+    once and reuse it for every subsequent solve with the same pattern (each solve
+    then only performs the numerical factorization, phase 22, and back substitution,
+    phase 33). A change of the sparsity pattern is detected automatically and
+    triggers a re-analysis.
 
-    omp_num_threads = os.environ.get("OMP_NUM_THREADS")
-    threads = int(omp_num_threads) if omp_num_threads is not None else -1
+    However, this reuse has been observed to silently produce numerically wrong
+    results (with PARDISO reporting ``error == 0``, so the usual NaN-based failure
+    check does not catch it) for some coupled-DOF problems where the numerically
+    relevant pivot structure shifts substantially between solves even though the
+    sparsity pattern itself does not change. Reuse is therefore **disabled by
+    default**; pass ``reuseSymbolicFactorization=True`` to opt in once this has been
+    verified safe for the problem at hand (e.g. by comparing against one-shot
+    solves on the actual matrix sequence). With reuse disabled, this class behaves
+    like the free function :func:`panuaPardisoSolve`, just as a reusable object.
 
-    iparm = setParameter(iparm, 2, threads)  # number of threads
+    Unlike MKL, Panua PARDISO does not derive its thread count from the environment
+    on its own; it is passed explicitly via ``iparm[2]``. By default the value of
+    ``OMP_NUM_THREADS`` is used, falling back to the number of CPUs available to this
+    process. It can be overridden with the ``numThreads`` argument.
 
-    cdef int phase
-    # reordering and symbolic factorization
-    phase = 11
-    pardiso(pt, &maxfct, &mnum, &mtype, &phase,
-            &rows, &data[0], &indptr[0], &indices[0], &idum, &nRhs,
-            iparm, &msglvl, &ddum, &ddum, &error, dparm)
+    Parameters
+    ----------
+    reuseSymbolicFactorization : bool
+        Reuse the symbolic factorization across solves with an unchanged sparsity
+        pattern.
+    numThreads : int
+        The number of threads to use. Defaults to ``OMP_NUM_THREADS``.
+    """
 
-    # numerical factorization
-    phase = 22
-    pardiso(pt, &maxfct, &mnum, &mtype, &phase,
-            &rows, &data[0], &indptr[0], &indices[0], &idum, &nRhs,
-            iparm, &msglvl, &ddum, &ddum, &error, dparm)
+    cdef void *pt[64]     # internal solver memory pointer
+    cdef int iparm[64]    # integer parameters for pardiso
+    cdef double dparm[64] # float parameters for pardiso
+    cdef int mtype        # real and unsymmetric matrix
+    cdef int solver       # sparse direct solver
+    cdef int maxfct
+    cdef int mnum
+    cdef int msglvl
+    cdef int rows
+    cdef int numThreads
+    cdef bint ptIsActive  # pt may hold PARDISO-internal allocations (phase -1 required)
+    cdef bint hasSymbolicFactorization
+    cdef bint reuseSymbolicFactorization
 
-    # back substitution and iterative refinement
-    phase = 33
-    pardiso(pt, &maxfct, &mnum, &mtype, &phase,
-            &rows, &data[0], &indptr[0], &indices[0], &idum, &nRhs,
-            iparm, &msglvl, &b_[0, 0], &x[0, 0], &error, dparm)
+    # the pattern arrays of the currently analyzed matrix (0-based, for change detection)
+    cdef object currentIndices
+    cdef object currentIndptr
+    # persistent 1-based copies handed to pardiso (fortran indexing)
+    cdef int[::1] indicesFortran
+    cdef int[::1] indptrFortran
 
-    # free the memory
-    phase = -1
-    pardiso(pt, &maxfct, &mnum, &mtype, &phase,
-            &rows, &data[0], &indptr[0], &indices[0], &idum, &nRhs,
-            iparm, &msglvl, &b_[0, 0], &x[0, 0], &error, dparm)
+    def __cinit__(self, reuseSymbolicFactorization=False, numThreads=None):
+        cdef int i
 
-    return np.reshape(x, b.shape)
+        self.mtype = 11
+        self.solver = 0
+        self.maxfct = 1
+        self.mnum = 1
+        self.msglvl = 0
+        self.ptIsActive = False
+        self.hasSymbolicFactorization = False
+        self.reuseSymbolicFactorization = reuseSymbolicFactorization
+        self.numThreads = int(numThreads) if numThreads is not None else _defaultNumThreads()
+        self.currentIndices = None
+        self.currentIndptr = None
+
+        if self.numThreads < 1:
+            raise ValueError("numThreads must be a positive integer")
+
+        # PARDISO requires pt to be all zeros before the first call
+        for i in range(64):
+            self.pt[i] = NULL
+            self.iparm[i] = 0
+            self.dparm[i] = 0.0
+
+    def __dealloc__(self):
+        self._releaseMemory()
+
+    cdef void _releaseMemory(self):
+        """Release all internal PARDISO memory (phase -1)."""
+        cdef int phase = -1
+        cdef int error = 0
+        cdef int nRhs = 1
+        cdef int idum = 0
+        cdef double ddum = 0
+
+        if not self.ptIsActive:
+            return
+
+        pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                &self.rows, &ddum, &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                &self.iparm[0], &self.msglvl, &ddum, &ddum, &error, &self.dparm[0])
+
+        self.ptIsActive = False
+        self.hasSymbolicFactorization = False
+        self.currentIndices = None
+        self.currentIndptr = None
+
+    cdef bint _hasSamePattern(self, A):
+        """Check if the sparsity pattern of A matches the analyzed one."""
+        if not self.hasSymbolicFactorization:
+            return False
+
+        indices = A.indices
+        indptr = A.indptr
+
+        # fast path: in-place assembly reuses the identical pattern arrays
+        if indices is self.currentIndices and indptr is self.currentIndptr:
+            return True
+
+        if (
+            A.shape[0] == self.rows
+            and np.array_equal(indptr, self.currentIndptr)
+            and np.array_equal(indices, self.currentIndices)
+        ):
+            # same pattern in new arrays; adopt them for future identity checks
+            self.currentIndices = indices
+            self.currentIndptr = indptr
+            return True
+
+        return False
+
+    cdef int _analyze(self, A) except -1:
+        """Run reordering and symbolic factorization (phase 11) for the pattern of A."""
+        cdef int phase = 11
+        cdef int error = 0
+        cdef int nRhs = 1
+        cdef int idum = 0
+        cdef double ddum = 0
+
+        self._releaseMemory()
+
+        if A.nnz > np.iinfo(np.intc).max:
+            raise ValueError(
+                "matrix has {:} nonzeros, exceeding the 32-bit PARDISO interface".format(A.nnz)
+            )
+        if A.shape[0] > np.iinfo(np.intc).max:
+            raise ValueError(
+                "matrix has {:} rows, exceeding the 32-bit PARDISO interface".format(A.shape[0])
+            )
+
+        self.rows = A.shape[0]
+        # pardiso uses fortran 1-based indexing; scipy may use int64 index arrays for
+        # large matrices, so cast explicitly to the 32-bit interface type
+        self.indicesFortran = np.ascontiguousarray(A.indices + 1, dtype=np.intc)
+        self.indptrFortran = np.ascontiguousarray(A.indptr + 1, dtype=np.intc)
+
+        # this also validates the license
+        pardisoinit(self.pt, &self.mtype, &self.solver, &self.iparm[0], &self.dparm[0], &error)
+
+        if error != 0:
+            raise RuntimeError(
+                "Panua PARDISO initialization failed with error code {:} "
+                "(-10: no license file, -11: license expired, -12: wrong username)".format(error)
+            )
+
+        # pardisoinit has filled iparm with the defaults, so iparm[0] must stay at 1 for
+        # the settings below to be honored at all; the thread count is mandatory for Panua
+        self.iparm[0] = 1
+        self.iparm[2] = self.numThreads
+
+        self.ptIsActive = True
+
+        cdef double[::1] data = A.data
+
+        pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                &self.iparm[0], &self.msglvl, &ddum, &ddum, &error, &self.dparm[0])
+
+        if error != 0:
+            self._releaseMemory()
+            raise RuntimeError("Panua PARDISO analysis failed with error code {:}".format(error))
+
+        self.hasSymbolicFactorization = True
+        self.currentIndices = A.indices
+        self.currentIndptr = A.indptr
+
+        return 0
+
+    def __call__(self, A, b):
+        """
+        Solve a linear system of equations.
+
+        Parameters
+        ----------
+        A : csr_matrix
+            The system matrix.
+        b : ndarray
+            The right-hand side vector (or matrix for multiple right-hand sides).
+
+        Returns
+        -------
+        ndarray
+            The solution vector.
+        """
+
+        # if reuse is disabled, always re-analyze; _hasSamePattern is not even
+        # evaluated in that case (see the class docstring for why reuse is opt-in)
+        if not self.reuseSymbolicFactorization or not self._hasSamePattern(A):
+            self._analyze(A)
+
+        cdef double[::1] data = A.data
+
+        # prepare rhs and solution
+        cdef double[::1, :] b_ = np.asfortranarray(b.reshape((self.rows, -1)))
+        cdef int nRhs = b_.shape[1]
+        cdef double[::1, :] x = np.zeros_like(b_, order="F")
+
+        cdef int phase
+        cdef int error = 0
+        cdef int idum = 0
+        cdef double ddum = 0
+
+        # numerical factorization
+        phase = 22
+        pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                &self.iparm[0], &self.msglvl, &ddum, &ddum, &error, &self.dparm[0])
+
+        if error == 0:
+            # back substitution and iterative refinement
+            phase = 33
+            pardiso(self.pt, &self.maxfct, &self.mnum, &self.mtype, &phase,
+                    &self.rows, &data[0], &self.indptrFortran[0], &self.indicesFortran[0], &idum, &nRhs,
+                    &self.iparm[0], &self.msglvl, &b_[0, 0], &x[0, 0], &error, &self.dparm[0])
+
+        if error != 0:
+            # signal failure via NaNs; the nonlinear solvers translate this into a cutback
+            np.asarray(x).fill(np.nan)
+
+        return np.reshape(x, b.shape)
+
+    def invalidate(self):
+        """
+        Force a fresh reordering and symbolic factorization (PARDISO phase 11) on the
+        next solve, regardless of what the array-identity / ``array_equal`` pattern
+        check in :meth:`_hasSamePattern` would otherwise conclude.
+
+        Call this whenever the caller knows the sparsity pattern may have changed
+        through a channel the automatic detection might not reliably catch — e.g. a
+        solver that rebuilds its CSR generator whenever the active domain changes,
+        which can happen more often than once per analysis step (unlike EdelweissFE's
+        own static-mesh usage, where a fresh instance is constructed once per step and
+        the pattern is never actually re-checked against a real change).
+
+        No-op when ``reuseSymbolicFactorization`` is False, since every solve already
+        re-analyzes unconditionally in that case.
+        """
+        self.hasSymbolicFactorization = False
+
+
+def panuaPardisoSolve(A, b):
+    """
+    Solve a linear system of equations using the Panua PARDISO solver.
+
+    One-shot convenience wrapper around :class:`PanuaPardisoSolver`; for repeated
+    solves with an identical sparsity pattern, use a persistent
+    :class:`PanuaPardisoSolver` instance to reuse the symbolic factorization.
+
+    Parameters
+    ----------
+    A : csr_matrix
+        The system matrix.
+    b : ndarray
+        The right-hand side vector.
+
+    Returns
+    -------
+    ndarray
+        The solution vector.
+    """
+
+    return PanuaPardisoSolver()(A, b)
