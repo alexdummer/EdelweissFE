@@ -34,24 +34,38 @@ PARDISO library at build time. The factory below therefore imports it lazily; se
 :func:`createSolver`.
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from edelweissfe.linsolve.base import LinearSolver
 
 
-class PanuaPardisoSolver(LinearSolver):
-    """The Panua PARDISO direct solver. Callable as ``(A, b) -> x``.
+class PanuaPardisoLinearSolver(LinearSolver):
+    """Thin wrapper giving the Cython
+    :class:`~edelweissfe.linsolve.panuapardiso.panuapardiso.PanuaPardisoSolver` extension type the
+    common :class:`~edelweissfe.linsolve.base.LinearSolver` interface
+    (``setJournal``/``setFieldStructure``) without touching the ``.pyx`` itself -- a plain Python
+    subclass keeps the Cython extension's build untouched and this wrapper trivially testable without
+    a rebuild.
 
-    A plain Python wrapper around the bare Cython function
-    :func:`~edelweissfe.linsolve.panuapardiso.panuapardiso.panuaPardisoSolve` -- not touching the
-    ``.pyx`` itself keeps this trivially testable without a rebuild.
+    Also forwards ``factorize``/``solveFactorized`` (the two-method contract
+    :class:`~edelweissfe.linsolve.inexactnewton.inexactnewton.InexactNewtonSolver` uses instead of the
+    plain ``(A, b) -> x`` call), exactly as
+    :class:`~edelweissfe.linsolve.pardiso.PardisoLinearSolver` does: ``inexactnewton`` resolves its
+    factorizing delegate through this same registry seam, so a backend that can serve as that
+    delegate has to satisfy both contracts, not just the ``LinearSolver`` one.
     """
 
-    def __init__(self, solveFunction):
-        self._solveFunction = solveFunction
+    def __init__(self, delegate):
+        self._delegate = delegate
 
     def __call__(self, A, b):
-        return self._solveFunction(A, b)
+        return self._delegate(A, b)
+
+    def factorize(self, A):
+        return self._delegate.factorize(A)
+
+    def solveFactorized(self, b):
+        return self._delegate.solveFactorized(b)
 
 
 def createSolver(opts) -> Callable:
@@ -64,16 +78,17 @@ def createSolver(opts) -> Callable:
     Parameters
     ----------
     opts
-        The linear-solver options parsed from the solver's ``linsolverConfigFile``. Not consulted:
-        this backend takes no options. It is still accepted so that every ``createSolver`` presents
-        the identical signature.
+        The linear-solver options parsed from the solver's ``linsolverConfigFile``. Only
+        ``opts["reuseSymbolicFactorization"]`` is consulted, defaulting to ``False``; ``opts`` is
+        tolerated as any non-mapping (the implicit-static solver passes ``""`` when no configuration
+        file is given), in which case that default applies.
 
     Returns
     -------
     Callable
-        A :class:`PanuaPardisoSolver` wrapping
-        :func:`~edelweissfe.linsolve.panuapardiso.panuapardiso.panuaPardisoSolve`, callable as
-        ``(A, b) -> x``.
+        A :class:`PanuaPardisoLinearSolver` wrapping a
+        :class:`~edelweissfe.linsolve.panuapardiso.panuapardiso.PanuaPardisoSolver` instance, callable
+        as ``(A, b) -> x``.
 
     Raises
     ------
@@ -85,6 +100,19 @@ def createSolver(opts) -> Callable:
     # Imported inside the function body, not at module scope: this extension is optional and
     # genuinely absent in most installs, so at module scope its absence would break anyone who
     # merely resolves a `linsolver` registry name rather than this one.
-    from edelweissfe.linsolve.panuapardiso.panuapardiso import panuaPardisoSolve
+    from edelweissfe.linsolve.panuapardiso.panuapardiso import PanuaPardisoSolver
 
-    return PanuaPardisoSolver(panuaPardisoSolve)
+    # Symbolic-factorization reuse across solves is only correct if the caller
+    # can guarantee the sparsity pattern stays genuinely stable for the solver
+    # instance's entire lifetime; with the MKL backend it has been observed to silently
+    # produce wrong (but not NaN, so undetected by the usual failure check) results for
+    # some coupled-DOF problems, and nothing about that is MKL-specific. Off by
+    # default; opt in explicitly via opts["reuseSymbolicFactorization"] = True once
+    # that has been verified safe for the problem at hand.
+    reuseSymbolicFactorization = (
+        bool(opts.get("reuseSymbolicFactorization", False)) if isinstance(opts, Mapping) else False
+    )
+
+    return PanuaPardisoLinearSolver(
+        PanuaPardisoSolver(reuseSymbolicFactorization=reuseSymbolicFactorization)
+    )

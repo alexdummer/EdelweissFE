@@ -57,7 +57,7 @@ Choose a linsolver after the ``*solver`` keyword:
       - —
       - ``edelweissfe.linsolve.matrixdump.matrixdump``
 
-Several linsolvers accept an optional configuration file ``linsolverConfigFile`` (a ``.json`` file), among them ``gmres``, ``amgcl``, ``inexactnewton`` and ``matrixdump``; the direct solvers ignore it (``pardiso`` additionally reads a single ``reuseSymbolicFactorization`` flag).
+Several linsolvers accept an optional configuration file ``linsolverConfigFile`` (a ``.json`` file), among them ``gmres``, ``amgcl``, ``inexactnewton`` and ``matrixdump``; the direct solvers ignore it (``pardiso`` and ``panuapardiso`` additionally read a single ``reuseSymbolicFactorization`` flag).
 
 Choose the options for the linsolver (in this case ``gmres``) in an extra file:
 
