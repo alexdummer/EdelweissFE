@@ -129,7 +129,7 @@ def _mergedSnapshot() -> dict:
     Quiescent-point requirement (found on review, not yet exploitable by any call site in this
     codebase): this reads every registered thread's tree without a lock. Safe as long as no other
     thread is still actively timing something when this is called -- true today, since every call
-    site (:func:`makePrettyTable`, :func:`extractIncrementTimes`, :func:`reset`) runs only after
+    site (:func:`makePrettyTable`, :func:`extractIncrementTimeRows`, :func:`reset`) runs only after
     joining whatever thread pool did the work being reported on, never concurrently with it. Adding
     per-node locking to make this safe under genuinely concurrent reporting too would reintroduce
     exactly the lock contention on the hot tic()/toc() path this module's whole redesign exists to
@@ -270,14 +270,30 @@ def makePrettyTable(maxLevels: int = 4) -> PrettyTable:
     return prettytable
 
 
-def extractIncrementTimes(maxLevels: int = 4) -> PrettyTable:
+def extractIncrementTimeRows(maxLevels: int = 4) -> list[tuple[int, str, float, int]]:
     """
-    Returns a PrettyTable of the time elapsed since the last time
-    this function was called, while keeping the accumulated totals intact.
+    Returns the time elapsed since the last time this function was called, as
+    ``(level, function, time, calls)`` rows, while keeping global 'times' intact.
+
+    **Consuming this is destructive**: it advances the snapshot the next delta is measured
+    against, so a caller that needs the same increment's times in more than one place (printed
+    *and* written to a file, say) must call this once and share the rows -- a second call
+    within the same increment reports zeros. :func:`makeIncrementTimesPrettyTable` turns the
+    rows into the printable table for exactly that reason.
+
+    Parameters
+    ----------
+    maxLevels
+        The maximum number of stack levels considered.
+
+    Returns
+    -------
+    list[tuple[int, str, float, int]]
+        One ``(level, function, time, calls)`` row per timed category, parents before children.
     """
 
-    if not hasattr(extractIncrementTimes, "_last_snapshot") or extractIncrementTimes._last_snapshot is None:
-        extractIncrementTimes._last_snapshot = None
+    if not hasattr(extractIncrementTimeRows, "_last_snapshot") or extractIncrementTimeRows._last_snapshot is None:
+        extractIncrementTimeRows._last_snapshot = None
 
     current_state = _mergedSnapshot()
 
@@ -295,8 +311,8 @@ def extractIncrementTimes(maxLevels: int = 4) -> PrettyTable:
 
         return {"time": delta_t, "calls": delta_c, "children": children_deltas}
 
-    delta_tree = compute_delta(current_state, extractIncrementTimes._last_snapshot)
-    extractIncrementTimes._last_snapshot = current_state
+    delta_tree = compute_delta(current_state, extractIncrementTimeRows._last_snapshot)
+    extractIncrementTimeRows._last_snapshot = current_state
 
     def flatten_delta(node, level):
         rows = []
@@ -306,15 +322,30 @@ def extractIncrementTimes(maxLevels: int = 4) -> PrettyTable:
                 rows += flatten_delta(data, level + 1)
         return rows
 
-    delta_rows = flatten_delta(delta_tree, 0)
+    return flatten_delta(delta_tree, 0)
+
+
+def makeIncrementTimesPrettyTable(rows: list[tuple[int, str, float, int]]) -> PrettyTable:
+    """Create a pretty formatted table from :func:`extractIncrementTimeRows` rows.
+
+    Parameters
+    ----------
+    rows
+        The ``(level, function, time, calls)`` rows to format.
+
+    Returns
+    -------
+    PrettyTable
+        The table in pretty format.
+    """
 
     prettytable = PrettyTable()
     prettytable.field_names = ["function", "inc. runtime", "calls", "time/call"]
     prettytable.align = "l"
-    for level, cat, t, calls in delta_rows:
+    for level, cat, t, calls in rows:
         t_per_call = t / calls if calls > 0 else 0.0
         prettytable.add_row(
-            [" " * level + cat, "{:}{:10.5f} s".format(" " * level, t), calls, "{:10.5f} s".format(t_per_call)]
+            [" " * level + cat, "{:}{:10.5E} s".format(" " * level, t), calls, "{:10.5E} s".format(t_per_call)]
         )
 
     return prettytable
@@ -328,4 +359,7 @@ def reset():
         root.clear()
         root.time = 0.0
         root.calls = 0
-    extractIncrementTimes._last_snapshot = None
+    # The baseline the next increment's delta is measured against lives on
+    # :func:`extractIncrementTimeRows` -- clearing it here is what keeps a new step's first increment
+    # from subtracting the previous step's (now zeroed) totals and reporting negative times.
+    extractIncrementTimeRows._last_snapshot = None
