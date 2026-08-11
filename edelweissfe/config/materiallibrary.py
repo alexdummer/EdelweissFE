@@ -49,8 +49,32 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
         provider = "MarmotMaterial"
 
     if strCaseCmp(provider, "marmotmaterial"):
+        # The material is created and owned by the Marmot element itself.
 
         return None
+
+    if strCaseCmp(provider, "marmotmaterialpoint"):
+        # A Marmot material evaluated point-wise, without an element in between.
+        # Which class applies follows from the base class the material is registered for
+        # in Marmot, not from its name, so the caller states the base class.
+        if strCaseCmp(materialName, "hypoelastic"):
+            from edelweissfe.materials.marmot.marmothypoelastic import (
+                MarmotHypoElasticMaterial,
+            )
+
+            return MarmotHypoElasticMaterial
+
+        if strCaseCmp(materialName, "gradientenhancedhypoelastic"):
+            from edelweissfe.materials.marmot.marmotgradientenhancedhypoelastic import (
+                MarmotGradientEnhancedHypoElasticMaterial,
+            )
+
+            return MarmotGradientEnhancedHypoElasticMaterial
+
+        raise Exception(
+            "Unknown Marmot material point base class '{:}'; "
+            "expected 'hypoelastic' or 'gradientEnhancedHypoElastic'".format(materialName)
+        )
 
     if strCaseCmp(provider, "edelweiss"):
         if strCaseCmp(materialName, "linearelastic"):
