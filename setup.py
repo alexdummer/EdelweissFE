@@ -108,6 +108,7 @@ marmot_material_dir = join("edelweissfe", "materials", "marmot")
 for marmot_material_source in [
     "marmothypoelastic.pyx",
     "marmotgradientenhancedhypoelastic.pyx",
+    "marmotgradientplasticityhypoelastic.pyx",
 ]:
     extensions += [
         Extension(
