@@ -105,7 +105,11 @@ extensions = [
 
 print("Gather the compiled finite difference cell kernels")
 kernel_dir = join("edelweissfe", "kernels")
-for kernel_source in ["gradientplasticitykernel.pyx"]:
+for kernel_source in [
+    "displacementkernel.pyx",
+    "gradientenhanceddisplacementkernel.pyx",
+    "gradientplasticitykernel.pyx",
+]:
     extensions += [
         Extension(
             "*",
