@@ -337,7 +337,10 @@ class NEST(NIST):
                             statusInfoDict=statusInfoDict,
                         )
 
-        except (ReachedMaxIncrements, ReachedMinIncrementSize):
+        except ReachedMaxIncrements:
+            self.applyStepActionsAtStepEnd(model, step.actions)
+
+        except ReachedMinIncrementSize:
             self.journal.errorMessage("Incrementation failed", self.identification)
             raise StepFailed()
 
