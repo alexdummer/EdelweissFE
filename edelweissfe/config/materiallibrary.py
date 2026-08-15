@@ -34,9 +34,7 @@ from edelweissfe.utils.misc import strCaseCmp
 _EDELWEISS_MATERIALS = {
     "linearelastic": ("edelweissfe.materials.linearelastic.linearelastic", "LinearElasticMaterial"),
     "vonmises": ("edelweissfe.materials.vonmises.vonmises", "VonMisesMaterial"),
-    "neohookewa": ("edelweissfe.materials.neohooke.neohookepencegouformulationa", "NeoHookeanWaMaterial"),
-    "neohookewb": ("edelweissfe.materials.neohooke.neohookepencegouformulationb", "NeoHookeanWbMaterial"),
-    "neohookewc": ("edelweissfe.materials.neohooke.neohookepencegouformulationc", "NeoHookeanWcMaterial"),
+    "neohooke": ("edelweissfe.materials.neohooke.neohooke", "NeoHookeanMaterial"),
     "hyperelasticadvanced": (
         "edelweissfe.materials.hyperelasticadvanced.hyperelasticadvanced",
         "HyperelasticAdvancedMaterial",
@@ -45,18 +43,7 @@ _EDELWEISS_MATERIALS = {
         "edelweissfe.materials.hyperelasticadvanced.hyperelasticadvancedi2extended",
         "HyperelasticAdvancedI2ExtendedMaterial",
     ),
-    "neohookewaplastic": (
-        "edelweissfe.materials.neohookeplastic.neohookepencegouformulationaplastic",
-        "NeoHookeanWaPlasticMaterial",
-    ),
-    "neohookewbplastic": (
-        "edelweissfe.materials.neohookeplastic.neohookepencegouformulationbplastic",
-        "NeoHookeanWbPlasticMaterial",
-    ),
-    "neohookewcplastic": (
-        "edelweissfe.materials.neohookeplastic.neohookepencegouformulationcplastic",
-        "NeoHookeanWcPlasticMaterial",
-    ),
+    "neohookeplastic": ("edelweissfe.materials.neohookeplastic.neohookeplastic", "NeoHookeanPlasticMaterial"),
     "hyperplasticadvanced": (
         "edelweissfe.materials.hyperplasticadvanced.hyperplasticadvanced",
         "HyperplasticAdvancedMaterial",

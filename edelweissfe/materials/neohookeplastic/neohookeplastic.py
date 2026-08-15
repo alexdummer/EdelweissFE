@@ -26,8 +26,6 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-from abc import abstractmethod
-
 import numpy as np
 import numpy.linalg as lin
 
@@ -36,6 +34,7 @@ from edelweissfe.utils.exceptions import CutbackRequest
 from edelweissfe.utils.plasticityutils import (
     deviatoric,
     deviatoricNorm,
+    dTensorExp_dA,
     dTensorLog_dA,
     tensorExp,
     tensorLogarithmEig,
@@ -71,12 +70,138 @@ Ieye4D = undoVoigtMatrix(3, np.eye(6))
 dR_dETrial = np.vstack([-np.eye(6), [np.zeros([6])]])
 
 
-class NeoHookeanPenceGouPlasticBaseMaterial(BaseHyperElasticMaterial):
+def _elasticWa(mu, K, Btr, dF, invFold, Bold):
+    """Energy, Kirchhoff stress and elastic tangent for formulation Wa."""
+
+    J = np.sqrt(lin.det(Btr))
+    I1 = np.trace(Btr)
+    invB = lin.inv(Btr)
+    lambdaBar = (K - 2 / 3 * mu) * (J**2 - J) - mu
+    muBar = (K / 2 - mu / 3) * (2 * J**2 - J)
+    T = mu * Btr + lambdaBar * np.eye(3)
+    dB_dF = np.einsum("ik,np,jp,ln->ijkl", Ieye, Bold, dF, invFold) + np.einsum(
+        "io,on,jk,ln->ijkl", dF, Bold, Ieye, invFold
+    )
+    CTauF = mu * dB_dF + muBar * np.einsum("ij,mn,mnkl->ijkl", np.eye(3), invB.T, dB_dF)
+    energy = mu / 2 * (I1 - 3) + (K / 2 - mu / 3) * (J - 1) ** 2 - mu * np.log(J)
+    return (energy, T, CTauF)
+
+
+def _kirchhoffStressWa(mu, K, e):
+    """Kirchhoff stress for formulation Wa."""
+
+    B, _ = tensorExp(2 * e)
+    J = np.sqrt(lin.det(B))
+    muBar = (K - 2 / 3 * mu) * (J**2 - J) - mu
+    T = mu * B + muBar * Ieye
+    return T
+
+
+def _dKirchhoff_dEWa(mu, K, e):
+    """Derivative of the Kirchhoff stress w.r.t. the spatial logarithmic Hencky strain for formulation Wa."""
+
+    B, n = tensorExp(2 * e)
+    J = np.sqrt(lin.det(B))
+    dExpE = np.einsum("ijmn,mnkl->ijkl", dTensorExp_dA(2 * e, n), Ieye4D)
+    return 2 * mu * dExpE + (K - 2 / 3 * mu) * (2 * J**2 - J) * np.einsum("ij,kl->ijkl", Ieye, Ieye)
+
+
+def _elasticWb(mu, K, Btr, dF, invFold, Bold):
+    """Energy, Kirchhoff stress and elastic tangent for formulation Wb."""
+
+    J = np.sqrt(lin.det(Btr))
+    I1 = np.trace(Btr)
+    invB = lin.inv(Btr)
+    lambdaHat = K / 4 * (J**2 + 1 / J**2) + mu * I1 / (9 * J ** (2 / 3))
+    muBar = mu / (3 * J ** (2 / 3))
+    lambdaBar = K / 4 * (J**2 - 1 / J**2) - muBar * I1
+    T = 3 * muBar * Btr + lambdaBar * np.eye(3)
+    dB_dF = np.einsum("ik,np,jp,ln->ijkl", Ieye, Bold, dF, invFold) + np.einsum(
+        "io,on,jk,ln->ijkl", dF, Bold, Ieye, invFold
+    )
+    CTauF = muBar * (
+        -np.einsum("ij,mn,mnkl->ijkl", Btr, invB.T, dB_dF)
+        + 3 * dB_dF
+        - np.einsum("ij,mn,mnkl->ijkl", Ieye, Ieye, dB_dF)
+    ) + lambdaHat * np.einsum("ij,mn,mnkl->ijkl", np.eye(3), invB.T, dB_dF)
+    energy = mu / 2 * (I1 / J ** (2 / 3) - 3) + K / 8 * (J**2 + 1 / J**2 - 2)
+    return (energy, T, CTauF)
+
+
+def _kirchhoffStressWb(mu, K, e):
+    """Kirchhoff stress for formulation Wb."""
+
+    B, _ = tensorExp(2 * e)
+    I1 = B.trace()
+    J = np.sqrt(lin.det(B))
+    muBar = K / 4 * (J**2 - 1 / J**2) - mu * I1 / (3 * J ** (2 / 3))
+    T = mu / J ** (2 / 3) * B + muBar * Ieye
+    return T
+
+
+def _dKirchhoff_dEWb(mu, K, e):
+    """Derivative of the Kirchhoff stress w.r.t. the spatial logarithmic Hencky strain for formulation Wb."""
+
+    B, n = tensorExp(2 * e)
+    J = np.sqrt(lin.det(B))
+    dExpE = np.einsum("ijmn,mnkl->ijkl", dTensorExp_dA(2 * e, n), Ieye4D)
+    I1 = B.trace()
+    p = 2 * mu / J ** (2 / 3)
+    lambdaBar = K / 2 * (J**2 + 1 / J**2) + p * I1 / 9
+    dT_de = (
+        p * dExpE
+        - p / 3 * np.einsum("ij,kl->ijkl", B, Ieye)
+        + lambdaBar * np.einsum("ij,kl->ijkl", Ieye, Ieye)
+        - p / 3 * np.einsum("ij,mn,mnkl->ijkl", Ieye, Ieye, dExpE)
+    )
+    return dT_de
+
+
+def _elasticWc(mu, K, Btr, dF, invFold, Bold):
+    """Energy, Kirchhoff stress and elastic tangent for formulation Wc."""
+
+    J = np.sqrt(lin.det(Btr))
+    I1 = Btr.trace()
+    invB = lin.inv(Btr)
+    muBar = mu * J ** (2 / 3 - K / mu)
+    lambdaBar = (K / mu - 2 / 3) * muBar / 2
+    T = mu * Btr - muBar * np.eye(3)
+    dB_dF = np.einsum("ik,np,jp,ln->ijkl", Ieye, Bold, dF, invFold) + np.einsum(
+        "io,on,jk,ln->ijkl", dF, Bold, Ieye, invFold
+    )
+    CTauF = mu * dB_dF + lambdaBar * np.einsum("ij,mn,mnkl->ijkl", Ieye, invB.T, dB_dF)
+    energy = mu / 2 * (I1 - 3) + 3 * mu**2 / (2 * K - 2 * mu) * (J ** (2 / 3 - K / mu) - 1)
+    return (energy, T, CTauF)
+
+
+def _kirchhoffStressWc(mu, K, e):
+    """Kirchhoff stress for formulation Wc."""
+
+    B, _ = tensorExp(2 * e)
+    muBar = np.exp((2 / 3 - K / mu) * e.trace())
+    T = mu * (B - muBar * Ieye)
+    return T
+
+
+def _dKirchhoff_dEWc(mu, K, e):
+    """Derivative of the Kirchhoff stress w.r.t. the spatial logarithmic Hencky strain for formulation Wc."""
+
+    B, n = tensorExp(2 * e)
+    J = np.sqrt(lin.det(B))
+    dExpE = np.einsum("ijmn,mnkl->ijkl", dTensorExp_dA(2 * e, n), Ieye4D)
+    return 2 * mu * dExpE + (K - 2 / 3 * mu) * J ** (2 / 3 - K / mu) * np.einsum("ij,kl->ijkl", Ieye, Ieye)
+
+
+_FORMULATIONS = {
+    1: (_elasticWa, _kirchhoffStressWa, _dKirchhoff_dEWa),
+    2: (_elasticWb, _kirchhoffStressWb, _dKirchhoff_dEWb),
+    3: (_elasticWc, _kirchhoffStressWc, _dKirchhoff_dEWc),
+}
+
+
+class NeoHookeanPlasticMaterial(BaseHyperElasticMaterial):
     """Shared J2-plasticity return-mapping implementation for the compressible neo-Hookean formulations
     Wa/Wb/Wc according to [1], combined with isotropic hardening.
-
-    Subclasses only need to provide the three law-specific functions ``_energyAndStressAndElasticTangent``,
-    ``_kirchhoffStress`` and ``_dKirchhoff_dE``, implementing their specific energy density function.
 
     [1] Pence, T. J., & Gou, K. (2015). On compressible versions of the incompressible neo-Hookean material.
         Mathematics and Mechanics of Solids, 20(2), 157–182. https://doi.org/10.1177/1081286514544258
@@ -84,7 +209,9 @@ class NeoHookeanPenceGouPlasticBaseMaterial(BaseHyperElasticMaterial):
     Parameters
     ----------
     materialProperties
-        The numpy array containing the material properties for the requested material."""
+        The numpy array containing the material properties for the requested material, in order:
+        formulation selector (1=Wa, 2=Wb, 3=Wc), mu, K, yieldStress, HLin, deltaYieldStress, delta,
+        and optionally the density."""
 
     def getNumberOfRequiredStateVars(self) -> int:
         """Returns number of needed material state Variables per integration point in the material.
@@ -98,14 +225,22 @@ class NeoHookeanPenceGouPlasticBaseMaterial(BaseHyperElasticMaterial):
 
     def __init__(self, materialProperties: np.ndarray):
         self._materialProperties = materialProperties
+        formulation = int(materialProperties[0])
+        if formulation not in _FORMULATIONS:
+            raise Exception(
+                "Unknown Neo-Hookean Pence-Gou formulation selector {:}; must be 1 (Wa), 2 (Wb), or 3 (Wc).".format(
+                    formulation
+                )
+            )
+        self._elasticImpl, self._kirchhoffStressImpl, self._dKirchhoff_dEImpl = _FORMULATIONS[formulation]
         # elasticity parameters
-        self._mu = materialProperties[0]
-        self._K = materialProperties[1]
+        self._mu = materialProperties[1]
+        self._K = materialProperties[2]
         # plasticity parameters
-        self.yieldStress = materialProperties[2]
-        self.HLin = materialProperties[3]
-        self.deltaYieldStress = materialProperties[4]
-        self.delta = materialProperties[5]
+        self.yieldStress = materialProperties[3]
+        self.HLin = materialProperties[4]
+        self.deltaYieldStress = materialProperties[5]
+        self.delta = materialProperties[6]
         # isotropic hardening
         self._fy = (
             lambda kappa_: self.yieldStress
@@ -117,60 +252,17 @@ class NeoHookeanPenceGouPlasticBaseMaterial(BaseHyperElasticMaterial):
         # derivative of fy dKappa
         self._dfy_ddKappa = lambda kappa_: self.HLin + self.deltaYieldStress * self.delta * np.exp(-self.delta * kappa_)
 
-        if len(materialProperties) > 6:
-            self._density = materialProperties[6]
+        if len(materialProperties) > 7:
+            self._density = materialProperties[7]
 
-    @abstractmethod
     def _energyAndStressAndElasticTangent(self, Btr, dF, invFold, Bold):
-        """Compute the energy, the Kirchhoff stress and the elastic tangent.
+        return self._elasticImpl(self._mu, self._K, Btr, dF, invFold, Bold)
 
-        Parameters
-        ----------
-        Btr
-            The trial left Cauchy-Green tensor.
-        dF
-            The change of the deformation gradient since the last step.
-        invFold
-            The inverse of the deformation gradient from the last step.
-        Bold
-            The left Cauchy-Green tensor from the last step.
-
-        Returns
-        -------
-        double
-            The energy density.
-        np.ndarray
-            The Kirchhoff stress.
-        np.ndarray
-            The elastic tangent dKirchhoff/dDeformationGradient."""
-
-    @abstractmethod
     def _kirchhoffStress(self, e):
-        """Compute the Kirchhoff stress.
+        return self._kirchhoffStressImpl(self._mu, self._K, e)
 
-        Parameters
-        ----------
-        e
-            The spatial logarithmic Hencky strain.
-
-        Returns
-        -------
-        np.ndarray
-            The Kirchhoff stress."""
-
-    @abstractmethod
     def _dKirchhoff_dE(self, e):
-        """Compute the derivative of the Kirchhoff stress w.r.t. the spatial logarithmic Hencky strain.
-
-        Parameters
-        ----------
-        e
-            The spatial logarithmic Hencky strain.
-
-        Returns
-        -------
-        np.ndarray
-            The derivative of the Kirchhoff stress w.r.t. the spatial Hencky strain."""
+        return self._dKirchhoff_dEImpl(self._mu, self._K, e)
 
     def assignCurrentStateVars(self, currentStateVars: np.ndarray):
         """Assign new current state vars.
@@ -186,31 +278,6 @@ class NeoHookeanPenceGouPlasticBaseMaterial(BaseHyperElasticMaterial):
         self._ee = np.reshape(currentStateVars[11:], (3, 3))
         if np.all(self._Fold == 0):
             self._Fold[:] = np.eye(3)
-
-    def computePlaneKirchhoff(
-        self,
-        stress: np.ndarray,
-        dStress_dDeformationGradient: np.ndarray,
-        deformationGradient: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a 2D material with plane stress.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dDeformationGradient
-            Matrix containing dStress/dStrain.
-        deformationGradient
-            The deformation gradient at time step t.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        super().computePlaneKirchhoff(stress, dStress_dDeformationGradient, deformationGradient, time, dTime)
 
     def computeKirchhoff(
         self,

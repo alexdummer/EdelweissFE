@@ -79,7 +79,6 @@ class BaseHyperElasticMaterial(ABC):
         currentStateVars
             Array containing the material state vars."""
 
-    @abstractmethod
     def computePlaneKirchhoff(
         self,
         stress: np.ndarray,
