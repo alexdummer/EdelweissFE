@@ -67,7 +67,6 @@ class BaseHypoElasticMaterial(ABC):
         currentStateVars
             Array containing the material state vars."""
 
-    @abstractmethod
     def computePlaneStress(
         self,
         stress: np.ndarray,
