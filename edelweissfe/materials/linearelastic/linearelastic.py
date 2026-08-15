@@ -61,27 +61,13 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         self._v = materialProperties[1]  # set v
         if len(materialProperties) > 2:
             self._density = materialProperties[2]
-
-    def elasticityMatrixPlaneStress(self) -> np.ndarray:
-        """Initalize a 2D plane stress material elasticity matrix.
-
-        Returns
-        -------
-        np.ndarray
-            The elasticity matrix."""
-        # elasticity matrix for plane stress
-        Ei = self._E / (1 - self._v**2) * np.array([[1, self._v, 0], [self._v, 1, 0], [0, 0, (1 - self._v) / 2]])
-        return Ei
-
-    def elasticityMatrix(self) -> np.ndarray:
-        """Initalize a 3D material elasticity matrix.
-
-        Returns
-        -------
-        np.ndarray
-            The elasticity matrix."""
-        # 3D elasticity matrix for Hexa8/Hexa20
-        Ei = (
+        # E and v are immutable for the lifetime of this instance (ChangeMaterialProperty
+        # constructs a new material instance rather than mutating an existing one), so the
+        # elasticity matrices only need to be assembled once.
+        self._EiPlaneStress = (
+            self._E / (1 - self._v**2) * np.array([[1, self._v, 0], [self._v, 1, 0], [0, 0, (1 - self._v) / 2]])
+        )
+        self._Ei = (
             self._E
             / ((1 + self._v) * (1 - 2 * self._v))
             * np.array(
@@ -95,7 +81,26 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
                 ]
             )
         )
-        return Ei
+
+    def elasticityMatrixPlaneStress(self) -> np.ndarray:
+        """The 2D plane stress material elasticity matrix.
+
+        Returns
+        -------
+        np.ndarray
+            The elasticity matrix."""
+
+        return self._EiPlaneStress
+
+    def elasticityMatrix(self) -> np.ndarray:
+        """The 3D material elasticity matrix.
+
+        Returns
+        -------
+        np.ndarray
+            The elasticity matrix."""
+
+        return self._Ei
 
     def assignCurrentStateVars(self, currentStateVars: np.ndarray):
         """Assign new current state vars.
@@ -128,7 +133,7 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         dTime
             Current time step size."""
 
-        Ei = self.elasticityMatrixPlaneStress()
+        Ei = self._EiPlaneStress
         index = [0, 1, 3]
         dStress_dStrain[:] = Ei
         stress[index] += Ei @ dStrain[index]
@@ -157,7 +162,7 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         dTime
             Current time step size."""
 
-        Ei = self.elasticityMatrix()
+        Ei = self._Ei
         dStress_dStrain[:] = Ei
         stress += Ei @ dStrain
 

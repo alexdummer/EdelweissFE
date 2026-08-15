@@ -120,8 +120,12 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         # derivative of fy dKappa
         self._dfy_ddKappa = lambda kappa_: self.HLin + self.deltaYieldStress * self.delta * np.exp(-self.delta * kappa_)
         self._G = self._E / (2 * (1.0 + self._v))
+        # E and v are immutable for the lifetime of this instance (ChangeMaterialProperty
+        # constructs a new material instance rather than mutating an existing one), so the
+        # elasticity matrix only needs to be assembled once.
+        self._Ei = self._computeElasticityMatrix()
 
-    def elasticityMatrix(self) -> np.ndarray:
+    def _computeElasticityMatrix(self) -> np.ndarray:
         """Initalize a 3D material elasticity matrix.
 
         Returns
@@ -145,6 +149,16 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
             )
         )
         return Ei
+
+    def elasticityMatrix(self) -> np.ndarray:
+        """The 3D material elasticity matrix.
+
+        Returns
+        -------
+        np.ndarray
+            The elasticity matrix."""
+
+        return self._Ei
 
     def assignCurrentStateVars(self, currentStateVars: np.ndarray):
         """Assign new current state vars.
@@ -179,7 +193,7 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         dTime
             Current time step size."""
 
-        Ei = self.elasticityMatrix()
+        Ei = self._Ei
         # handle zero strain increment
         if np.linalg.norm(dStrain) < 10**-14:
             dStress_dStrain[:] = Ei
