@@ -73,27 +73,6 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         Ei = self._E / (1 - self._v**2) * np.array([[1, self._v, 0], [self._v, 1, 0], [0, 0, (1 - self._v) / 2]])
         return Ei
 
-    def elasticityMatrix2D(self) -> np.ndarray:
-        """Initalize a 2D plane strain material elasticity matrix.
-
-        Returns
-        -------
-        np.ndarray
-            The elasticity matrix."""
-        # Ei = elasticity matrix for plane strain for element i (mostly the case for rectangular elements)
-        Ei = (
-            (self._E * (1 - self._v))
-            / ((1 + self._v) * (1 - 2 * self._v))
-            * np.array(
-                [
-                    [1, self._v / (1 - self._v), 0],
-                    [self._v / (1 - self._v), 1, 0],
-                    [0, 0, (1 - 2 * self._v) / (2 * (1 - self._v))],
-                ]
-            )
-        )
-        return Ei
-
     def elasticityMatrix(self) -> np.ndarray:
         """Initalize a 3D material elasticity matrix.
 
@@ -155,35 +134,6 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         stress[index] += Ei @ dStrain[index]
         dStrain[2] = -self._v / (1 - self._v) * (dStrain[0] + dStrain[1])  # dStrain33 for plane stress
 
-    def computeStress2D(
-        self,
-        stress: np.ndarray,
-        dStress_dStrain: np.ndarray,
-        dStrain: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a 2D material with plane strain.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dStrain
-            Matrix containing dStress/dStrain.
-        dStrain
-            Strain vector increment at time step t to t+dTime.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        Ei = self.elasticityMatrix2D()
-        index = [0, 1, 3]
-        dStress_dStrain[:] = Ei
-        stress[index] += Ei @ dStrain[index]
-        stress[2] = self._v * (stress[0] + stress[1])  # stress33 for plane strain
-
     def computeStress(
         self,
         stress: np.ndarray,
@@ -211,42 +161,6 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         dStress_dStrain[:] = Ei
         stress += Ei @ dStrain
 
-    def computeUniaxialStress(
-        self,
-        stress: np.ndarray,
-        dStress_dStrain: np.ndarray,
-        dStrain: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a uniaxial stress state.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dStrain
-            Matrix containing dStress/dStrain.
-        dStrain
-            Strain vector increment at time step t to t+dTime.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        raise Exception("Computing uniaxial stress is not possible with this material.")
-
-    def getDensity(self) -> float:
-        """Get the density of the material.
-
-        Returns
-        -------
-        float
-            The density of the material."""
-        if not hasattr(self, "_density"):
-            raise Exception("Density is not defined for this material.")
-        return self._density
-
     def getResult(self, result: str) -> float:
         """Get the result, as a persistent view which is continiously
         updated by the material.
@@ -261,3 +175,5 @@ class LinearElasticMaterial(BaseHypoElasticMaterial):
         float
             The result.
         """
+
+        raise Exception("This result doesn't exist for the current material.")

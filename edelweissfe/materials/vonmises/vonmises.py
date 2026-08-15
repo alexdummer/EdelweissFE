@@ -156,31 +156,6 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
 
         self.kappaOld = currentStateVars
 
-    def computePlaneStress(
-        self,
-        stress: np.ndarray,
-        dStress_dStrain: np.ndarray,
-        dStrain: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a plane stress material.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dStrain
-            Matrix containing dStress/dStrain.
-        dStrain
-            Strain vector increment at time step t to t+dTime.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        super().computePlaneStress(stress, dStress_dStrain, dStrain, time, dTime)
-
     def computeStress(
         self,
         stress: np.ndarray,
@@ -250,42 +225,6 @@ class VonMisesMaterial(BaseHypoElasticMaterial):
         else:  # elastic step
             stress[:] = trialStress
             dStress_dStrain[:] = Ei
-
-    def computeUniaxialStress(
-        self,
-        stress: np.ndarray,
-        dStress_dStrain: np.ndarray,
-        dStrain: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a uniaxial stress state.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dStrain
-            Matrix containing dStress/dStrain.
-        dStrain
-            Strain vector increment at time step t to t+dTime.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        raise Exception("Computing uniaxial stress is not possible with this material.")
-
-    def getDensity(self) -> float:
-        """Get the density of the material.
-
-        Returns
-        -------
-        float
-            The density of the material."""
-        if not hasattr(self, "_density"):
-            raise Exception("Density is not defined for this material.")
-        return self._density
 
     def getResult(self, result: str) -> float:
         """Get the result, as a persistent view which is continiously
