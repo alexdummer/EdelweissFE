@@ -153,7 +153,6 @@ class BaseHypoElasticMaterial(ABC):
         dTime
             Current time step size."""
 
-    @abstractmethod
     def computeUniaxialStress(
         self,
         stress: np.ndarray,
@@ -177,7 +176,8 @@ class BaseHypoElasticMaterial(ABC):
         dTime
             Current time step size."""
 
-    @abstractmethod
+        raise Exception("Computing uniaxial stress is not possible with this material.")
+
     def getDensity(self) -> float:
         """Determines the density of the material.
 
@@ -185,6 +185,10 @@ class BaseHypoElasticMaterial(ABC):
         -------
         float
             The density of the material."""
+
+        if not hasattr(self, "_density"):
+            raise Exception("Density is not defined for this material.")
+        return self._density
 
     @abstractmethod
     def getResult(self, result: str) -> float:

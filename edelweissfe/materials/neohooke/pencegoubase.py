@@ -27,16 +27,13 @@
 #  ---------------------------------------------------------------------
 
 import numpy as np
-import numpy.linalg as lin
 
-from edelweissfe.materials.neohooke.pencegoubase import NeoHookeanPenceGouBaseMaterial
-from edelweissfe.utils.voigtnotation import doVoigtStress
+from edelweissfe.materials.base.basehyperelasticmaterial import BaseHyperElasticMaterial
 
 
-class NeoHookeanWaMaterial(NeoHookeanPenceGouBaseMaterial):
-    """Neo-Hookean Wa material according to [1] with the following energy density function.
-
-    W_a (I1, J) = mu/2 * (I1 - 3) + (K/2 - mu/3)(J - 1)² - mu ln(J).
+class NeoHookeanPenceGouBaseMaterial(BaseHyperElasticMaterial):
+    """Shared implementation for the compressible neo-Hookean formulations Wa/Wb/Wc according to [1].
+    Subclasses only need to provide ``computeKirchhoff``, implementing their specific energy density function.
 
     [1] Pence, T. J., & Gou, K. (2015). On compressible versions of the incompressible neo-Hookean material.
         Mathematics and Mechanics of Solids, 20(2), 157–182. https://doi.org/10.1177/1081286514544258
@@ -46,7 +43,35 @@ class NeoHookeanWaMaterial(NeoHookeanPenceGouBaseMaterial):
     materialProperties
         The numpy array containing the material properties for the requested material."""
 
-    def computeKirchhoff(
+    def getNumberOfRequiredStateVars(self) -> int:
+        """Returns number of needed material state Variables per integration point in the material.
+
+        Returns
+        -------
+        int
+            Number of needed material state Vars."""
+
+        return 1
+
+    def __init__(self, materialProperties: np.ndarray):
+        self._materialProperties = materialProperties
+        # elasticity parameters
+        self._mu = materialProperties[0]
+        self._K = materialProperties[1]
+        if len(materialProperties) > 2:
+            self._density = materialProperties[2]
+
+    def assignCurrentStateVars(self, currentStateVars: np.ndarray):
+        """Assign new current state vars.
+
+        Parameters
+        ----------
+        currentStateVars
+            Array containing the material state vars."""
+
+        self._energy = currentStateVars
+
+    def computePlaneKirchhoff(
         self,
         stress: np.ndarray,
         dStress_dDeformationGradient: np.ndarray,
@@ -54,7 +79,7 @@ class NeoHookeanWaMaterial(NeoHookeanPenceGouBaseMaterial):
         time: float,
         dTime: float,
     ):
-        """Computes the stresses for a 3D material/2D material with plane strain.
+        """Computes the stresses for a 2D material with plane stress.
 
         Parameters
         ----------
@@ -69,15 +94,24 @@ class NeoHookeanWaMaterial(NeoHookeanPenceGouBaseMaterial):
         dTime
             Current time step size."""
 
-        F = deformationGradient
-        invF = lin.inv(F)  # inverse
-        B = F @ F.T  # left Cauchy-Green tensor
-        J = lin.det(F)
-        I1 = np.trace(B)
-        lambdaBar = (self._K - 2 / 3 * self._mu) * (J**2 - J) - self._mu
-        muBar = (self._K - 2 / 3 * self._mu) * (2 * J**2 - J)
-        stress[:] = doVoigtStress(3, self._mu * B + lambdaBar * np.eye(3))
-        dStress_dDeformationGradient[:] = self._mu * (
-            np.einsum("ik,jl->ijkl", np.eye(3), F) + np.einsum("il,jk->ijkl", F, np.eye(3))
-        ) + muBar * np.einsum("ij,lk->ijkl", np.eye(3), invF)
-        self._energy[0] = self._mu / 2 * (I1 - 3) + (self._K / 2 - self._mu / 3) * (J - 1) ** 2 - self._mu * np.log(J)
+        super().computePlaneKirchhoff(stress, dStress_dDeformationGradient, deformationGradient, time, dTime)
+
+    def getResult(self, result: str) -> float:
+        """Get the result, as a persistent view which is continiously
+        updated by the material.
+
+        Parameters
+        ----------
+        result
+            The name of the result.
+
+        Returns
+        -------
+        float
+            The result.
+        """
+
+        if result == "energy":
+            return self._energy
+        else:
+            raise Exception("This result doesn't exist for the current material.")

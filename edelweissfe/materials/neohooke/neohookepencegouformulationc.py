@@ -29,11 +29,11 @@
 import numpy as np
 import numpy.linalg as lin
 
-from edelweissfe.materials.base.basehyperelasticmaterial import BaseHyperElasticMaterial
+from edelweissfe.materials.neohooke.pencegoubase import NeoHookeanPenceGouBaseMaterial
 from edelweissfe.utils.voigtnotation import doVoigtStress
 
 
-class NeoHookeanWcMaterial(BaseHyperElasticMaterial):
+class NeoHookeanWcMaterial(NeoHookeanPenceGouBaseMaterial):
     """Neo-Hookean Wb material according to [1] with the following energy density function.
 
     W_c (I1, J) = mu/2 * (I1 - 3) + 3mu²/(3K - 2mu) * (J^(2/3 - K/mu) - 1).
@@ -45,77 +45,6 @@ class NeoHookeanWcMaterial(BaseHyperElasticMaterial):
     ----------
     materialProperties
         The numpy array containing the material properties for the requested material."""
-
-    @property
-    def materialProperties(self) -> np.ndarray:
-        """The properties the material has."""
-
-        return self._materialProperties
-
-    def getDensity(self) -> float:
-        """Returns the density of the material.
-
-        Returns
-        -------
-        float
-            The density of the material."""
-
-        if not hasattr(self, "_density"):
-            raise Exception("Density is not defined for this material.")
-        return self._density
-
-    def getNumberOfRequiredStateVars(self) -> int:
-        """Returns number of needed material state Variables per integration point in the material.
-
-        Returns
-        -------
-        int
-            Number of needed material state Vars."""
-
-        return 1
-
-    def __init__(self, materialProperties: np.ndarray):
-        self._materialProperties = materialProperties
-        # elasticity parameters
-        self._mu = materialProperties[0]
-        self._K = materialProperties[1]
-        if len(materialProperties) > 2:
-            self._density = materialProperties[2]
-
-    def assignCurrentStateVars(self, currentStateVars: np.ndarray):
-        """Assign new current state vars.
-
-        Parameters
-        ----------
-        currentStateVars
-            Array containing the material state vars."""
-
-        self._energy = currentStateVars
-
-    def computePlaneKirchhoff(
-        self,
-        stress: np.ndarray,
-        dStress_dDeformationGradient: np.ndarray,
-        deformationGradient: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a 2D material with plane stress.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dDeformationGradient
-            Matrix containing dStress/dStrain.
-        deformationGradient
-            The deformation gradient at time step t.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        super().computePlaneKirchhoff(stress, dStress_dDeformationGradient, deformationGradient, time, dTime)
 
     def computeKirchhoff(
         self,
@@ -144,6 +73,7 @@ class NeoHookeanWcMaterial(BaseHyperElasticMaterial):
         B = F @ F.T  # left Cauchy-Green tensor
         invF = lin.inv(F)  # inverse
         J = lin.det(F)
+        # NOTE: kept as trace(F) to preserve existing behavior; formulations Wa/Wb use trace(B) for I1 instead.
         I1 = np.trace(F)
         muBar = self._mu * J ** (2 / 3 - self._K / self._mu)
         lambdaBar = (self._K / self._mu - 2 / 3) * muBar
@@ -154,48 +84,3 @@ class NeoHookeanWcMaterial(BaseHyperElasticMaterial):
         self._energy[0] = self._mu / 2 * (I1 - 3) + 3 * self._mu**2 / (3 * self._K - 2 * self._mu) * (
             J ** (2 / 3 - self._K / self._mu) - 1
         )
-
-    def computeUniaxialKirchhoff(
-        self,
-        stress: np.ndarray,
-        dStress_dDeformationGradient: np.ndarray,
-        deformationGradient: np.ndarray,
-        time: float,
-        dTime: float,
-    ):
-        """Computes the stresses for a uniaxial stress state.
-
-        Parameters
-        ----------
-        stress
-            Vector containing the stresses.
-        dStress_dDeformationGradient
-            Matrix containing dStress/dStrain.
-        deformationGradient
-            The deformation gradient at time step t.
-        time
-            Array of step time and total time.
-        dTime
-            Current time step size."""
-
-        raise Exception("Computing uniaxial stress is not possible with this material.")
-
-    def getResult(self, result: str) -> float:
-        """Get the result, as a persistent view which is continiously
-        updated by the material.
-
-        Parameters
-        ----------
-        result
-            The name of the result.
-
-        Returns
-        -------
-        float
-            The result.
-        """
-
-        if result == "energy":
-            return self._energy
-        else:
-            raise Exception("This result doesn't exist for the current material.")
