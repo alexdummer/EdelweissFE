@@ -126,6 +126,14 @@ def createFieldOutputFromInputFile(inputfile: dict, model: FEModel, journal: Jou
                         f"result={definition['result']!r}."
                     )
 
+                if definition["rigidBody"] not in model.rigidBodies:
+                    raise Exception(
+                        f"During parsing of keyword {keywordIdentifier}fieldOutput "
+                        f"({moduleLevelKeywordIdentifier}perNode) '{definition['name']}': rigidBody "
+                        f"'{definition['rigidBody']}' is not defined. Available rigid bodies: "
+                        f"{list(model.rigidBodies.keys())}."
+                    )
+
                 fieldOutputController.addRigidBodyFieldOutput(
                     name=definition["name"],
                     rigidBody=model.rigidBodies[definition["rigidBody"]],
@@ -246,6 +254,12 @@ def fillFEModelFromInputFile(model: FEModel, inputfile: dict, journal: Journal) 
         module = inputLanguage["modelGenerator"].getModule(generatorType)
 
         args, kwargs = module.parseDatalines(data)
+
+        # raw code lines must not be comma-split -- same special case as in the
+        # executeAfterManualGeneration loop below, which previously was the only place with it
+        # (executePythonCode was broken in this phase)
+        if strCaseCmp(module.name, "executePythoncode"):
+            args = data
 
         model = getGeneratorFunction(generatorType)(generatorDefinition, model, journal, *args, **kwargs)
 

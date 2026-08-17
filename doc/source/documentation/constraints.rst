@@ -226,6 +226,31 @@ comments of the ``applyConstraint`` method in the module source.
     :language: edelweiss
     :caption: Example: ``testfiles/edelweiss-only/NodeToDiscreteRigidBodyContact/test.inp``
 
+``nodetodeformablesurfacepenalty`` - Node-to-deformable-surface contact
+-------------------------------------------------------------------------
+
+The complete theory of this constraint -- surface discretization and triangulation, tributary
+areas, finite- and small-sliding gap kinematics, penalty and augmented-Lagrange normal laws,
+Coulomb friction with consistent tangents, solver integration, and the verification methodology
+-- is documented in :doc:`contacttheory`.
+
+Module ``edelweissfe.constraints.nodetodeformablesurfacepenalty``
+
+.. automodule:: edelweissfe.constraints.nodetodeformablesurfacepenalty
+    :members: __doc__
+
+.. pprint:: edelweissfe.constraints.nodetodeformablesurfacepenalty.documentation
+    :caption: Options:
+
+.. literalinclude:: ../../../testfiles/edelweiss-only/NodeToDeformableSurfaceContact/test.inp
+    :language: edelweiss
+    :caption: Example: ``testfiles/edelweiss-only/NodeToDeformableSurfaceContact/test.inp``
+
+.. literalinclude:: ../../../testfiles/edelweiss-only/NodeToDeformableSurfaceContactFrictionHexa20/test.inp
+    :language: edelweiss
+    :caption: Example (small sliding, Coulomb friction, hexa20 midside triangulation):
+              ``testfiles/edelweiss-only/NodeToDeformableSurfaceContactFrictionHexa20/test.inp``
+
 Implementing your own constraints
 ---------------------------------
 

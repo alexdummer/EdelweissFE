@@ -405,6 +405,7 @@ from edelweissfe.generators.pipegen import inputLanguage  # noqa: F811,E402
 from edelweissfe.generators.planerectquad import inputLanguage  # noqa: F811,E402
 from edelweissfe.generators.cuboidlatticegenerator import inputLanguage  # noqa: F811,E402
 from edelweissfe.generators.discreterigidbodygenerator import inputLanguage  # noqa: F811,E402
+from edelweissfe.generators.surfaceelementgenerator import inputLanguage  # noqa: F811,E402
 
 # isort: on
 
@@ -425,6 +426,7 @@ from edelweissfe.constraints.rigidbody import inputLanguage  # noqa: F811,E402
 from edelweissfe.constraints.directionalspringpenalty import inputLanguage  # noqa: F811,E402
 from edelweissfe.constraints.nodetorigidsurfacepenalty import inputLanguage  # noqa: F811,E402
 from edelweissfe.constraints.nodetodiscreterigidbodypenalty import inputLanguage  # noqa: F811,E402
+from edelweissfe.constraints.nodetodeformablesurfacepenalty import inputLanguage  # noqa: F811,E402
 
 # isort: on
 
