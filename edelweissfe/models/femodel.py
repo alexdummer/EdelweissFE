@@ -67,6 +67,7 @@ class FEModel:
         self.surfaces = {}  #: Surface definitions in the model.
         self.constraints = {}  #: Constraints in the model.
         self.constraintSets = {}  #: ConstraintsSets in the model.
+        self.multiPointConstraints = {}  #: Multi-point (DOF-elimination) constraints in the model.
         self.materials = {}  #: Materials in the model.
         self.analyticalFields = {}  #: AnalyticalFields in the model.
         self.scalarVariables = {}  #: ScalarVariables in the model.
@@ -267,6 +268,9 @@ class FEModel:
         for constraint in self.constraints.values():
             constraint.acceptLastState()
 
+        for mpc in self.multiPointConstraints.values():
+            mpc.acceptLastState()
+
     def writeRestart(self, restartFile: h5py.File):
         """Write the current state of the model to a restart file.
 
@@ -354,6 +358,12 @@ def printPrettyModelSummary(model: FEModel, journal: Journal):
     if model.constraints:
         journal.message(
             " {:<20}{:<15}".format("constraints: ", len(model.constraints)),
+            identification,
+            0,
+        )
+    if model.multiPointConstraints:
+        journal.message(
+            " {:<20}{:<15}".format("multi-point constraints: ", len(model.multiPointConstraints)),
             identification,
             0,
         )

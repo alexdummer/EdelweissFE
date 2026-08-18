@@ -48,6 +48,9 @@ from edelweissfe.config.constraints import getConstraintClass
 from edelweissfe.config.elementlibrary import getElementClass
 from edelweissfe.config.materiallibrary import getMaterialClass
 from edelweissfe.config.sections import getSectionFactoryByName
+from edelweissfe.constraints.base.multipointconstraintbase import (
+    MultiPointConstraintBase,
+)
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.points.node import Node
 from edelweissfe.sets.elementset import ElementSet
@@ -335,7 +338,18 @@ class AbqModelConstructor:
             The updated model tree.
         """
 
-        for definition in inputFile["constraint"]:
+        # Multi-point / geometric-adjustment constraints (e.g. Tie with adjust=True) are
+        # instantiated first so that any in-place reference coordinate adjustments take effect
+        # before subsequent constraints (e.g. penalty contact) cache reference nodal coordinates
+        # by value. Order within each category is preserved.
+        def isMPCDefinition(definition):
+            constraintType = CaseInsensitiveDict(definition)["type"]
+            return issubclass(getConstraintClass(constraintType), MultiPointConstraintBase)
+
+        mpcDefinitions = [d for d in inputFile["constraint"] if isMPCDefinition(d)]
+        ordinaryDefinitions = [d for d in inputFile["constraint"] if not isMPCDefinition(d)]
+
+        for definition in mpcDefinitions + ordinaryDefinitions:
             constraintKwArgs = CaseInsensitiveDict(definition.copy())
 
             name = constraintKwArgs.pop("name")
@@ -346,8 +360,15 @@ class AbqModelConstructor:
 
             args, kwargs = module.parseDatalines(data)
 
-            constraint = getConstraintClass(constraintType)(name, model, self.journal, **kwargs)
-            model.constraints[name] = constraint
+            constraintClass = getConstraintClass(constraintType)
+            constraint = constraintClass(name, model, self.journal, **kwargs)
+
+            # Multi-point (DOF-elimination) constraints contribute nothing to the load vector or
+            # system matrix and must stay outside the DofManager/assembly machinery.
+            if issubclass(constraintClass, MultiPointConstraintBase):
+                model.multiPointConstraints[name] = constraint
+            else:
+                model.constraints[name] = constraint
 
         return model
 

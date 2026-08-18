@@ -163,6 +163,8 @@ class NEST(NIST):
 
     identification = "NESTSolver"
 
+    supportsMPC = False
+
     SolverSpecificOptions = {
         "runge-kutta-stages": 2,
         "runge-kutta-error-tolerance": 1e-3,
@@ -199,6 +201,8 @@ class NEST(NIST):
         fieldOutputController
             The field output controller.
         """
+
+        self.validateModelCapabilities(model)
 
         for constraintName, constraint in model.constraints.items():
             if type(constraint).updateConnectivity is not ConstraintBase.updateConnectivity:

@@ -79,6 +79,8 @@ class NIST(NonlinearSolverBase):
 
     identification = "NISTSolver"
 
+    supportsMPC = True
+
     SolverSpecificOptions = {
         "defaultMaxIter": 10,
         "defaultCriticalIter": 5,
@@ -149,9 +151,12 @@ class NIST(NonlinearSolverBase):
         # inherits ConstraintBase's no-op default), this is unconditionally built exactly once, on
         # the first increment -- identical to the previous behavior.
         self.theDofManager = None
+        self.mpcTransformation = None
         U = dU = P = K = None
 
         prevTimeStep = None
+
+        self.validateModelCapabilities(model)
 
         self.applyStepActionsAtStepStart(model, step.actions)
 
@@ -205,6 +210,9 @@ class NIST(NonlinearSolverBase):
 
                     for variable in model.scalarVariables.values():
                         U[self.theDofManager.idcsOfScalarVariablesInDofVector[variable]] = variable.value
+
+                    self.mpcTransformation = self.buildMPCTransformation(model)
+                    self.checkMPCDirichletConflicts(self.mpcTransformation, step.actions)
 
                     # The old dU/prevTimeStep no longer match the (possibly new) DOF layout, so
                     # suppress extrapolation for this one increment -- the same fallback already
@@ -427,6 +435,12 @@ class NIST(NonlinearSolverBase):
             R[:] = -P
             R += PExt
 
+            # Condense the residual BEFORE the Dirichlet handling below: T^T folds slave-row
+            # residuals into their master rows, which may themselves carry a prescribed delta --
+            # transforming afterwards would corrupt it.
+            if self.mpcTransformation is not None:
+                R[:] = self.mpcTransformation.transformResidual(R, dU)
+
             # --- Impose the Dirichlet (prescribed-value) boundary conditions ---
             # Row-replacement method: for each constrained DOF i we overwrite its
             # row of the linearized system  K ddU = R  so that the linear solve
@@ -463,6 +477,10 @@ class NIST(NonlinearSolverBase):
                     raise ReachedMaxIterations("Reached max. iterations in current increment, cutting back")
 
             K_ = self.assembleStiffnessCSR(K)
+
+            if self.mpcTransformation is not None:
+                K_ = self.mpcTransformation.transformSystemMatrix(K_)
+
             K_ = self.applyDirichletToStiffness(K_, dirichlets)  # zero rows, unit diagonal
 
             ddU = self.linearSolve(K_, R)
@@ -566,7 +584,32 @@ class NIST(NonlinearSolverBase):
 
     @performancetiming.timeit("dirichlet K on CSR")
     def applyDirichletToStiffness(self, K: csr_matrix, dirichlets: list[StepActionBase]) -> csr_matrix:
-        return applyDirichletToStiffness(K, dirichlets)
+        K = applyDirichletToStiffness(K, dirichlets)
+
+        # Compacting the just-zeroed entries out of K is a storage/performance concern,
+        # not part of applying the boundary condition -- and whether it's even safe
+        # depends on K's identity, which only the assembler/solver side knows:
+        #
+        # - No MPC transformation: K is self.csrGenerator's own persistent CSR matrix,
+        #   returned by reference (assembleStiffnessCSR/updateInPlace) and reused, in
+        #   place, every Newton iteration. eliminate_zeros() would shrink/compact its
+        #   data/indices arrays -- but the generator's C++ core scatters fresh values
+        #   into the ORIGINAL, full-length buffer on every subsequent update via a fixed
+        #   assembly map computed once at construction. After a shrink, that buffer and
+        #   the (now compacted) K.indices/K.indptr disagree about which stored slot
+        #   belongs to which (row, col) -- silently misaligned values from the next
+        #   iteration on. Must NOT eliminate.
+        # - MPC transformation active (hanging nodes / ties): K is the freshly computed,
+        #   disposable T^T @ K @ T + C from mpcTransformation.transformSystemMatrix,
+        #   independent of the generator's buffer and discarded after this solve.
+        #   Eliminating here is always safe, and PARDISO's reordering on these more
+        #   poorly conditioned, path-dependent (contact/friction) condensed systems is
+        #   sensitive enough to the extra explicit-zero structural entries to visibly
+        #   drift from the converged reference path if they are kept.
+        if self.mpcTransformation is not None:
+            K.eliminate_zeros()
+
+        return K
 
     @performancetiming.timeit("elements")
     def computeElements(

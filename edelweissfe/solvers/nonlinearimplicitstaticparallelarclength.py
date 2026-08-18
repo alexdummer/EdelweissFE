@@ -56,6 +56,8 @@ kw.addOptionalArg("stopCondition", "", str, None)
 class NISTPArcLength(NISTParallel):
     identification = "NISTPArcLength"
 
+    supportsMPC = False
+
     def __init__(self, jobInfo, journal, **kwargs):
         self.Lambda = 0.0
         self.dLambda = 0.0
@@ -70,6 +72,8 @@ class NISTPArcLength(NISTParallel):
         fieldOutputController: FieldOutputController,
         outputmanagers: dict[str, OutputManagerBase],
     ):
+        self.validateModelCapabilities(model)
+
         self.arcLengthController = None
         self.checkConditionalStop = lambda: False
 
