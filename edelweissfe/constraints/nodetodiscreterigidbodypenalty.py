@@ -26,15 +26,11 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-"""
-A penalty based unilateral contact constraint between a node set of ordinary FE nodes and the
-surface of a :class:`~edelweissfe.rigidbodies.discreterigidbody.DiscreteRigidBody`.
-"""
-
 import numpy as np
 
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
 from edelweissfe.models.femodel import FEModel
+from edelweissfe.models.meshdependent import MeshDependent
 from edelweissfe.rigidbodies.discreterigidbody import DiscreteRigidBody
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.caseinsensitivedict import CaseInsensitiveDict
@@ -43,6 +39,19 @@ from edelweissfe.utils.misc import (
     caseInsensitiveKwargsChecker,
     castKwargsValuesAndAddDefaults,
 )
+
+"""
+A penalty based unilateral contact constraint between a node set of ordinary FE nodes and the
+surface of a :class:`~edelweissfe.rigidbodies.discreterigidbody.DiscreteRigidBody`.
+
+This constraint is a :class:`~edelweissfe.models.meshdependent.MeshDependent`: if an AMR refinement
+(e.g. :mod:`~edelweissfe.modelmodifiers.adaptivity.hadaptivity`) adds nodes to the watched slave
+``nSet`` (a boundary reaching into a refined region), the new nodes are picked up and protected from
+penetrating the rigid body at the constraint's own next :meth:`updateConnectivity` tick -- no
+separate wiring needed. There is no per-slave history to preserve across the rebuild (unlike the
+deformable-surface/tie facet constraints): every quantity is recomputed fresh from the current
+geometry every Newton iteration.
+"""
 
 module = Module(
     "nodeToDiscreteRigidBodyPenalty",
@@ -158,7 +167,7 @@ class DiscreteRigidBodyContactStiffnessView:
             self.K_rpp.append(rpp)
 
 
-class Constraint(ConstraintBase):
+class Constraint(ConstraintBase, MeshDependent):
     """
     Penalty based unilateral contact between a slave node set and a discrete rigid body.
 
@@ -238,8 +247,9 @@ class Constraint(ConstraintBase):
         self.rigidBody = model.rigidBodies[kwargs["rigidBody"]]
         self.rpNode = self.rigidBody.rpNode
 
+        self._nSetName = kwargs["nSet"]
         rigidBodyNodes = set(self.rigidBody.surfaceNodes) | {self.rpNode}
-        slaveNodesRequested = model.nodeSets[kwargs["nSet"]]
+        slaveNodesRequested = model.nodeSets[self._nSetName]
         if any(node in rigidBodyNodes for node in slaveNodesRequested):
             raise ValueError(
                 f"nSet '{kwargs['nSet']}' for constraint '{name}' contains nodes belonging to rigid body "
@@ -247,7 +257,6 @@ class Constraint(ConstraintBase):
                 "field variables and cannot be slave nodes. Exclude them from the node set."
             )
         self.slaveNodes = list(slaveNodesRequested)
-        self.nSlaves = len(self.slaveNodes)
 
         self.penalty = kwargs["penalty"]
         self.type = kwargs["type"].lower()
@@ -259,6 +268,15 @@ class Constraint(ConstraintBase):
         self.nRot = 3
         self.rprpDof = self.nDim + self.nRot
 
+        self._lastSeenTopologyVersion = model.topologyVersion
+        self._rebuildFromSlaveNodes()
+
+        self.totalNormalForce = 0.0
+
+    def _rebuildFromSlaveNodes(self) -> None:
+        """(Re)derive every quantity that depends on the slave node list/count."""
+
+        self.nSlaves = len(self.slaveNodes)
         self._referenceCoords = np.array([n.coordinates for n in self.slaveNodes])
 
         self._nodes = self.slaveNodes + [self.rpNode]
@@ -273,7 +291,17 @@ class Constraint(ConstraintBase):
         )
         self._indicesOfRPInLocal = self._indicesOfRPDispInLocal + self._indicesOfRPRotInLocal
 
-        self.totalNormalForce = 0.0
+    def reconcile(self, model: FEModel, change) -> bool:
+        """Refresh the slave node list from the (possibly grown) watched ``nSet``."""
+
+        if not change.touchesNodeSet(self._nSetName):
+            return False
+        self.slaveNodes = list(model.nodeSets[self._nSetName])
+        self._rebuildFromSlaveNodes()
+        return True
+
+    def updateConnectivity(self, model: FEModel) -> bool:
+        return self.reconcileIfChanged(model)
 
     @property
     def nodes(self) -> list:

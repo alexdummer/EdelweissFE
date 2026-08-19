@@ -27,11 +27,15 @@
 #  ---------------------------------------------------------------------
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 from edelweissfe.constraints.base.multipointconstraintbase import (
     MultiPointConstraintBase,
 )
+from edelweissfe.generators.surfaceelementgenerator import buildContactFacets
+from edelweissfe.journal.journal import Journal
 from edelweissfe.models.femodel import FEModel
+from edelweissfe.models.meshdependent import MeshDependent
 from edelweissfe.sets.nodeset import NodeSet
 from edelweissfe.utils.caseinsensitivedict import CaseInsensitiveDict
 from edelweissfe.utils.facetcontactgeometry import line2ClosestPoint, tria3ClosestPoint
@@ -53,6 +57,18 @@ and every displacement component of the slave node is constrained to the identic
 master interpolation. The constraint is enforced exactly -- no penalty parameter, no Lagrange
 multiplier DOFs -- and adds zero stiffness, which in particular leaves the critical time step of
 explicit dynamics untouched.
+
+This constraint is a :class:`~edelweissfe.models.meshdependent.MeshDependent`: if either surface's
+source solid elements are refined mid-run (e.g. by :mod:`~edelweissfe.modelmodifiers.adaptivity.
+hadaptivity`), it regenerates that side's facets and re-projects the tied records -- no separate
+wiring needed. Unlike the penalty contact constraint, a tie has no per-increment tick of its own
+that runs *before* the DofManager/system matrix is rebuilt (its only hook,
+:meth:`getMultiPointConstraints`, is called from inside that rebuild -- too late to safely swap in
+freshly regenerated facet elements), so it reconciles via the model's push notification instead,
+synchronously as part of the mesh-mutating modifier's own call. The re-projection never re-adjusts
+slave node coordinates regardless of the ``adjust`` setting: that snap is a setup-time convenience
+for removing an initial geometric gap, not something to repeat on an already-loaded, already-tied
+node.
 """
 
 module = Module(
@@ -156,7 +172,7 @@ def _facetCharacteristicSize(facetCoords: np.ndarray) -> float:
     return np.mean(edgeLengths)
 
 
-class Constraint(MultiPointConstraintBase):
+class Constraint(MultiPointConstraintBase, MeshDependent):
     """
     An Abaqus-style surface-to-surface tie constraint via master-slave DOF elimination.
 
@@ -191,8 +207,19 @@ class Constraint(MultiPointConstraintBase):
         self.name = name
         self.nDim = model.domainSize
 
-        slaveFacetElements = list(model.elementSets[kwargs["slaveSurface"]])
-        masterFacetElements = list(model.elementSets[kwargs["masterSurface"]])
+        self._journal = Journal()
+        self._slaveSurfaceSetName = kwargs["slaveSurface"]
+        self._masterSurfaceSetName = kwargs["masterSurface"]
+        self._positionTolerance = kwargs["positionTolerance"]
+        self._positionToleranceFactor = kwargs["positionToleranceFactor"]
+        self._adjustTolerance = kwargs["adjustTolerance"]
+        #: References to the published tied/untied NodeSets, so a later reconcile() updates their
+        #: membership in place (via replaceMembers) instead of colliding with its own earlier publish.
+        self._tiedNodeSet = None
+        self._untiedNodeSet = None
+
+        slaveFacetElements = list(model.elementSets[self._slaveSurfaceSetName])
+        masterFacetElements = list(model.elementSets[self._masterSurfaceSetName])
 
         if not masterFacetElements:
             raise ValueError(
@@ -203,83 +230,215 @@ class Constraint(MultiPointConstraintBase):
                 f"Constraint '{name}': slave surface '{kwargs['slaveSurface']}' contains no facet elements."
             )
 
-        # the tied points are the unique nodes of the slave surface, in first-seen order
-        slaveNodes = list(dict.fromkeys(node for el in slaveFacetElements for node in el.nodes))
-
         masterNodes = {node for el in masterFacetElements for node in el.nodes}
-        if not masterNodes.isdisjoint(slaveNodes):
+        slaveNodesForCheck = {node for el in slaveFacetElements for node in el.nodes}
+        if not masterNodes.isdisjoint(slaveNodesForCheck):
             raise ValueError(
                 f"Constraint '{name}': slave surface '{kwargs['slaveSurface']}' and master surface "
                 f"'{kwargs['masterSurface']}' share nodes -- a node cannot be tied to itself."
             )
 
-        positionTolerance = kwargs["positionTolerance"]
-        positionToleranceFactor = kwargs["positionToleranceFactor"]
-        adjust = strtobool(kwargs["adjust"])
-        adjustTolerance = kwargs["adjustTolerance"]
+        # Frozen ONCE from the INITIAL (pre-any-AMR) master surface, not recomputed on every
+        # reconcile(): computing it fresh from whatever the master surface's mean facet size happens
+        # to be at reconcile time is unsafe under AMR -- a node evaluated after an unrelated
+        # refinement has already shrunk that mean would get an artificially tight tolerance unrelated
+        # to its actual (unchanged) gap.
+        if self._positionTolerance is not None:
+            self._membershipTolerance = self._positionTolerance
+        else:
+            initialMasterFacetCoords = [np.array([n.coordinates for n in el.nodes]) for el in masterFacetElements]
+            self._membershipTolerance = self._positionToleranceFactor * np.mean(
+                [_facetCharacteristicSize(c) for c in initialMasterFacetCoords]
+            )
+
+        self.tiedRecords, self.untiedSlaveNodes = self._buildTiedRecords(
+            model, slaveFacetElements, masterFacetElements, adjust=strtobool(kwargs["adjust"])
+        )
+        self._publishTiedUntiedNodeSets(model)
+
+        # A tie has no per-increment tick of its own that runs before the DofManager/VIJSystemMatrix
+        # rebuild -- getMultiPointConstraints() is only called from inside that rebuild, too late to
+        # safely swap in newly regenerated facet elements (the just-built system wouldn't know about
+        # them). So, unlike nodeToDeformableSurfacePenalty, a tie reconciles via the push escape
+        # hatch: model.notifyModelChanged() calls onModelChanged() synchronously, from inside the
+        # model modifier's own updateModel(), strictly before the rebuild decision is even made.
+        model.registerObserver(self)
+
+    def onModelChanged(self, model: FEModel, changeType, change) -> None:
+        if change is not None:
+            self.reconcile(model, change)
+
+    def _buildTiedRecords(self, model: FEModel, slaveFacetElements, masterFacetElements, adjust: bool):
+        """Project every unique slave-surface node onto its closest master facet (reference
+        configuration) and freeze the resulting clamped weights. With ``adjust``, additionally snap
+        each tied node onto its projected point (only if also within ``adjustTolerance``), removing
+        any initial geometric gap -- a setup-time convenience, never applied on a reconcile-triggered
+        re-projection.
+
+        Tie MEMBERSHIP (is this node tied at all) is independent of adjust (does a tied node get
+        snapped) -- these are separate decisions, see the ``adjust`` option's docstring. A single
+        tolerance, frozen once at construction from the INITIAL (pre-any-AMR) master surface's
+        characteristic facet size unless given explicitly, is used for every slave node regardless of
+        when it is evaluated (matching Abaqus' *TIE, which always enforces some tolerance -- explicit
+        or internally computed -- and never ties unconditionally regardless of distance). It is
+        deliberately NOT recomputed from ``masterFacetElements`` on a later reconcile() call: an
+        unrelated AMR refinement elsewhere on the master surface would otherwise shrink the mean facet
+        size and retroactively tighten the tolerance for nodes evaluated afterwards, for a gap that
+        never changed.
+
+        Slave nodes already claimed as slaves by another multi-point constraint of the model are
+        skipped: a DOF may be condensed out only once, and a second record for it would be rejected
+        by the condensation operator. Dropping the tie record is exact, not a silencer -- the typical
+        case is a hanging node created by adaptive refinement of the slave surface, whose masters are
+        the coarse-trace nodes of that very surface and are themselves tied, so its interpolated
+        motion already is the tied motion and the tie equation is redundant."""
+
+        slaveNodes = list(dict.fromkeys(node for el in slaveFacetElements for node in el.nodes))
+
+        alreadyClaimedNodes = set()
+        for constraint in model.multiPointConstraints.values():
+            if constraint is not self:
+                alreadyClaimedNodes |= constraint.claimedSlaveNodes()
 
         closestPointFunction = tria3ClosestPoint if self.nDim == 3 else line2ClosestPoint
         masterFacetCoords = [np.array([n.coordinates for n in el.nodes]) for el in masterFacetElements]
 
-        # Tie MEMBERSHIP (is this node tied at all) is independent of adjust (does a tied node get
-        # snapped) -- these are separate decisions, see the adjust arg's docstring. A single
-        # tolerance, computed once from the whole master surface's characteristic facet size, is
-        # used for every slave node (matching Abaqus' *TIE, which always enforces some tolerance --
-        # explicit or internally computed -- and never ties unconditionally regardless of distance).
-        membershipTolerance = (
-            positionTolerance
-            if positionTolerance is not None
-            else positionToleranceFactor * np.mean([_facetCharacteristicSize(c) for c in masterFacetCoords])
-        )
+        # Frozen at construction (see __init__) -- NOT recomputed from the current (possibly
+        # AMR-refined, and therefore shrunk) masterFacetCoords passed in here on a reconcile() call.
+        membershipTolerance = self._membershipTolerance
 
-        #: Tied records: (slaveNode, masterNodes of the assigned facet, frozen weights).
-        self.tiedRecords = []
-        #: Slave nodes beyond positionTolerance (explicit or computed default), left untied.
-        self.untiedSlaveNodes = []
+        # Projecting every slave node onto its closest master facet by brute force is O(nSlave *
+        # nMaster) and, on a large tied surface re-projected after every AMR refinement, dominates
+        # the whole refinement step. Index the master facets by centroid in a k-d tree instead and,
+        # per slave node, run the exact closest-point test only on the facets that could possibly win.
+        # The candidate set is a *superset* of the brute-force winner (see maxFacetRadius below), and
+        # iterating it in ascending facet order with a strict "<" reproduces the brute-force choice
+        # exactly (same first-of-equals tie-break) -- so this is an acceleration, not an approximation.
+        if masterFacetCoords:
+            centroids = np.array([coords.mean(axis=0) for coords in masterFacetCoords])
+            facetTree = cKDTree(centroids)
+            # The farthest any facet vertex sits from that facet's own centroid. If a facet's true
+            # closest point beats a known distance d, its centroid lies within d + maxFacetRadius of
+            # the slave node (triangle inequality), so a ball query of that radius, seeded with the
+            # exact distance to the nearest-centroid facet (an upper bound on the global minimum),
+            # is guaranteed to include the brute-force winner.
+            maxFacetRadius = max(
+                float(np.linalg.norm(coords - coords.mean(axis=0), axis=1).max()) for coords in masterFacetCoords
+            )
+
+        tiedRecords = []
+        untiedSlaveNodes = []
+        nSkippedClaimedNodes = 0
 
         for slaveNode in slaveNodes:
+            if slaveNode in alreadyClaimedNodes:
+                nSkippedClaimedNodes += 1
+                continue
+
             bestWeights = None
             bestFacetIdx = None
             bestDistance = np.inf
 
-            for facetIdx, facetCoords in enumerate(masterFacetCoords):
-                weights, distance = closestPointFunction(slaveNode.coordinates, *facetCoords)
-                if distance < bestDistance:
-                    bestDistance = distance
-                    bestWeights = weights
-                    bestFacetIdx = facetIdx
+            if masterFacetCoords:
+                xs = slaveNode.coordinates
+                _, seedIdx = facetTree.query(xs, k=1)
+                _, seedDistance = closestPointFunction(xs, *masterFacetCoords[int(seedIdx)])
+                candidates = set(facetTree.query_ball_point(xs, seedDistance + maxFacetRadius))
+                candidates.add(int(seedIdx))
+                for facetIdx in sorted(candidates):
+                    weights, distance = closestPointFunction(xs, *masterFacetCoords[facetIdx])
+                    if distance < bestDistance:
+                        bestDistance = distance
+                        bestWeights = weights
+                        bestFacetIdx = facetIdx
 
             if bestFacetIdx is None or bestDistance > membershipTolerance:
-                self.untiedSlaveNodes.append(slaveNode)
+                untiedSlaveNodes.append(slaveNode)
                 continue
 
             # Snapping is the separate, independent decision: a tied node is only snapped if adjust
             # is requested AND (when given) its distance is also within adjustTolerance -- a node
             # beyond adjustTolerance stays tied, just not snapped, preserving its gap exactly.
-            withinAdjustTolerance = adjustTolerance is None or bestDistance <= adjustTolerance
+            withinAdjustTolerance = self._adjustTolerance is None or bestDistance <= self._adjustTolerance
             if adjust and withinAdjustTolerance and bestDistance > 0.0:
                 slaveNode.coordinates[:] = bestWeights @ masterFacetCoords[bestFacetIdx]
 
-            self.tiedRecords.append((slaveNode, masterFacetElements[bestFacetIdx].nodes, bestWeights))
+            tiedRecords.append((slaveNode, masterFacetElements[bestFacetIdx].nodes, bestWeights))
 
-        # Exposed as ordinary node sets so the tied/untied split is directly inspectable -- e.g. via
-        # *fieldOutput, or for free in Ensight, which automatically creates a part for every node
-        # set in the model (edelweissfe/outputmanagers/ensight.py's _createGeometryParts), no
-        # fieldOutput required just to see where these nodes are. A set with no members is left
-        # unpublished rather than published empty: Ensight's export is unconditional over every
-        # node set, so a tie whose untied side is (as is typical) always empty would otherwise get
-        # its own empty, useless part in every export.
+        if nSkippedClaimedNodes:
+            self._journal.message(
+                "{:} slave node(s) are already slaves of another multi-point constraint "
+                "(e.g. hanging nodes); their redundant tie records were dropped".format(nSkippedClaimedNodes),
+                self.name,
+            )
+
+        return tiedRecords, untiedSlaveNodes
+
+    def _publishTiedUntiedNodeSets(self, model: FEModel):
+        """Expose the tied/untied slave nodes as ordinary node sets -- e.g. via *fieldOutput, or for
+        free in Ensight, which automatically creates a part for every node set in the model
+        (edelweissfe/outputmanagers/ensight.py's _createGeometryParts), no fieldOutput required just
+        to see where these nodes are. A set with no members is left unpublished rather than published
+        empty: Ensight's export is unconditional over every node set, so a tie whose untied side is
+        (as is typical) always empty would otherwise get its own empty, useless part in every export.
+
+        Called again after every :meth:`reconcile` (AMR may change which nodes are tied/untied): an
+        already-published set is updated in place via :meth:`~edelweissfe.sets.orderedset.OrderedSet.
+        replaceMembers` rather than recreated, so a reference elsewhere in the model keeps seeing
+        current membership, and the "does this name already exist" collision check below only ever
+        fires against a genuinely foreign set."""
+
         tiedNodes = [record[0] for record in self.tiedRecords]
         if tiedNodes:
-            tiedSetName = f"{name}_tied"
-            if tiedSetName in model.nodeSets:
-                raise ValueError(f"Constraint '{name}': node set '{tiedSetName}' already exists in the model.")
-            model.nodeSets[tiedSetName] = NodeSet(tiedSetName, tiedNodes)
+            if self._tiedNodeSet is not None:
+                self._tiedNodeSet.replaceMembers(tiedNodes)
+            else:
+                tiedSetName = f"{self.name}_tied"
+                if tiedSetName in model.nodeSets:
+                    raise ValueError(f"Constraint '{self.name}': node set '{tiedSetName}' already exists in the model.")
+                self._tiedNodeSet = model.nodeSets[tiedSetName] = NodeSet(tiedSetName, tiedNodes)
         if self.untiedSlaveNodes:
-            untiedSetName = f"{name}_untied"
-            if untiedSetName in model.nodeSets:
-                raise ValueError(f"Constraint '{name}': node set '{untiedSetName}' already exists in the model.")
-            model.nodeSets[untiedSetName] = NodeSet(untiedSetName, self.untiedSlaveNodes)
+            if self._untiedNodeSet is not None:
+                self._untiedNodeSet.replaceMembers(self.untiedSlaveNodes)
+            else:
+                untiedSetName = f"{self.name}_untied"
+                if untiedSetName in model.nodeSets:
+                    raise ValueError(
+                        f"Constraint '{self.name}': node set '{untiedSetName}' already exists in the model."
+                    )
+                self._untiedNodeSet = model.nodeSets[untiedSetName] = NodeSet(untiedSetName, self.untiedSlaveNodes)
+
+    def reconcile(self, model: FEModel, change) -> bool:
+        """Regenerate whichever side's facets were affected by ``change`` (via its recorded
+        :attr:`~edelweissfe.models.femodel.FEModel.contactFacetRecipes`) and re-project the tied
+        records from scratch against the rebuilt surfaces -- never adjusting coordinates, since the
+        tied nodes are already loaded mid-run."""
+
+        slaveRecipe = model.contactFacetRecipes.get(self._slaveSurfaceSetName)
+        masterRecipe = model.contactFacetRecipes.get(self._masterSurfaceSetName)
+        touchedSlave = slaveRecipe is not None and change.touchesSurface(slaveRecipe[0])
+        touchedMaster = masterRecipe is not None and change.touchesSurface(masterRecipe[0])
+        if not (touchedSlave or touchedMaster):
+            return False
+
+        if touchedSlave:
+            buildContactFacets(model, *slaveRecipe, self._journal)
+        if touchedMaster:
+            buildContactFacets(model, *masterRecipe, self._journal)
+
+        slaveFacetElements = list(model.elementSets[self._slaveSurfaceSetName])
+        masterFacetElements = list(model.elementSets[self._masterSurfaceSetName])
+        self.tiedRecords, self.untiedSlaveNodes = self._buildTiedRecords(
+            model, slaveFacetElements, masterFacetElements, adjust=False
+        )
+        self._publishTiedUntiedNodeSets(model)
+        return True
+
+    def claimedSlaveNodes(self) -> set:
+        """The tied slave nodes of this constraint. Overrides the base implementation, since a tie
+        keeps its records in :attr:`tiedRecords` rather than in the base class' ``_records``."""
+
+        return {slaveNode for slaveNode, _, _ in self.tiedRecords}
 
     def getMultiPointConstraints(self, dofManager) -> list[tuple[int, list[tuple[int, float]]]]:
         fieldVariableIndices = dofManager.idcsOfFieldVariablesInDofVector

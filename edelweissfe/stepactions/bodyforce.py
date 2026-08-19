@@ -65,7 +65,8 @@ class StepAction(BodyLoadBase):
     def __init__(self, name, action, jobInfo, model, fieldOutputController, journal):
         self._name = name
         self._forceAtStepStart = 0.0
-        self._elSet = model.elementSets[action["elSet"]]
+        self._elSetName = action["elSet"]
+        self._elSet = model.elementSets[self._elSetName]
         load = np.fromstring(action["forceVector"], sep=",", dtype=np.double)
 
         if len(load) < model.domainSize:

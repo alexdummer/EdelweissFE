@@ -334,6 +334,23 @@ cdef class MarmotElementWrapper:
 
         self._stateVars[:] = self._stateVarsTemp
 
+    def getStateVars(self):
+        """Return a copy of the converged quadrature-point state-variable buffer."""
+
+        return np.asarray(self._stateVars).copy()
+
+    def setStateVars(self, double[::1] values):
+        """Overwrite the converged and trial state-variable buffers in place (so the MarmotElement's
+        assigned pointer to the trial buffer stays valid). Used by adaptive refinement to transfer
+        history to child elements."""
+
+        if values.shape[0] != self._stateVars.shape[0]:
+            raise ValueError(
+                "setStateVars: expected {:} state variables, got {:}".format(
+                    self._stateVars.shape[0], values.shape[0]))
+        self._stateVars[:] = values
+        self._stateVarsTemp[:] = values
+
     def resetToLastValidState(self, ):
         """Reset to the last valid state."""
 
@@ -356,6 +373,22 @@ cdef class MarmotElementWrapper:
         cdef StateView res = self.marmotElement.getStateView(result, quadraturePoint)
 
         return <double[:res.stateSize]> (res.stateLocation)
+
+    def getStateVarSlice(self, name):
+        """Locate a named state variable within one per-quadrature-point state block.
+
+        Returns the (offset, size) of the named variable relative to the start of a per-quadrature-
+        point block, computed from the pointer the MarmotElement hands out for quadrature point 0.
+        Used by adaptive refinement to route different state variables to different transfer
+        strategies (copy / project / reset)."""
+
+        if not self._hasMaterial:
+            raise Exception("Element {:} has no material assigned!".format(self._elNumber))
+
+        cdef string name_ = name.encode("UTF-8")
+        cdef StateView res = self.marmotElement.getStateView(name_, 0)
+        cdef Py_ssize_t offset = res.stateLocation - &self._stateVarsTemp[0]
+        return int(offset), int(res.stateSize)
 
     def getCoordinatesAtCenter(self):
         """Compute the underlying MarmotElement centroid coordinates."""

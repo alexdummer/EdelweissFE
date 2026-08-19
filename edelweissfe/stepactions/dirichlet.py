@@ -113,8 +113,21 @@ class StepAction(DirichletBase):
         self.possibleComponents = [str(i + 1) for i in range(self.fieldSize)]
 
         self._components = None
+        self._journal = journal
+        self._model = model
 
         self.updateStepAction(action, jobInfo, model, fieldOutputController, journal)
+
+    def _reconcileIfSetChanged(self):
+        """Re-size the prescribed values if the node set was mutated in-place (e.g. AMR adding new
+        boundary nodes) since the last check. Preserve the active/inactive flag: updateStepAction
+        unconditionally activates, but a BC deactivated at a prior step end must stay inactive --
+        otherwise a refinement in a later step would silently revive it. The node set itself needs
+        no re-fetch: it has stable identity (mutated in place), so ``self.nSet`` is already current."""
+        if self._checkSetChanged(self.nSet):
+            wasActive = self.active
+            self.updateStepAction(self.action, None, self._model, None, self._journal)
+            self.active = wasActive
 
     @property
     def components(
@@ -128,6 +141,7 @@ class StepAction(DirichletBase):
     def updateStepAction(self, action, jobInfo, model, fieldOutputController, journal):
         self.active = True
 
+        self._checkSetChanged(self.nSet)
         self.action = action
 
         if action["components"] is not None:
@@ -154,6 +168,7 @@ class StepAction(DirichletBase):
         self.amplitude = self._getAmplitude(action)
 
     def getPrescribedIncrement(self, timeStep: TimeStep):
+        self._reconcileIfSetChanged()
         if self.active:
             return self.delta * (
                 self.amplitude(timeStep.stepProgress)

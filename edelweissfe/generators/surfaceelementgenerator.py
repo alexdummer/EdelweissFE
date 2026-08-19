@@ -38,6 +38,12 @@ face-consistent per-node tributary area shares for the pressure-weighted contact
 See the :doc:`contact theory documentation </documentation/contacttheory>` for the full
 background.
 
+The underlying :func:`buildContactFacets` is idempotent and re-runnable, so a
+:class:`~edelweissfe.models.meshdependent.MeshDependent` consumer of these facets (e.g.
+:mod:`~edelweissfe.constraints.nodetodeformablesurfacepenalty`) can regenerate them from the
+current ``*surface`` definition after the source solid elements change underneath it (e.g. an AMR
+refinement) as well as at setup time; the recipe is recorded in ``model.contactFacetRecipes``.
+
 .. code-block:: edelweiss
     :caption: Example
 
@@ -192,31 +198,39 @@ def _assignQuadConsistentShares(quadFacets: list):
         facet.setNodalAreaShares([quadArea / 4.0 / facetsOfNode[node] for node in facet.nodes])
 
 
-@caseInsensitiveKwargsChecker([kw.name for kw in module.requiredArgs], [kw.name for kw in module.optionalArgs])
-@castKwargsValuesAndAddDefaults(module)
-def generateModelData(generatorDefinition: dict, model: FEModel, journal, *args, **kwargs) -> FEModel:
-    """Generate contact facet elements from an existing ``*surface`` definition.
+def buildContactFacets(model: FEModel, surfaceName: str, prefix: str, triangulation: str, journal) -> tuple[str, str]:
+    """(Re)generate the flat contact facet elements tiling ``surfaceName`` under ``prefix``.
+
+    Idempotent: any facets a previous call under the same ``prefix`` created are removed first, so
+    this can be re-run after ``surfaceName`` changes underneath it (e.g. an AMR refinement of the
+    solid elements it tiles -- the model's ``surfaces`` entry is kept in sync with the refined child
+    faces by the modifier, see :mod:`~edelweissfe.modelmodifiers.adaptivity.hadaptivity`) as well as
+    at setup time. The recipe (``surfaceName``, ``prefix``, ``triangulation``) is recorded in
+    ``model.contactFacetRecipes`` keyed by the generated facet element set name, so a
+    :class:`~edelweissfe.models.meshdependent.MeshDependent` consumer of these facets can find its
+    way back to the source surface it needs to watch via
+    :meth:`~edelweissfe.models.femodel.FEModel.changesSince`.
 
     Parameters
     ----------
-    generatorDefinition
-        The generator definition dict.
     model
         The model tree.
+    surfaceName
+        The name of an existing ``*surface`` definition.
+    prefix
+        The prefix for the generated element/node sets.
+    triangulation
+        The facet triangulation of higher-order element faces: 'corner' or 'midside'.
     journal
         The journal instance.
 
     Returns
     -------
-    FEModel
-        The updated model tree.
+    tuple[str, str]
+        The generated ``(facetsSetName, nodesSetName)``.
     """
 
-    kwargs = CaseInsensitiveDict(kwargs)
-
-    surfaceName = kwargs["surface"]
-    prefix = kwargs["name"]
-    triangulation = kwargs["triangulation"].lower()
+    triangulation = triangulation.lower()
     if triangulation not in ("corner", "midside"):
         raise ValueError(
             f"surfaceElementGenerator: triangulation '{triangulation}' is not supported. Use 'corner' or 'midside'."
@@ -224,6 +238,13 @@ def generateModelData(generatorDefinition: dict, model: FEModel, journal, *args,
 
     if surfaceName not in model.surfaces:
         raise ValueError(f"surfaceElementGenerator: surface '{surfaceName}' is not defined.")
+
+    facetsSetName = f"{prefix}_facets"
+    nodesSetName = f"{prefix}_nodes"
+
+    # remove any facets a previous call under this prefix created, so re-running is idempotent
+    for staleFacet in model.elementSets.get(facetsSetName, []):
+        model.elements.pop(staleFacet.elNumber, None)
 
     surfaceDef = model.surfaces[surfaceName]
 
@@ -297,8 +318,22 @@ def generateModelData(generatorDefinition: dict, model: FEModel, journal, *args,
 
     model.elements.update(newElements)
 
-    facetsSetName = f"{prefix}_facets"
-    model.elementSets[facetsSetName] = ElementSet(facetsSetName, list(newElements.values()))
+    # this function is the one that mutates model.elements outside the mesh modifier (removing the
+    # stale facets above and inserting newElements here), so model.elementSets["all"] must be
+    # resynced here to mirror model.elements -- otherwise "all" keeps dangling references to the
+    # popped stale facets and misses the new ones for the rest of the refinement window.
+    if "all" in model.elementSets:
+        model.elementSets["all"].replaceMembers(list(model.elements.values()))
+
+    # stable identity across rebuilds (mutate in place rather than replace under the same key), like
+    # every other AMR-mutated topological container -- a consumer that merely caches
+    # model.elementSets[facetsSetName]/model.nodeSets[nodesSetName] (e.g. a fromExpression
+    # FieldOutput reading a contact constraint's per-facet-node result) would otherwise keep
+    # referencing the pre-rebuild object and silently go stale/size-mismatched on the next rebuild.
+    if facetsSetName in model.elementSets:
+        model.elementSets[facetsSetName].replaceMembers(list(newElements.values()))
+    else:
+        model.elementSets[facetsSetName] = ElementSet(facetsSetName, list(newElements.values()))
 
     seenNodes = set()
     facetNodesInOrder = []
@@ -308,8 +343,11 @@ def generateModelData(generatorDefinition: dict, model: FEModel, journal, *args,
                 seenNodes.add(node)
                 facetNodesInOrder.append(node)
 
-    nodesSetName = f"{prefix}_nodes"
-    model.nodeSets[nodesSetName] = NodeSet(nodesSetName, facetNodesInOrder)
+    if nodesSetName in model.nodeSets:
+        model.nodeSets[nodesSetName].replaceMembers(facetNodesInOrder)
+    else:
+        model.nodeSets[nodesSetName] = NodeSet(nodesSetName, facetNodesInOrder)
+    model.contactFacetRecipes[facetsSetName] = (surfaceName, prefix, triangulation)
 
     journal.message(
         f"generated {len(newElements)} contact facet element(s) from surface '{surfaceName}' "
@@ -318,4 +356,29 @@ def generateModelData(generatorDefinition: dict, model: FEModel, journal, *args,
         1,
     )
 
+    return facetsSetName, nodesSetName
+
+
+@caseInsensitiveKwargsChecker([kw.name for kw in module.requiredArgs], [kw.name for kw in module.optionalArgs])
+@castKwargsValuesAndAddDefaults(module)
+def generateModelData(generatorDefinition: dict, model: FEModel, journal, *args, **kwargs) -> FEModel:
+    """Generate contact facet elements from an existing ``*surface`` definition.
+
+    Parameters
+    ----------
+    generatorDefinition
+        The generator definition dict.
+    model
+        The model tree.
+    journal
+        The journal instance.
+
+    Returns
+    -------
+    FEModel
+        The updated model tree.
+    """
+
+    kwargs = CaseInsensitiveDict(kwargs)
+    buildContactFacets(model, kwargs["surface"], kwargs["name"], kwargs["triangulation"], journal)
     return model

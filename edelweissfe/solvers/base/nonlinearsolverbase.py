@@ -60,6 +60,11 @@ class NonlinearSolverBase(ABC):
     #: (e.g. surface ties). Subclasses supporting MPCs must set this to True.
     supportsMPC = False
 
+    #: Whether this solver polls model.modelModifiers (e.g. h-adaptivity) every increment.
+    #: Subclasses that call modifier.updateModel(...) in their solveStep loop must set this
+    #: to True; without it, a modifier silently never runs and the model never adapts.
+    supportsModelModifiers = False
+
     #: The active multi-point-constraint (hanging node / tie) condensation, if any -- None
     #: whenever there are no multi-point constraints in the model. Lets
     #: applyDirichletToStiffness tell an MPC-transformed (fresh, disposable) system matrix
@@ -84,7 +89,12 @@ class NonlinearSolverBase(ABC):
                 f"Multi-point constraints (e.g. surface ties) are not supported by the {self.identification} solver."
             )
 
-    def _updateOptions(self, updatedOptions: dict, journal):
+        if model.modelModifiers and not self.supportsModelModifiers:
+            raise NotImplementedError(
+                f"Model modifiers (e.g. h-adaptivity) are not supported by the {self.identification} solver."
+            )
+
+    def _updateOptions(self, updatedOptions: dict, journal, strict: bool = False):
         """Update options of the solver using a string dict
 
         Parameters
@@ -93,14 +103,31 @@ class NonlinearSolverBase(ABC):
             The options dictionary.
         journal
             The journal module.
+        strict
+            If True, an unrecognised option raises an AttributeError instead of being ignored. Use it
+            for option sources which are exclusively owned by this solver (i.e. the datalines of the
+            *solver keyword), such that typos are not silently swallowed.
         """
 
+        # Input keywords arrive case-folded (the parser lowercases option keys), while the option
+        # names in SolverSpecificOptions are camelCase -- match them case-insensitively via their
+        # canonical spelling. A >>options block carries the UNION of every solver's options (they all
+        # register on the same 'options' keyword) plus routing/meta keys ('category', 'inputFile',
+        # 'datalines'), so keys not belonging to this solver are silently skipped rather than rejected.
+        canonicalByLower = {key.lower(): key for key in self.SolverSpecificOptions}
         for k, v in updatedOptions.items():
-            if k in self.SolverSpecificOptions:
-                journal.message("Updating option {:}={:}".format(k, v), self.identification)
-                self.options[k] = type(self.SolverSpecificOptions[k])(updatedOptions[k])
+            canonicalKey = canonicalByLower.get(k.lower())
+            if canonicalKey is None:
+                if strict:
+                    raise AttributeError("Invalid option {:} for {:}".format(k, self.identification))
+                continue
+            journal.message("Updating option {:}={:}".format(canonicalKey, v), self.identification)
+            defaultValue = self.SolverSpecificOptions[canonicalKey]
+            if isinstance(defaultValue, bool):
+                # bool("False") is truthy, so parse the string explicitly rather than via bool(...)
+                self.options[canonicalKey] = str(v).strip().lower() in ("true", "1", "yes", "on")
             else:
-                raise AttributeError("Invalid option {:} for {:}".format(k, self.identification))
+                self.options[canonicalKey] = type(defaultValue)(v)
 
     @abstractmethod
     def solveStep(self, *args):

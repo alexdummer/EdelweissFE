@@ -87,7 +87,8 @@ class StepAction(DistributedLoadBase):
     def __init__(self, name, action, jobInfo, model, fieldOutputController, journal):
         self._name = name
         self._magnitudeAtStepStart = 0.0
-        self._surface = model.surfaces[action["surface"]]
+        self._surfaceName = action["surface"]
+        self._surface = model.surfaces[self._surfaceName]
         self._loadType = action["type"]
         magnitude = np.fromstring(action["magnitude"], sep=",")
 

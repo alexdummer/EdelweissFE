@@ -162,7 +162,9 @@ class _FieldOutputBase:
         self,
     ) -> np.ndarray:
         """Get the history.
-        Throws an exception if the history is not stored.
+        Throws an exception if the history is not stored, or if the stored entries do not all
+        share the same shape (e.g. because the mesh changed under adaptive refinement, in which
+        case a rectangular per-node history is not well-defined).
 
         Returns
         -------
@@ -174,6 +176,17 @@ class _FieldOutputBase:
             raise Exception(
                 "fieldOutput {:} does not save any history; please define it with saveHistory=True!".format(self.name)
             )
+
+        if self.result:
+            firstShape = np.shape(self.result[0])
+            if any(np.shape(r) != firstShape for r in self.result):
+                raise Exception(
+                    "fieldOutput {:} has a per-node/per-element history with varying shapes across "
+                    "increments (e.g. due to adaptive mesh refinement); a rectangular history is not "
+                    "well-defined. Use a reducing f(x) (as in examples/WinklerL_AMR/test_amr.inp) "
+                    "instead of saveHistory=True in this case.".format(self.name)
+                )
+
         return np.asarray(self.result)
 
     def getTimeHistory(
@@ -212,6 +225,31 @@ class _FieldOutputBase:
         else:
             self.result = result
 
+    def _resultTableForExport(self) -> np.ndarray:
+        """Assemble the result table that ``f_export`` is applied to.
+
+        Normally this is the whole stored history, so that a table-wide ``f_export`` such as
+        ``x[:,:,1]`` sees the increment axis it expects. Under adaptive mesh refinement the
+        per-increment shape changes, and the history as a whole is no longer representable as a
+        single rectangular array; in that case only the last increment is tabulated, as a table
+        of one row. This keeps the dimensionality (and hence ``f_export``) valid while exporting
+        the current increment, which is all ``writeLastResult`` consumes.
+
+        Returns
+        -------
+        np.ndarray
+            The result table, with the increment as leading axis.
+        """
+
+        if not self.appendResults:
+            return np.asarray(self.result)
+
+        lastShape = np.shape(self.result[-1])
+        if any(np.shape(entry) != lastShape for entry in self.result):
+            return np.asarray(self.result[-1:])
+
+        return np.asarray(self.result)
+
     def writeLastResult(self):
         """Update file output.
 
@@ -220,7 +258,7 @@ class _FieldOutputBase:
         model
             The model tree.
         """
-        res = np.asarray(self.result)
+        res = self._resultTableForExport()
         if self.f_export:
             res = self.f_export(res)
 
@@ -354,7 +392,7 @@ class NodeFieldOutput(_FieldOutputBase):
         fExport_x: Callable = None,
     ):
         self.entry = result
-
+        self.fieldName = nodeField.name
         self._nodeField = nodeField
         self.associatedSet = nodeField.associatedSet
 
@@ -487,11 +525,23 @@ class ElementFieldOutput(_FieldOutputBase):
         self.resultName = resultName
         self.quadraturePoints = quadraturePoints
 
+        self._seenSetVersion = elSet._version
         self.elementResultCollector = ElementResultCollector(
             list(self.associatedSet), self.quadraturePoints, self.resultName
         )
 
         super().__init__(name, model, journal, saveHistory, f_x, export, fExport_x)
+
+    def _rebuildCollectorIfSetChanged(self):
+        """Rebuild the element result collector -- which pins a fixed snapshot of the element
+        list at construction -- if the associated ElementSet was mutated in-place (e.g. AMR
+        replacing a refined parent element with its children) since the last check. Unlike a plain
+        iteration over the set, this pinned snapshot does not see new elements on its own."""
+        if self.associatedSet._version != self._seenSetVersion:
+            self.elementResultCollector = ElementResultCollector(
+                list(self.associatedSet), self.quadraturePoints, self.resultName
+            )
+            self._seenSetVersion = self.associatedSet._version
 
     def updateResults(self, model: FEModel):
         """Update the field output.
@@ -503,6 +553,7 @@ class ElementFieldOutput(_FieldOutputBase):
             The model tree.
         """
 
+        self._rebuildCollectorIfSetChanged()
         result = self.elementResultCollector.getCurrentResults()
 
         super()._applyResultsPipleline(result)
@@ -519,6 +570,7 @@ class ElementFieldOutput(_FieldOutputBase):
         if self.f:
             raise Exception("cannot set field output for modified results (f(x) != None) !")
 
+        self._rebuildCollectorIfSetChanged()
         for i, el in enumerate(self.associatedSet):
             for j, g in enumerate(self.quadraturePoints):
                 theArray = el.getResultArray(self.resultName, g, True)

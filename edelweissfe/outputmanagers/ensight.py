@@ -489,7 +489,7 @@ class EnsightChunkWiseCase:
         self.fileNames = {}
 
         if not os.path.exists(self.caseFileNamePrefix):
-            os.mkdir(self.caseFileNamePrefix)
+            os.makedirs(self.caseFileNamePrefix)
 
     def setCurrentTime(self, timeAndFileSetNumber: int, timeValue: float):
         """Set the current time of the case.
@@ -518,28 +518,40 @@ class EnsightChunkWiseCase:
             The associated time and fileset number.
         """
 
-        if ensightGeometry.name not in self.fileNames:
-            fileName = os.path.join(
-                self.caseFileNamePrefix,
-                ensightGeometry.name + ".geo",
-            )
+        if self.writeTransientSingleFiles:
+            if ensightGeometry.name not in self.fileNames:
+                fileName = os.path.join(
+                    self.caseFileNamePrefix,
+                    ensightGeometry.name + ".geo",
+                )
+                self.fileNames[ensightGeometry.name] = fileName
+                # create empty file
+                with open(fileName, mode="wb") as f:
+                    pass
 
-            self.fileNames[ensightGeometry.name] = fileName
-            # create empty file
-            with open(fileName, mode="wb") as f:
-                pass
+            filename = self.fileNames[ensightGeometry.name]
 
-        filename = self.fileNames[ensightGeometry.name]
+            with open(filename, mode="ab") as f:
+                if ensightGeometry.name not in self.geometryTrends:
+                    self.geometryTrends[ensightGeometry.name] = timeAndFileSetNumber
+                    writeC80(f, "C Binary")
 
-        with open(filename, mode="ab") as f:
-            if ensightGeometry.name not in self.geometryTrends:
-                self.geometryTrends[ensightGeometry.name] = timeAndFileSetNumber
-                writeC80(f, "C Binary")
-
-            if self.writeTransientSingleFiles:
                 writeC80(f, "BEGIN TIME STEP")
                 ensightGeometry.writeToFile(f)
                 writeC80(f, "END TIME STEP")
+        else:
+            if timeAndFileSetNumber not in self.timeAndFileSets:
+                stepIndex = 0
+            else:
+                stepIndex = len(self.timeAndFileSets[timeAndFileSetNumber].timeValues)
+
+            if ensightGeometry.name not in self.geometryTrends:
+                self.geometryTrends[ensightGeometry.name] = timeAndFileSetNumber
+
+            multiFileName = os.path.join(self.caseFileNamePrefix, f"{ensightGeometry.name}.geo_{stepIndex:04d}")
+            with open(multiFileName, mode="wb") as f:
+                writeC80(f, "C Binary")
+                ensightGeometry.writeToFile(f)
 
     def writeVariableTrendChunk(self, ensightVariable: EnsightVariableTrend, timeAndFileSetNumber: int = 2):
         """
@@ -553,32 +565,44 @@ class EnsightChunkWiseCase:
             The associated time and fileset number.
         """
 
-        if ensightVariable.name not in self.fileNames:
-            # create file name
-            fileName = os.path.join(self.caseFileNamePrefix, ensightVariable.name + ".var")
+        if self.writeTransientSingleFiles:
+            if ensightVariable.name not in self.fileNames:
+                # create file name
+                fileName = os.path.join(self.caseFileNamePrefix, ensightVariable.name + ".var")
+                # append to file names
+                self.fileNames[ensightVariable.name] = fileName
+                # create empty file
+                with open(fileName, mode="wb") as f:
+                    pass
 
-            # append to file names
-            self.fileNames[ensightVariable.name] = fileName
+            filename = self.fileNames[ensightVariable.name]
 
-            # create empty file
-            with open(fileName, mode="wb") as f:
-                pass
+            with open(filename, mode="ab") as f:
+                if ensightVariable.name not in self.variableTrends:
+                    self.variableTrends[ensightVariable.name] = (
+                        timeAndFileSetNumber,
+                        ensightVariable.varType,
+                    )
+                    writeC80(f, "C Binary")
 
-        filename = self.fileNames[ensightVariable.name]
-
-        with open(filename, mode="ab") as f:
+                writeC80(f, "BEGIN TIME STEP")
+                ensightVariable.writeToFile(f)
+                writeC80(f, "END TIME STEP")
+        else:
+            if timeAndFileSetNumber not in self.timeAndFileSets:
+                stepIndex = 0
+            else:
+                stepIndex = len(self.timeAndFileSets[timeAndFileSetNumber].timeValues)
 
             if ensightVariable.name not in self.variableTrends:
                 self.variableTrends[ensightVariable.name] = (
                     timeAndFileSetNumber,
                     ensightVariable.varType,
                 )
-                writeC80(f, "C Binary")
 
-            if self.writeTransientSingleFiles:
-                writeC80(f, "BEGIN TIME STEP")
+            multiFileName = os.path.join(self.caseFileNamePrefix, f"{ensightVariable.name}.var_{stepIndex:04d}")
+            with open(multiFileName, mode="wb") as f:
                 ensightVariable.writeToFile(f)
-                writeC80(f, "END TIME STEP")
 
     def finalize(self, replaceTimeValuesByEnumeration: bool = True, closeFileHandes: bool = True):
         """Write the file .case file containing all the required information."
@@ -618,28 +642,50 @@ class EnsightChunkWiseCase:
 
             cf.write("GEOMETRY\n")
             for geometryName, tAndFSetNum in self.geometryTrends.items():
-                cf.write(
-                    "model: {:} {:} {:}\n".format(
-                        tAndFSetNum,
-                        tAndFSetNum,
-                        os.path.join(self.caseFileNamePrefix, geometryName + ".geo"),
+                if self.writeTransientSingleFiles:
+                    geoFile = os.path.join(self.caseFileNamePrefix, geometryName + ".geo")
+                    cf.write(
+                        "model: {:} {:} {:}\n".format(
+                            tAndFSetNum,
+                            tAndFSetNum,
+                            geoFile,
+                        )
                     )
-                )
+                else:
+                    geoFile = os.path.join(self.caseFileNamePrefix, geometryName + ".geo_****")
+                    cf.write(
+                        "model: {:} {:}\n".format(
+                            tAndFSetNum,
+                            geoFile,
+                        )
+                    )
 
             cf.write("VARIABLE\n")
             for variableName, (
                 tAndFSetNum,
                 variableType,
             ) in self.variableTrends.items():
-                cf.write(
-                    "{:}: {:} {:} {:} {:}.var\n".format(
-                        variableType,
-                        tAndFSetNum,
-                        tAndFSetNum,
-                        variableName,
-                        os.path.join(self.caseFileNamePrefix, variableName),
+                if self.writeTransientSingleFiles:
+                    varFile = os.path.join(self.caseFileNamePrefix, variableName + ".var")
+                    cf.write(
+                        "{:}: {:} {:} {:} {:}\n".format(
+                            variableType,
+                            tAndFSetNum,
+                            tAndFSetNum,
+                            variableName,
+                            varFile,
+                        )
                     )
-                )
+                else:
+                    varFile = os.path.join(self.caseFileNamePrefix, variableName + ".var_****")
+                    cf.write(
+                        "{:}: {:} {:} {:}\n".format(
+                            variableType,
+                            tAndFSetNum,
+                            variableName,
+                            varFile,
+                        )
+                    )
 
 
 def createUnstructuredPartFromElementSet(setName, elementSet: list, partID: int):
@@ -783,8 +829,10 @@ class OutputManager(OutputManagerBase):
         self.intermediateSaveIntervalCounter = 0
         self.fieldOutputController = fieldOutputController
         self.journal = journal
+        self.overwrite = True
 
         self.transientTAndFSetNumber = 1
+        self.transientVariableTAndFSetNumber = 2
         self.staticTAndFSetNumber = 2
 
         self.elSetToEnsightPartMappings = {}
@@ -804,7 +852,8 @@ class OutputManager(OutputManagerBase):
         self.intermediateSaveInterval = int(val) if val is not None else None
         self.overwrite = module.getKeyword("configuration")["overwrite"].default
         transient = module.getKeyword("configuration")["transient"].default
-        part = None
+        configSetName = None
+        configIsNodeSet = None
 
         if perNodeDefs is None:
             perNodeDefs = []
@@ -828,32 +877,72 @@ class OutputManager(OutputManagerBase):
             #     )
 
             if configuration["nSet"]:
-                part = self.nSetToEnsightPartMappings[configuration["nSet"]]
+                configSetName = configuration["nSet"]
+                configIsNodeSet = True
             elif configuration["elSet"]:
-                part = self.elSetToEnsightPartMappings[configuration["elSet"]]
+                configSetName = configuration["elSet"]
+                configIsNodeSet = False
 
         if not self.overwrite:
             self.exportName = "{:}_{:}".format(self.name, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
 
-        for definition in perNodeDefs:
-            fieldOutput = fieldOutputController.fieldOutputs[definition["fieldOutput"]]
+        # store the definitions so parts + variable jobs can be rebuilt when the mesh changes (AMR)
+        self._perNodeDefs = perNodeDefs
+        self._perElementDefs = perElementDefs
+        self._fieldOutputController = fieldOutputController
+        self._configSetName = configSetName
+        self._configIsNodeSet = configIsNodeSet
+        self._configPart = None
+        self._resolveConfigPart()
+        self._transientCfg = transient
+        self._nameKwarg = kwargs.get("name", None)
+        self._initialMeshSignature = (len(self.model.elements), len(self.model.nodes))
+        self._meshSignature = None
+        self._buildVariableJobs()
 
-            nEntries, varSize = self._ensureArrayIs2D(fieldOutput.getLastResult()).shape
+    def _resolveConfigPart(self):
+        """(Re)resolve `self._configPart` from the configured set name/kind against the current
+        nSetToEnsightPartMappings/elSetToEnsightPartMappings, so it stays consistent with the geometry
+        parts after a mesh change (AMR). Leaves `self._configPart` as None if no set was configured."""
+        if self._configSetName is None:
+            self._configPart = None
+        elif self._configIsNodeSet:
+            self._configPart = self.nSetToEnsightPartMappings[self._configSetName]
+        else:
+            self._configPart = self.elSetToEnsightPartMappings[self._configSetName]
+
+    def _buildVariableJobs(self):
+        """(Re)create the per-node/per-element variable jobs from the stored definitions against the
+        current geometry parts. Called at setup and again whenever the mesh changes (AMR)."""
+        for definition in self._perNodeDefs:
+            fieldOutput = self._fieldOutputController.fieldOutputs[definition["fieldOutput"]]
+            _, varSize = self._ensureArrayIs2D(fieldOutput.getLastResult()).shape
             if self.model.domainSize == 2 and varSize == 2:
                 varSize = 3
+            name = (self._nameKwarg or fieldOutput.name).replace(" ", "_")
+            self.createPerNodeOutput(fieldOutput, self._configPart, name, transient=self._transientCfg, varSize=varSize)
 
-            fieldOutputName = kwargs.get("name", fieldOutput.name).replace(" ", "_")
-            self.createPerNodeOutput(fieldOutput, part, fieldOutputName, transient=transient, varSize=varSize)
-
-        for definition in perElementDefs:
-            fieldOutput = fieldOutputController.fieldOutputs[definition["fieldOutput"]]
-
-            nEntries, varSize = self._ensureArrayIs2D(fieldOutput.getLastResult()).shape
+        for definition in self._perElementDefs:
+            fieldOutput = self._fieldOutputController.fieldOutputs[definition["fieldOutput"]]
+            _, varSize = self._ensureArrayIs2D(fieldOutput.getLastResult()).shape
             if self.model.domainSize == 2 and varSize == 2:
                 varSize = 3
+            name = (self._nameKwarg or fieldOutput.name).replace(" ", "_")
+            self.createPerElementOutput(
+                fieldOutput, self._configPart, name, transient=self._transientCfg, varSize=varSize
+            )
 
-            fieldOutputName = kwargs.get("name", fieldOutput.name).replace(" ", "_")
-            self.createPerElementOutput(fieldOutput, part, fieldOutputName, transient=transient, varSize=varSize)
+    def _rebuildForMeshChange(self):
+        """Rebuild geometry parts + variable jobs after an AMR mesh change, so both stay consistent
+        with the current (refined) mesh."""
+        self.elSetToEnsightPartMappings = {}
+        self.nSetToEnsightPartMappings = {}
+        self.rigidBodyToEnsightPartMappings = {}
+        self._transientPerNodeVariableJobs = defaultdict(list)
+        self._transientPerElementVariableJobs = defaultdict(list)
+        self.geometryParts = self._createGeometryParts(1)
+        self._resolveConfigPart()
+        self._buildVariableJobs()
 
     def updateDefinition(self, **kwargs: dict):
         # Determine the type
@@ -998,13 +1087,9 @@ class OutputManager(OutputManagerBase):
             raise Exception("Only transient per node outputs are supported!")
 
     def initializeJob(self):
-        self.ensightCase = EnsightChunkWiseCase(self.exportName)
-        self.ensightCase.setCurrentTime(self.staticTAndFSetNumber, self.model.time)
-
-        geometry = EnsightGeometry("geometry", "EdelweissFE", "*export*", ensightPartList=self.geometryParts)
-        geometryTimesetNumber = self.staticTAndFSetNumber
-
-        self.ensightCase.writeGeometryTrendChunk(geometry, geometryTimesetNumber)
+        self.ensightCase = EnsightChunkWiseCase(self.exportName, writeTransientSingleFiles=False)
+        # Geometry is written per output step (on the transient time set) rather than once, so it can
+        # change with adaptive mesh refinement and stay 1:1 aligned with the variable time steps.
 
     def initializeStep(self, step):
         if self.name in step.actions["options"] or "Ensight" in step.actions["options"]:
@@ -1036,7 +1121,26 @@ class OutputManager(OutputManagerBase):
 
     def writeOutput(self, model: FEModel):
         self.timeAtLastOutput = model.time
-        self.ensightCase.setCurrentTime(self.transientTAndFSetNumber, model.time)
+
+        # rebuild parts + variable jobs if the mesh changed (AMR), so geometry and variables match
+        signature = (len(model.elements), len(model.nodes))
+        mesh_changed = False
+
+        if self._meshSignature is None:
+            mesh_changed = True
+            if signature != self._initialMeshSignature:
+                self._rebuildForMeshChange()
+        elif signature != self._meshSignature:
+            self._rebuildForMeshChange()
+            mesh_changed = True
+
+        self._meshSignature = signature
+
+        # write the current geometry only if it changed
+        if mesh_changed:
+            geometry = EnsightGeometry("geometry", "EdelweissFE", "*export*", ensightPartList=self.geometryParts)
+            self.ensightCase.writeGeometryTrendChunk(geometry, self.transientTAndFSetNumber)
+            self.ensightCase.setCurrentTime(self.transientTAndFSetNumber, model.time)
 
         for (
             resultName,
@@ -1054,7 +1158,7 @@ class OutputManager(OutputManagerBase):
                     result,
                 )
             enSightVariable = EnsightPerNodeVariable(resultName, resultsByParts, perNodeVariableJob["varSize"])
-            self.ensightCase.writeVariableTrendChunk(enSightVariable, self.transientTAndFSetNumber)
+            self.ensightCase.writeVariableTrendChunk(enSightVariable, self.transientVariableTAndFSetNumber)
             del enSightVariable
 
         for (
@@ -1076,15 +1180,18 @@ class OutputManager(OutputManagerBase):
                 resultsByParts[part.partNumber] = partResultsByElementShape
 
             enSightVariable = EnsightPerElementVariable(resultName, resultsByParts, perElementVariableJob["varSize"])
-            self.ensightCase.writeVariableTrendChunk(enSightVariable, self.transientTAndFSetNumber)
+            self.ensightCase.writeVariableTrendChunk(enSightVariable, self.transientVariableTAndFSetNumber)
             del enSightVariable
 
-        # intermediate save of the case
-        if self.intermediateSaveInterval:
-            self.intermediateSaveIntervalCounter += 1
-            if self.intermediateSaveIntervalCounter >= self.intermediateSaveInterval:
-                self.ensightCase.finalize(replaceTimeValuesByEnumeration=False, closeFileHandes=False)
-                self.intermediateSaveIntervalCounter = 0
+        # register the current time for variables
+        self.ensightCase.setCurrentTime(self.transientVariableTAndFSetNumber, model.time)
+
+        # Rewrite the small .case every step so the on-disk step count always matches the committed
+        # data even if the job aborts before finalizeJob() (the L-panel dies on GCDP return-mapping).
+        # A trailing partial geometry step written just before an abort is simply not counted here, so
+        # the reader never overruns it. The .case is tiny text and the data files are already appended
+        # every step, so there is no benefit to gating this behind intermediateSaveInterval.
+        self.ensightCase.finalize(replaceTimeValuesByEnumeration=False, closeFileHandes=False)
 
     def finalizeStep(
         self,
