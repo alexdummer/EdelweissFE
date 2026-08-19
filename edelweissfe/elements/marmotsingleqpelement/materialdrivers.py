@@ -47,6 +47,11 @@ from edelweissfe.materials.base.basegradientenhancedhypoelasticmaterial import (
     GradientEnhancedResponse,
     GradientEnhancedTangents,
 )
+from edelweissfe.materials.base.basegradientplasticityhypoelasticmaterial import (
+    GradientPlasticityIncrement,
+    GradientPlasticityResponse,
+    GradientPlasticityTangents,
+)
 
 
 class BaseMaterialDriver(ABC):
@@ -333,10 +338,122 @@ class MarmotMaterialGradientEnhancedHypoElasticDriver(BaseMaterialDriver):
         return np.array(self._material.getResult(result), copy=not getPersistentView)
 
 
+class MarmotMaterialGradientPlasticityHypoElasticDriver(BaseMaterialDriver):
+    """Drives a gradient plasticity Marmot material of hypoelastic type with a single yield
+    surface.
+
+    The single node carries the strain and the plastic multiplier. Since a material point has
+    no spatial extent, there are no neighbours to form a Laplacian from, so the driver always
+    passes a vanishing Laplacian of the plastic multiplier increment to the material: the yield
+    condition reduces to the local one degree of freedom the point owns, exactly as the local
+    part of :class:`MarmotMaterialGradientEnhancedHypoElasticDriver`'s second residual does.
+    """
+
+    def __init__(self):
+        self._fields = ["strain symmetric", "plastic multiplier"]
+        self._nDof = 7
+        self._material = None
+
+        self._response = GradientPlasticityResponse.createZero(1)
+        self._tangents = GradientPlasticityTangents.createZero(1)
+        self._increment = GradientPlasticityIncrement.createZero(1)
+
+    @property
+    def fields(self) -> list[str]:
+        return self._fields
+
+    @property
+    def nDof(self) -> int:
+        return self._nDof
+
+    @property
+    def nStateVarsOverhead(self) -> int:
+        """Number of state variables the driver keeps in front of the material's own ones."""
+
+        nYieldSurfaces = self._nDof - 6
+
+        return 6 + 6 + nYieldSurfaces + self._nDof**2
+
+    def createMaterial(self, materialName: str, materialProperties: np.ndarray):
+        from edelweissfe.materials.marmot.marmotgradientplasticityhypoelastic import (
+            MarmotGradientPlasticityHypoElasticMaterial,
+        )
+
+        self._material = MarmotGradientPlasticityHypoElasticMaterial(materialName, materialProperties)
+
+        if self._material.nYieldSurfaces != 1:
+            raise ValueError("This driver supports materials with a single yield surface only.")
+
+    def getNumberOfRequiredStateVars(self) -> int:
+        return self.nStateVarsOverhead + self._material.getNumberOfRequiredStateVars()
+
+    def assignStateVars(self, stateVars: np.ndarray):
+        self._stress = stateVars[0:6]
+        self._strain = stateVars[6:12]
+        self._lambda = stateVars[12:13]
+        self._algorithmicTangent = stateVars[13 : 13 + self._nDof**2]
+
+        self._material.assignCurrentStateVars(stateVars[13 + self._nDof**2 :])
+
+    def computeKernels(
+        self,
+        Ke: np.ndarray,
+        Pe: np.ndarray,
+        U: np.ndarray,
+        dU: np.ndarray,
+        time: float,
+        dTime: float,
+    ):
+        response = self._response
+        tangents = self._tangents
+        increment = self._increment
+
+        increment.dStrain[:] = dU[0:6]
+        increment.dLambda[:] = dU[6:7]
+        increment.laplaceDLambda[:] = 0.0
+
+        # the stress enters the rate form material as the stress of the last increment
+        response.stress[:] = self._stress
+        tangents.zero()
+
+        self._material.computeStress(response, tangents, increment, time, dTime)
+
+        self._strain += increment.dStrain
+        self._lambda += increment.dLambda
+
+        self._stress[:] = response.stress
+
+        # the yield function value is already the residual of the additional balance
+        # equation, cf. GradientPlasticityResponse
+        Pe[0:6] = response.stress
+        Pe[6] = response.f[0]
+
+        Ke[0:6, 0:6] = tangents.dStress_dStrain
+        Ke[0:6, 6] = tangents.dStress_dLambda[:, 0]
+        Ke[6, 0:6] = tangents.dF_dStrain[0, :]
+        Ke[6, 6] = tangents.dF_dLambda[0, 0]
+
+        # stored column wise, so that a reshape with order='F' recovers the matrix
+        self._algorithmicTangent[:] = np.asarray(Ke).flatten(order="F")
+
+    def getResultArray(self, result: str, getPersistentView: bool = True) -> np.ndarray:
+        if result == "stress":
+            return np.array(self._stress, copy=not getPersistentView)
+        if result == "strain":
+            return np.array(self._strain, copy=not getPersistentView)
+        if result == "plastic multiplier":
+            return np.array(self._lambda, copy=not getPersistentView)
+        if result == "algorithmicTangent":
+            return np.array(self._algorithmicTangent, copy=not getPersistentView)
+
+        return np.array(self._material.getResult(result), copy=not getPersistentView)
+
+
 #: The available material drivers, keyed by the name of the Marmot material base class.
 materialDrivers = {
     "MarmotMaterialHypoElastic": MarmotMaterialHypoElasticDriver,
     "MarmotMaterialGradientEnhancedHypoElastic": MarmotMaterialGradientEnhancedHypoElasticDriver,
+    "MarmotMaterialGradientPlasticityHypoElastic": MarmotMaterialGradientPlasticityHypoElasticDriver,
 }
 
 

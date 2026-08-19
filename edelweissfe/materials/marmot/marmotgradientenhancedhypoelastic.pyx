@@ -48,7 +48,7 @@ from libcpp.string cimport string
 from edelweissfe.materials.marmot._gradientenhanced cimport (
     GradientEnhancedHypoElasticShim1,
 )
-from edelweissfe.materials.marmot._marmotmaterials cimport StateView
+from edelweissfe.materials.marmot._marmotmaterials cimport StateView, stateViewAsArray
 
 from edelweissfe.materials.base.basegradientenhancedhypoelasticmaterial import (
     BaseGradientEnhancedHypoElasticMaterial,
@@ -326,9 +326,8 @@ cdef class MarmotGradientEnhancedHypoElasticMaterial:
 
         cdef string result_ = result.encode("UTF-8")
         cdef StateView res = self._material.getStateView(result_, &self._stateVars[0])
-        cdef double[::1] resultView = <double[:res.stateSize]> (res.stateLocation)
 
-        return np.asarray(resultView)
+        return stateViewAsArray(res)
 
 
 BaseGradientEnhancedHypoElasticMaterial.register(MarmotGradientEnhancedHypoElasticMaterial)

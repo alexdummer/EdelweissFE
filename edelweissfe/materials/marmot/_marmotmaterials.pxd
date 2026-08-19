@@ -34,6 +34,9 @@
 # non-type template parameters, it is reached through the C++ shim declared in
 # ``_gradientenhanced.pxd``.
 
+import numpy as np
+
+cimport numpy as np
 from libcpp.string cimport string
 
 
@@ -63,6 +66,21 @@ cdef extern from "Marmot/MarmotUtils.h":
     cdef struct StateView:
         double *stateLocation
         int stateSize
+
+
+cdef inline np.ndarray stateViewAsArray(StateView res):
+    """Wrap a Marmot state view in a persistent numpy array, without copying.
+
+    Shared by the three point-wise material wrappers (hypoelastic, gradient-enhanced,
+    gradient-plasticity), whose ``getResult`` bodies are otherwise identical: this is a
+    plain function, not a base class, so that a wrapper's ``_material`` pointer type stays
+    whatever Marmot base class it actually is, and none of the three extensions gains a
+    build dependency on either of the other two's C++ shims.
+    """
+
+    cdef double[::1] resultView = <double[:res.stateSize]> (res.stateLocation)
+
+    return np.asarray(resultView)
 
 
 cdef extern from "Marmot/MarmotMaterialHypoElastic.h":

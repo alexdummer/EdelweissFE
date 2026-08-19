@@ -216,17 +216,38 @@ class GradientEnhancedTangents:
 
         n = nNonlocalVariables
 
-        return cls(
-            dStress_dStrain=np.zeros((6, 6)),
-            dStress_dK=np.zeros((6, n)),
-            dKLocal_dStrain=np.zeros((n, 6)),
-            dKLocal_dK=np.zeros((n, n)),
-            dc_dK=np.zeros((n, n)),
-            d2c_dK2=np.zeros((n, n)),
-        )
+        shapes = ((6, 6), (6, n), (n, 6), (n, n), (n, n), (n, n))
+
+        # One contiguous block with the entries as views into it, so that resetting is a single
+        # fill rather than one per entry. The entries are small -- a six by six and five smaller
+        # ones -- so for a material point evaluated hundreds of thousands of times in a
+        # simulation, the per call overhead of six numpy operations is what dominates, not the
+        # arithmetic, cf. GradientPlasticityTangents.createZero.
+        block = np.zeros(sum(rows * columns for rows, columns in shapes))
+
+        views, offset = [], 0
+        for rows, columns in shapes:
+            views.append(block[offset : offset + rows * columns].reshape(rows, columns))
+            offset += rows * columns
+
+        instance = cls(*views)
+        instance._block = block
+
+        return instance
 
     def zero(self):
-        """Reset all entries to zero."""
+        """Reset all entries to zero.
+
+        A single fill of the block the entries are views into, see :meth:`createZero`. Falls back
+        to entry by entry for an instance that was built by hand rather than by ``createZero``, so
+        that the class stays usable either way.
+        """
+
+        block = getattr(self, "_block", None)
+
+        if block is not None:
+            block.fill(0.0)
+            return
 
         for name in self.entryNames:
             getattr(self, name)[:] = 0.0
