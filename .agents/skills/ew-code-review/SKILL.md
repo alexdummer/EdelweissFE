@@ -24,7 +24,7 @@ This skill provides a systematic review rubric for EdelweissFE pull requests and
 - [ ] **Input System Registry**: Ensure new input deck keywords and options are declared via `InputSystemRegistry` with clear validation.
 - [ ] **Linear Solver Base Contract**: Verify new linear solver interfaces adhere to `LinearSolverBase` and handle singular matrix conditions by returning NaNs rather than hanging or continuing with corrupted values.
 
-## 3. Formatting & Static Linting
+## 3. Formatting, Static Linting & Code Hygiene
 
 Run automated checks locally:
 ```bash
@@ -41,6 +41,10 @@ Inspect specific tools:
 - `flake8 --max-line-length 120 --ignore E203,E501 --extend-ignore W503`
 - `cython-lint --max-line-length=120 --ignore=E741`
 - `clang-format` on C/C++ sources
+
+**Cleanliness & Artifact Checks**:
+- [ ] **No Stray Agent Comments or Conversational Artifacts**: Scan modified files to ensure no temporary comments relating to AI agent plans, development conversations, or prompt instructions remain (e.g. `# Step 1 of plan...`, `# Agent note...`, `# As discussed in chat...`, `# Co-authored-by comments in source files`). Code comments must describe the math, algorithm, or codebase design—not the conversational context.
+- [ ] **No Debug Print Statements or Temp Files**: Remove leftover `print()`, debug outputs, scratch dump files, or temporary testing artifacts before committing.
 
 ## 4. Test Deck Verification
 
