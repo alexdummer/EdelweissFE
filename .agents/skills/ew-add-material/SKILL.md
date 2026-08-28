@@ -13,26 +13,59 @@ This skill guides the implementation, registration, testing, and documentation o
 
 Before writing any new material code, adhere strictly to these principles:
 - **Reuse Existing Base Classes & Helpers**:
-  - Always inherit from established base classes (`BaseMaterial`, `BaseHypoElasticMaterial`, `BaseHyperElasticMaterial`) rather than re-implementing common lifecycle methods.
-  - Reuse shared tensor operations, matrix inversion, Voigt notation mappings, and eigenvalue/eigenvector routines from `edelweissfe/numerics/` and `edelweissfe/materials/`.
+  - Always inherit from established base classes (`BaseMaterial`, `BaseHypoElasticMaterial`, `BaseHyperElasticMaterial`).
+  - Reuse tensor utilities rather than writing custom matrix/Voigt math:
+    ```python
+    # Common imports to reuse directly:
+    from edelweissfe.materials.base.basehypoelasticmaterial import (
+        BaseHypoElasticMaterial,
+    )
+    from edelweissfe.materials.base.basematerial import BaseMaterial
+    from edelweissfe.utils.exceptions import CutbackRequest
+    from edelweissfe.utils.voigtnotation import (
+        undoVoigtStrain,
+        undoVoigtStress,
+        voigtStrain,
+        voigtStress,
+    )
+```
 - **Extract Shared Constitutive Logic**:
-  - If multiple materials share common components (e.g. isotropic elasticity baseline, yield functions, plastic potential derivatives, return-mapping integration algorithms, or damage degradation functions), extract them into shared helper modules under `edelweissfe/materials/` or a common base class.
+  - If multiple materials share components (isotropic baseline, yield surfaces, flow rules, return mapping, damage degradation), extract them into shared helper functions or common base classes.
 - **Parametrize Rather Than Duplicate**:
-  - Prefer parametrizing an existing material model over creating new copy-pasted variants (e.g. like the consolidated neo-Hookean and Pence-Gou models). Avoid parallel classes that differ only by a single parameter or yield condition.
+  - Prefer parametrizing existing materials over creating copy-pasted variants.
 - **Performance & Invariant Caching**:
-  - Cache invariant elasticity matrices ($\mathbb{C}$) and pre-allocate local arrays to avoid runtime allocations in constitutive evaluation loops.
+  - Cache invariant elasticity matrices ($\mathbb{C}$) during initialization to avoid per-iteration allocations.
 
 ## Implementation Steps
 
 ### 1. Create the Material Module
-Create a new package or module under `edelweissfe/materials/<material_name>/`:
-- Inherit from the appropriate base class (e.g. `BaseMaterial` or `BaseHypoElasticMaterial`).
-- Reuse existing parameter parsers and tensor helpers.
-- Implement the constitutive update method:
-  - Input: Strain / deformation measure (e.g., small strain tensor $\boldsymbol{\varepsilon}$, deformation gradient $\boldsymbol{F}$, or rate of deformation $\boldsymbol{D}$).
-  - State variables: Accept previous state variables and return updated state variables.
-  - Output: Stress tensor (Cauchy $\boldsymbol{\sigma}$ or 2nd Piola-Kirchhoff $\boldsymbol{S}$) and consistent tangent operator ($\mathbb{C}$ or $\mathbb{D}$).
-- Cache invariant elasticity matrices or common tensor operations where possible for performance.
+Create a new package under `edelweissfe/materials/<material_name>/<material_name>.py`:
+```python
+import numpy as np
+
+from edelweissfe.materials.base.basehypoelasticmaterial import (
+    BaseHypoElasticMaterial,
+)
+from edelweissfe.utils.exceptions import CutbackRequest
+from edelweissfe.utils.voigtnotation import undoVoigtStrain
+
+
+class MyMaterial(BaseHypoElasticMaterial):
+    def __init__(self, E, nu, *args, **kwargs):
+        super().__init__()
+        self.E = float(E)
+        self.nu = float(nu)
+        # Precompute & cache invariant elasticity tensor
+        self._computeElasticMatrix()
+
+    def getInitialInternalStateVariables(self, totalNumberOfIntegrationPoints):
+        # Return initial state array (e.g. zeros of shape (num_points, num_state_vars))
+        return np.zeros((totalNumberOfIntegrationPoints, self.numStateVars))
+
+    def evaluate(self, strain, stateVarsOld, **kwargs):
+        # Return: stress (Voigt), tangent_C (6x6), stateVarsNew
+        ...
+```
 
 ### 2. Register in the Material Library
 Register the new material in `edelweissfe/config/materiallibrary.py` under the `provider="edelweiss"` block:

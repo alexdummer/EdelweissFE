@@ -11,7 +11,15 @@ description: >-
 
 Before writing any new element code, adhere strictly to these principles:
 - **Reuse Existing Base Classes**:
-  - Always inherit from base classes such as `DisplacementElement`, `DisplacementTLElement`, or relevant continuum/structural element base classes.
+  - Always inherit from base classes such as `DisplacementElement`, `DisplacementTLElement`, or relevant continuum/structural base classes:
+    ```python
+    from edelweissfe.elements.base.displacementelement import (
+        DisplacementElement,
+    )
+    from edelweissfe.elements.base.displacementtlelement import (
+        DisplacementTLElement,
+    )
+```
 - **Reuse Quadrature Rules & Shape Functions**:
   - Do not hardcode Gauss quadrature points, weights, or shape function derivatives inside individual element classes. Use or extend shared quadrature and shape function utilities.
 - **Extract Shared Matrix & Transformation Routines**:
