@@ -48,7 +48,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#adding--running-tests) for test creation g
 
 ## Linting, formatting & commit conventions
 
-Formatting and static checks are enforced by pre-commit hooks (`autoflake`, `black --line-length 120`, `isort`, `flake8`, `cython-lint`, `clang-format`). All commits must adhere to Conventional Commits.
+Formatting and static checks are enforced by pre-commit hooks (`autoflake`, `black --line-length 120`, `isort`, `flake8`, `cython-lint`, `clang-format`). All commits must adhere to Conventional Commits. A helper script for formatting and resolving `cython-lint` issues is available at `scripts/format_cython_files.sh`.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#pre-commit-hooks) for hook installation and tool flags, and [CONTRIBUTING.md](CONTRIBUTING.md#conventional-commits) for commit message types and subsystem scopes.
 

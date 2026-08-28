@@ -67,6 +67,8 @@ Formatting and linting tools configured in `.pre-commit-config.yaml`:
 - `cython-lint`: Lints Cython `.pyx` files (`--max-line-length=120 --ignore=E741`).
 - `clang-format`: Formats C and C++ source files.
 
+> **Tip**: An automated helper script is available at `scripts/format_cython_files.sh` to iteratively format Cython `.pyx` and `.pxd` files and resolve common `cython-lint` issues.
+
 ---
 
 ## Conventional Commits
