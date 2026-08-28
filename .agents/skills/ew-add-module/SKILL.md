@@ -5,98 +5,50 @@ description: >-
   Use when implementing new solvers, linear solvers, step actions, constraints, output managers, generators, analytical fields, or when routing to specialized skills.
 ---
 
-# Universal Module & Feature Development Lifecycle in EdelweissFE
+# Module Development Lifecycle in EdelweissFE
 
-This skill is the general entry point and orchestrator for implementing, registering, testing, and documenting any new subsystem module or feature in EdelweissFE.
+Universal entry point for adding/extending any subsystem feature.
 
----
+## 1. Routing to Dedicated Skills
 
-## 1. Routing to Specialized Skills
-
-If you are implementing a specific subsystem covered by a dedicated skill, activate and follow that skill:
-
-| Subsystem | Dedicated Skill |
+| Task | Skill |
 | :--- | :--- |
-| **Material Models** (elastic, hyperelastic, plastic, damage) | [`ew-add-material`](../ew-add-material/SKILL.md) |
-| **Finite Element Formulations** (continuum, structural, mixed) | [`ew-add-element`](../ew-add-element/SKILL.md) |
-| **Regression Test Decks** (`test.inp` + `U.ref`) | [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) |
-| **Sphinx Documentation & Keywords** | [`ew-documentation`](../ew-documentation/SKILL.md) |
-| **Pre-commit & PR Code Review** | [`ew-code-review`](../ew-code-review/SKILL.md) |
-
-For all other modules (solvers, linear solvers, step-actions, constraints, AMR markers, output managers, generators, analytical fields), follow the universal lifecycle below.
+| Materials (elastic, plastic, damage) | [`ew-add-material`](../ew-add-material/SKILL.md) |
+| Elements (continuum, structural, mixed) | [`ew-add-element`](../ew-add-element/SKILL.md) |
+| Regression test decks (`test.inp` + `U.ref`) | [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) |
+| Sphinx docs & keyword reference | [`ew-documentation`](../ew-documentation/SKILL.md) |
+| QA & PR code review | [`ew-code-review`](../ew-code-review/SKILL.md) |
 
 ---
 
-## 2. Universal Subsystem Directory & Registry Map
+## 2. Subsystem Directory & Plugin Registry Map
 
-EdelweissFE uses the **Plugin-Registry Pattern**. Every pluggable feature lives in a dedicated module directory and is mapped in `edelweissfe/config/`:
-
-| Feature Type | Implementation Directory | Plugin Registry (`edelweissfe/config/`) |
+| Subsystem | Directory | Registry (`edelweissfe/config/`) |
 | :--- | :--- | :--- |
-| **Nonlinear Solvers** | `edelweissfe/solvers/` | `solvers.py::solverLibrary` |
-| **Linear Solvers** | `edelweissfe/linsolve/` | `linsolve.py::getLinSolverByName` |
-| **Step Actions** (BCs, loads, controllers) | `edelweissfe/stepactions/` | `stepactions.py` |
-| **Constraints & MPCs** | `edelweissfe/constraints/` | `constraints.py` |
-| **AMR & Error Markers** | `edelweissfe/adaptivity/` | `amrmarkers.py` |
-| **Output Managers** | `edelweissfe/outputmanagers/` | `outputmanagers.py` |
-| **Mesh / Geometry Generators** | `edelweissfe/generators/` | `generators.py` |
-| **Analytical Fields & Variables** | `edelweissfe/analyticalfields/` | `analyticalfields.py` |
-| **Sections** | `edelweissfe/sections/` | `sections.py` |
+| Nonlinear Solvers | `edelweissfe/solvers/` | `solvers.py::solverLibrary` |
+| Linear Solvers | `edelweissfe/linsolve/` | `linsolve.py::getLinSolverByName` |
+| Step Actions (loads, BCs, controllers) | `edelweissfe/stepactions/` | `stepactions.py` |
+| Constraints & MPCs | `edelweissfe/constraints/` | `constraints.py` |
+| AMR Markers | `edelweissfe/adaptivity/` | `amrmarkers.py` |
+| Output Managers | `edelweissfe/outputmanagers/` | `outputmanagers.py` |
+| Mesh Generators | `edelweissfe/generators/` | `generators.py` |
+| Analytical Fields | `edelweissfe/analyticalfields/` | `analyticalfields.py` |
+| Sections | `edelweissfe/sections/` | `sections.py` |
 
 ---
 
-## 3. The 6-Step Feature Implementation Lifecycle
+## 3. Implementation Checklist
 
-### Step 1: Code Reuse & Base Class Audit
-- **Audit Existing Implementations**: Check existing classes in the target subsystem.
-- **Inherit from Subsystem Base Class**: Ensure your class implements the standard contract (e.g. `LinearSolver` in `linsolve`, `StepActionBase` in `stepactions`, `ConstraintBase` in `constraints`).
-- **Extract Shared Helpers**: If introducing reusable math, tensor, or solver routines, place them in a common module (e.g. `edelweissfe/numerics/` or subsystem base) to prevent duplication across the codebase.
+1. **Inheritance & Code Reuse**: Inherit from subsystem base class (`LinearSolver`, `StepActionBase`, `ConstraintBase`). Reuse shared math/tensor routines in `edelweissfe/numerics/`.
+2. **Free-Threading Safety**: Never import third-party C-extensions without `Py_MOD_GIL_NOT_USED` (e.g. `gstools`) at top level. Import lazily inside methods.
+3. **Lazy Registration**: In `edelweissfe/config/<subsystem>.py`, import class lazily inside condition:
+   ```python
+   if strCaseCmp(name, "myFeature"):
+       from edelweissfe.subsystem.myfeature import MyFeature
 
-### Step 2: Implementation & Free-Threading Safety
-- **Free-Threading / GIL Safety**: Never import third-party C-extensions lacking `Py_MOD_GIL_NOT_USED` (such as `gstools`) at module top-level; always import them lazily inside the specific method/class where they are used.
-- **CSR Matrix Assembly**: If the module modifies equations or matrix sparsity, preserve explicit off-diagonal zeros and avoid per-iteration sparsity rebuilds.
-
-### Step 3: Lazy Plugin Registry Registration
-Register the user-facing name in the appropriate `edelweissfe/config/<subsystem>.py`:
-```python
-# Always import lazily inside the conditional branch:
-if strCaseCmp(name, "my_new_feature"):
-    from edelweissfe.subsystem.myfeature import MyFeatureClass
-
-    return MyFeatureClass
+       return MyFeature
 ```
-
-### Step 4: Input Language & Keyword Integration
-Register the keyword, options, and dataline parsing schema in `edelweissfe/utils/inputlanguage.py` using `InputSystemRegistry`:
-```python
-@InputSystemRegistry.registerKeyword(keyword="*myFeature")
-def parseMyFeature(parser, options, dataLines):
-    # Parse options and datalines into model structure
-    ...
-```
-
-### Step 5: Regression Testing (`ew-create-regression-test`)
-- Create a minimal, deterministic test deck under `testfiles/edelweiss-only/<TestName>/test.inp` (or `testfiles/marmot/` if Marmot is required).
-- Generate the reference solution:
-  ```bash
-  run_tests_edelweissfe ./testfiles/edelweiss-only/ --tests <TestName> --create
-  ```
-- Verify the test passes with residual $< 10^{-6}$.
-
-### Step 6: Sphinx Documentation (`ew-documentation`)
-- Add user-facing documentation and input deck snippets to the corresponding `.rst` file under `doc/source/documentation/`.
-- Update the keyword catalog in `doc/source/documentation/keywords.rst`.
-- Verify the documentation build compiles cleanly:
-  ```bash
-  sphinx-build ./doc/source/ ./docs -b html
-  ```
-
----
-
-## 4. Final Review Checklist (`ew-code-review`)
-Before submitting changes, run the review checklist:
-- [ ] Run `pre-commit run --all-files` and `bash scripts/format_cython_files.sh`.
-- [ ] Ensure all tests pass (`run_tests_edelweissfe ./testfiles/edelweiss-only/`).
-- [ ] Confirm no stray agent comments or temporary conversational artifacts remain.
-- [ ] Ensure commit messages follow Conventional Commits format (`feat(...)`, `fix(...)`).
-- [ ] Target the correct PR branch (`master` for bugfixes, `next_v<YY>.<MM>` for new features).
+4. **Input DSL Schema**: Register keyword handler via `InputSystemRegistry` in `edelweissfe/utils/inputlanguage.py`.
+5. **Regression Test**: Follow [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) to generate `test.inp` + `U.ref`.
+6. **Documentation**: Follow [`ew-documentation`](../ew-documentation/SKILL.md) to update `.rst` files in `doc/source/documentation/`.
+7. **Review**: Check with [`ew-code-review`](../ew-code-review/SKILL.md) (`pre-commit run --all-files`, clean commit message).

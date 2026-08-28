@@ -5,87 +5,65 @@ description: >-
   Use when creating or refactoring material formulations (elastic, hyperelastic, hypoelastic, plastic, or damage models).
 ---
 
-# Implementing a New Material Model in EdelweissFE
+# Implementing a Material Model in EdelweissFE
 
-This skill guides the implementation, registration, testing, and documentation of a new material model.
-
-## Code Reuse & Anti-Duplication Principles
-
-Before writing any new material code, adhere strictly to these principles:
-- **Reuse Existing Base Classes & Helpers**:
-  - Always inherit from established base classes (`BaseMaterial`, `BaseHypoElasticMaterial`, `BaseHyperElasticMaterial`).
-  - Reuse tensor utilities rather than writing custom matrix/Voigt math:
-    ```python
-    # Common imports to reuse directly:
-    from edelweissfe.materials.base.basehypoelasticmaterial import (
-        BaseHypoElasticMaterial,
-    )
-    from edelweissfe.materials.base.basematerial import BaseMaterial
-    from edelweissfe.utils.exceptions import CutbackRequest
-    from edelweissfe.utils.voigtnotation import (
-        undoVoigtStrain,
-        undoVoigtStress,
-        voigtStrain,
-        voigtStress,
-    )
+## 1. Imports & Core Utilities
+Always inherit from base classes and reuse Voigt/tensor utilities:
+```python
+from edelweissfe.materials.base.basehypoelasticmaterial import (
+    BaseHypoElasticMaterial,
+)
+from edelweissfe.materials.base.basematerial import BaseMaterial
+from edelweissfe.utils.exceptions import CutbackRequest
+from edelweissfe.utils.voigtnotation import (
+    undoVoigtStrain,
+    undoVoigtStress,
+    voigtStrain,
+    voigtStress,
+)
 ```
-- **Extract Shared Constitutive Logic**:
-  - If multiple materials share components (isotropic baseline, yield surfaces, flow rules, return mapping, damage degradation), extract them into shared helper functions or common base classes.
-- **Parametrize Rather Than Duplicate**:
-  - Prefer parametrizing existing materials over creating copy-pasted variants.
-- **Performance & Invariant Caching**:
-  - Cache invariant elasticity matrices ($\mathbb{C}$) during initialization to avoid per-iteration allocations.
 
-## Implementation Steps
-
-### 1. Create the Material Module
-Create a new package under `edelweissfe/materials/<material_name>/<material_name>.py`:
+## 2. Implementation Skeleton
+Create `edelweissfe/materials/<name>/<name>.py`:
 ```python
 import numpy as np
 
 from edelweissfe.materials.base.basehypoelasticmaterial import (
     BaseHypoElasticMaterial,
 )
-from edelweissfe.utils.exceptions import CutbackRequest
-from edelweissfe.utils.voigtnotation import undoVoigtStrain
 
 
 class MyMaterial(BaseHypoElasticMaterial):
-    def __init__(self, E, nu, *args, **kwargs):
-        super().__init__()
-        self.E = float(E)
-        self.nu = float(nu)
-        # Precompute & cache invariant elasticity tensor
-        self._computeElasticMatrix()
+    def __init__(self, materialProperties: np.ndarray):
+        self.E = float(materialProperties[0])
+        self.nu = float(materialProperties[1])
+        # Invariant caching: precompute virgin elasticity matrix C0 once
+        self._C0 = ...
 
-    def getInitialInternalStateVariables(self, totalNumberOfIntegrationPoints):
-        # Return initial state array (e.g. zeros of shape (num_points, num_state_vars))
-        return np.zeros((totalNumberOfIntegrationPoints, self.numStateVars))
+    def getNumberOfRequiredStateVars(self) -> int:
+        return 2  # minimal state storage (e.g. kappa, d)
 
-    def evaluate(self, strain, stateVarsOld, **kwargs):
-        # Return: stress (Voigt), tangent_C (6x6), stateVarsNew
+    def assignCurrentStateVars(self, currentStateVars: np.ndarray):
+        self.stateVarsOld = currentStateVars
+
+    def computeStress(
+        self, eps, time, dTime, **kwargs
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        # Return: (stress_voigt, tangent_C_6x6, newStateVars)
         ...
 ```
 
-### 2. Register in the Material Library
-Register the new material in `edelweissfe/config/materiallibrary.py` under the `provider="edelweiss"` block:
+## 3. Lazy Registration
+In `edelweissfe/config/materiallibrary.py` (inside `provider="edelweiss"`):
 ```python
-elif strCaseCmp(materialName, "my_new_material"):
-    from edelweissfe.materials.mymaterial.mymaterial import MyMaterialClass
+elif strCaseCmp(materialName, "myMaterial"):
+    from edelweissfe.materials.mymaterial.mymaterial import MyMaterial
 
-    material = MyMaterialClass
-```
-*Note*: Always import lazily inside the condition to keep startup overhead low and prevent unintentional GIL re-enabling.
-
-### 3. Define Input File Syntax
-Ensure `*material` block syntax is supported in `edelweissfe/utils/inputlanguage.py`:
-```
-*material, name=MatName, id=my_new_material, provider=edelweiss
-<param1>, <param2>, <param3>, ...
+    material = MyMaterial
 ```
 
-### 4. Regression & Verification Tests
-Follow [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) to add a minimal verification test deck under `testfiles/edelweiss-only/<TestName>/` (e.g. single-element Quad4/Hexa8 tension or shear test) and generate its `U.ref` reference solution.
-
-### 5. Documentation
-Follow [`ew-documentation`](../ew-documentation/SKILL.md) to document the material formulation, governing equations, parameter definitions, and an input deck example in `doc/source/documentation/materials.rst`.
+## 4. Input Syntax, Tests & Documentation
+- **Input deck**: `*material, name=myMat, id=myMaterial, provider=edelweiss` followed by datalines.
+- **Tests**: Follow [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) (`*modelGenerator, generator=boxGen` or `planeRectQuad`).
+- **Docs**: Follow [`ew-documentation`](../ew-documentation/SKILL.md) (update `doc/source/documentation/materials.rst`).
+- **Review**: Follow [`ew-code-review`](../ew-code-review/SKILL.md).
