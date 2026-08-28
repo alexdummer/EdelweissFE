@@ -63,7 +63,7 @@ Inspect specific tools:
 ## 6. Agent Instructions & Custom Skills Maintenance
 
 - [ ] **Agent Guidance (`AGENTS.md` & `CONTRIBUTING.md`)**: Check if new subsystems, build flags, or workflow changes require updating `AGENTS.md` and `CONTRIBUTING.md`.
-- [ ] **Workspace Skills (`.agents/skills/`)**: Check if new development workflows, refactored procedures, or newly added patterns require creating or updating tailored skills in `.agents/skills/` (e.g. `ew-add-material`, `ew-add-element`, `ew-create-regression-test`, etc.).
+- [ ] **Workspace Skills (`.agents/skills/`)**: Check if new development workflows, refactored procedures, or newly added patterns require creating or updating tailored skills in `.agents/skills/` (e.g. `ew-add-material`, `ew-add-element`, `ew-create-regression-test`, `ew-documentation`, etc.).
 
 ## 7. Conventional Commits & Target Branch
 
