@@ -23,7 +23,9 @@ from edelweissfe.utils.voigtnotation import (
 )
 ```
 
-## 2. Implementation Skeleton
+## 2. Implementation Skeleton & Minimal State Variables
+- **Minimal State Variables Requirement**: Store **only strictly path-dependent historical variables** in `stateVars`. Never store instantaneous or algebraically computable quantities unless explicitly requested by the user. Compute derived quantities on the fly.
+
 Create `edelweissfe/materials/<name>/<name>.py`:
 ```python
 import numpy as np
@@ -35,13 +37,13 @@ from edelweissfe.materials.base.basehypoelasticmaterial import (
 
 class MyMaterial(BaseHypoElasticMaterial):
     def __init__(self, materialProperties: np.ndarray):
-        self.E = float(materialProperties[0])
-        self.nu = float(materialProperties[1])
-        # Invariant caching: precompute virgin elasticity matrix C0 once
+        self.param1 = float(materialProperties[0])
+        self.param2 = float(materialProperties[1])
+        # Invariant caching: precompute invariant tensors during init
         self._C0 = ...
 
     def getNumberOfRequiredStateVars(self) -> int:
-        return 2  # minimal state storage (e.g. kappa, d)
+        return 0  # strictly minimal path-dependent history variables
 
     def assignCurrentStateVars(self, currentStateVars: np.ndarray):
         self.stateVarsOld = currentStateVars

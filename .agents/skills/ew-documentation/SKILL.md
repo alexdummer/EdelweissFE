@@ -26,18 +26,18 @@ My Feature Name
 Governing equations:
 
 .. math::
-   \boldsymbol{\sigma} = (1 - d) \mathbb{C}^0 : \boldsymbol{\varepsilon}
+   \boldsymbol{\sigma} = \mathcal{F}(\boldsymbol{\varepsilon}, \dots)
 
 Parameters:
-- ``E``: Young's modulus (:math:`\text{MPa}`).
-- ``nu``: Poisson's ratio.
+- ``param1``: Description (:math:`\text{unit}`).
+- ``param2``: Description.
 
 Input deck snippet:
 
 .. code-block:: edelweiss
 
    *material, name=myMat, id=myMaterial, provider=edelweiss
-   210000.0, 0.3
+   <val1>, <val2>, ...
 ```
 
 ## 3. Docstrings & Keyword Catalog

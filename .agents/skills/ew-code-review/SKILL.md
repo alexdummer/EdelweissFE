@@ -14,6 +14,7 @@ description: >-
 
 ## 2. Architecture & Code Reuse
 - [ ] **Code Reuse**: Subclass base classes (`BaseHypoElasticMaterial`, `DisplacementElement`, `LinearSolver`). Reuse `edelweissfe/numerics/` and `voigtnotation`.
+- [ ] **Minimal State Variables**: Materials must store only strictly path-dependent history variables in `stateVars` (never instantaneous or algebraically computable quantities, unless explicitly requested).
 - [ ] **Lazy Plugin Registrations**: Register in `edelweissfe/config/<subsystem>.py` with lazy imports.
 - [ ] **Input System Registry**: Register keyword schemas via `InputSystemRegistry`.
 

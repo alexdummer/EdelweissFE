@@ -21,7 +21,7 @@ Use procedural generators (coarse meshes `1..4` elements for fast execution):
 ### 2D Template (`planeRectQuad`)
 ```
 *material, name=mat1, id=myMaterial, provider=edelweiss
-30000.0, 0.2, ...
+<param1>, <param2>, ...
 
 *section, name=sec1, thickness=1.0, material=mat1, type=plane
 all
@@ -45,7 +45,7 @@ maxInc=0.5, minInc=1e-5, maxNumInc=10, maxIter=25
 ### 3D Template (`boxGen`)
 ```
 *material, name=mat1, id=myMaterial, provider=edelweiss
-210000.0, 0.3, ...
+<param1>, <param2>, ...
 
 *section, name=sec1, material=mat1, type=solid
 all
