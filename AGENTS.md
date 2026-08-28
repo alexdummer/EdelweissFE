@@ -56,6 +56,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md#pre-commit-hooks) for hook installation an
 
 Specialized runbooks and checklists for development workflows are available under `.agents/skills/`. Agents should activate and follow the corresponding `SKILL.md` when tasked with:
 
+- **[`ew-add-module`](.agents/skills/ew-add-module/SKILL.md)**: Universal entry point and architectural lifecycle for adding or extending any kind of functionality (solvers, linear solvers, step actions, constraints, AMR markers, output managers, generators, analytical fields), and routing to specialized skills.
 - **[`ew-add-material`](.agents/skills/ew-add-material/SKILL.md)**: Use when creating, refactoring, or registering a new material model (elastic, hyperelastic, hypoelastic, plastic, damage). Follow this skill to reuse tensor utilities, inherit from base classes, register lazily in `materiallibrary.py`, and document in Sphinx.
 - **[`ew-add-element`](.agents/skills/ew-add-element/SKILL.md)**: Use when implementing new finite element formulations (continuum, structural, mixed/EAS, Marmot wrappers). Follow this skill for node numbering conventions, quadrature/shape function reuse, `*elementproperty` support, and registration in `elementlibrary.py`.
 - **[`ew-create-regression-test`](.agents/skills/ew-create-regression-test/SKILL.md)**: Use when creating or updating regression test decks (`test.inp` + `U.ref`) for bug fixes, new features, or solver benchmarking. Follow this skill for fast-running mesh guidelines, running `run_tests_edelweissfe --create`, and residual checks.

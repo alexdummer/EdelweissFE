@@ -51,17 +51,8 @@ Ensure `*material` block syntax is supported in `edelweissfe/utils/inputlanguage
 <param1>, <param2>, <param3>, ...
 ```
 
-### 4. Create Regression Tests
-- Create a test under `testfiles/edelweiss-only/<TestName>/` with a small mesh (e.g. single element Quad4 or Hexa8).
-- Generate reference solution:
-  ```bash
-  run_tests_edelweissfe ./testfiles/edelweiss-only/ --tests <TestName> --create
-  ```
-- Verify convergence under load steps and check stress/strain output.
+### 4. Regression & Verification Tests
+Follow [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) to add a minimal verification test deck under `testfiles/edelweiss-only/<TestName>/` (e.g. single-element Quad4/Hexa8 tension or shear test) and generate its `U.ref` reference solution.
 
-### 5. Document in Sphinx
-- Add material theory, governing equations, parameter definitions, and an input deck snippet to `doc/source/documentation/materials.rst`.
-- Build docs locally:
-  ```bash
-  sphinx-build ./doc/source/ ./docs -b html
-  ```
+### 5. Documentation
+Follow [`ew-documentation`](../ew-documentation/SKILL.md) to document the material formulation, governing equations, parameter definitions, and an input deck example in `doc/source/documentation/materials.rst`.

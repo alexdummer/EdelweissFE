@@ -58,16 +58,7 @@ Ensure `*element` keyword syntax parses correctly in `edelweissfe/utils/inputlan
 ```
 
 ### 4. Regression & Verification Tests
-- Create a test deck in `testfiles/edelweiss-only/<TestName>/` with known boundary conditions (e.g. patch test, pure bending, or cantilever tension).
-- Generate reference solution:
-  ```bash
-  run_tests_edelweissfe ./testfiles/edelweiss-only/ --tests <TestName> --create
-  ```
-- Verify parallel element loop execution with `...Parallel` solvers (e.g., `NISTParallel`, `NEDParallel`).
+Follow [`ew-create-regression-test`](../ew-create-regression-test/SKILL.md) to create an input deck (e.g. patch test, bending, or tension) under `testfiles/edelweiss-only/<TestName>/`, generate `U.ref`, and verify both serial and thread-parallel (`...Parallel`) execution.
 
-### 5. Sphinx Documentation
-- Document the element in `doc/source/documentation/elements.rst` (degrees of freedom, topology, integration order, supported materials, formulation type).
-- Verify doc build:
-  ```bash
-  sphinx-build ./doc/source/ ./docs -b html
-  ```
+### 5. Documentation
+Follow [`ew-documentation`](../ew-documentation/SKILL.md) to document the element formulation, nodal degrees of freedom, integration schemes, and supported materials in `doc/source/documentation/elements.rst`.
