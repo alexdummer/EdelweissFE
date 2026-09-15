@@ -28,9 +28,9 @@
 """
 The compiled inner loop of a finite difference gradient enhanced cell.
 
-The two field counterpart for the gradient *enhanced* material family, where the discretisation
-owns the second balance equation rather than the material. The material returns a local driving
-variable
+The two field counterpart for the gradient *enhanced* material family, where -- unlike gradient
+plasticity, see :mod:`edelweissfe.kernels.gradientplasticitykernel` -- the discretisation owns the
+second balance equation rather than the material. The material returns a local driving variable
 :math:`K_{local}` and a nonlocal parameter :math:`c`, and the screened Poisson equation
 
 .. math::
