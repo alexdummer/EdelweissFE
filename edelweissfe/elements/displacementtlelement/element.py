@@ -29,6 +29,7 @@
 import numpy as np
 import numpy.linalg as lin
 
+from edelweissfe.config import registry
 from edelweissfe.elements.base.baseelement import BaseElement
 from edelweissfe.elements.displacementtlelement._elementcomputationmatrices import (
     computeBOperator,
@@ -191,7 +192,12 @@ class DisplacementTLElement(BaseElement):
     def __init__(self, elementType: str, elNumber: int):
         self._elType = elementType
         properties = elLibrary[elementType]
-        if eval(properties["elClass"]) is not DisplacementTLElement:
+        # Guard against being handed an element type belonging to a *different* formulation, e.g.
+        # `DisplacementTLElement("CPE4", 1)`: `elLibrary` supplies quadrature data for both
+        # formulations, so nothing else here would notice. The type -> class mapping is looked up
+        # in the `element` category of the registry, since neither element module imports the
+        # other's class.
+        if registry.lookup("element", elementType)[0] is not DisplacementTLElement:
             raise Exception("Something went wrong with the element initialization!")
         self._elNumber = elNumber
         self._nNodes = properties["nNodes"]
@@ -246,6 +252,22 @@ class DisplacementTLElement(BaseElement):
 
         if self.nSpatialDimensions == 2:
             self._t = elementProperties[0]  # thickness
+
+    def assignProperty(self, propertyName: str, properties: np.ndarray):
+        """Assign a property of the element by name."""
+        if propertyName.lower() == "thickness":
+            if self.nSpatialDimensions == 2:
+                self._t = float(properties[0])
+            else:
+                raise Exception("Thickness property is only supported for 2D elements.")
+        else:
+            raise NotImplementedError(f"Property '{propertyName}' is not supported by this element.")
+
+    def getPropertyNames(self) -> list[str]:
+        """Get the names of all the valid properties of the element."""
+        if self.nSpatialDimensions == 2:
+            return ["thickness"]
+        return []
 
     def initializeElement(
         self,
@@ -581,7 +603,7 @@ class DisplacementTLElement(BaseElement):
         elif self._nSpatialDimensions == 2:
             return np.sqrt(4 * self.detJ[qp])
         elif self._nSpatialDimensions == 3:
-            return np.qbrt(8 * self.detJ[qp])
+            return np.cbrt(8 * self.detJ[qp])
 
     def computeInternalEnergy(self) -> float:
         """Compute the internal energy of the element.
@@ -612,6 +634,33 @@ class DisplacementTLElement(BaseElement):
         self,
     ):
         """Reset to the last valid state."""
+
+    def getStateVars(self) -> np.ndarray:
+        """Return a copy of the converged quadrature-point state-variable buffer, including the
+        converged Green-Lagrange strain (``_Eold``) needed to resume the total-Lagrangian
+        incremental-strain computation."""
+
+        return np.concatenate([self._stateVarsRef.reshape(-1), self._Eold.reshape(-1)]).copy()
+
+    def setStateVars(self, values: np.ndarray):
+        """Overwrite the converged quadrature-point state-variable buffer and ``_Eold`` in place.
+
+        The working buffers are seeded from them as well. :meth:`acceptLastState` copies
+        ``_stateVarsTemp`` over ``_stateVarsRef`` *and* ``_E`` over ``_Eold``, and it can run
+        before any element computation has populated either: both explicit solvers process a zero
+        increment first, for which :meth:`computeYourself` is never called, and then accept it. On
+        a resumed run that copied freshly allocated buffers of zeros over the state just restored,
+        discarding both the quadrature-point history and the converged Green-Lagrange strain the
+        total-Lagrangian incremental-strain computation resumes from. A cold start never noticed,
+        because there both buffers are zero anyway.
+        """
+
+        values = np.asarray(values)
+        nStateVars = self._stateVarsRef.size
+        self._stateVarsRef[:] = values[:nStateVars].reshape(self._stateVarsRef.shape)
+        self._Eold[:] = values[nStateVars:].reshape(self._Eold.shape)
+        self._stateVarsTemp = self._stateVarsRef.copy()
+        self._E = self._Eold.copy()
 
     def getResultArray(self, result: str, quadraturePoint: int, getPersistentView: bool = True) -> np.ndarray:
         """Get the array of a result, possibly as a persistent view which is continiously

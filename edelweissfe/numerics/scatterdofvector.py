@@ -42,10 +42,10 @@ class ScatterDofVectorTemplate:
 
     Parameters
     ----------
-    entitiesInDofVector
-        The dictionary mapping entities to their indices in the DofVector.
-    nDof
-        The total number of degrees of freedom.
+    entitiesInDofVector : dict
+        The dictionary mapping entities to their global index arrays in the `DofVector`.
+    nDof : int
+        The total number of global degrees of freedom.
     """
 
     def __init__(self, entitiesInDofVector: dict, nDof: int):
@@ -91,6 +91,8 @@ class ScatterDofVector(np.ndarray):
         obj._global_indices = template.globalIndices
         obj._entitiesInDofVector = template.entitiesInDofVector
         obj._nDof = template.nDof
+        #: Plain-ndarray alias of the same buffer; see __getitem__.
+        obj._plainView = None
 
         return obj
 
@@ -101,50 +103,111 @@ class ScatterDofVector(np.ndarray):
         self._entitiesInDofVector = getattr(obj, "_entitiesInDofVector", None)
         self._nDof = getattr(obj, "_nDof", None)
         self._global_indices = getattr(obj, "_global_indices", None)
+        self._plainView = None
 
     def __getitem__(self, key):
         """
-        Returns a VIEW into the expanded buffer.
+        Returns a view into the contiguous scatter buffer.
 
         Parameters
         ----------
-        key
-            The key for indexing, either an entity or an integer index.
+        key : int, slice, np.ndarray, list, tuple, or entity
+            The key for indexing, either standard numpy index/slice or an entity key.
+
+        Returns
+        -------
+        ndarray or float
+            The slice view corresponding to the key.
         """
-        # try the entity lookup first; it is by far the most common access pattern
+        # Hot path: see DofVector.__getitem__ for the measurement. The slice itself is
+        # cheap here, so wrapping the result back into a ScatterDofVector subclass (which
+        # runs __array_finalize__ and its four attribute lookups) was almost the entire
+        # cost. A plain ndarray view of the same buffer aliases the same memory, so the
+        # element kernels still write straight into the scatter buffer.
         try:
             offset, size = self._offset_map[key]
-            return super().__getitem__(slice(offset, offset + size))
         except (KeyError, TypeError):
             return super().__getitem__(key)
 
-    def assembleInto(self, targetDofVector, absolute=False):
-        """Scatter-Add into the global vector.
+        plainView = self._plainView
+        if plainView is None:
+            plainView = self._plainView = self.view(np.ndarray)
+        return plainView[offset : offset + size]
+
+    def __setitem__(self, key, value):
+        """
+        Assign values to a slice in the scatter buffer.
 
         Parameters
         ----------
-        targetDofVector
-            The target DofVector to assemble into.
-        absolute
-            If True, assemble the absolute values.
+        key : int, slice, np.ndarray, list, tuple, or entity
+            The key for indexing, either standard numpy index/slice or an entity key.
+        value : array_like or float
+            The value(s) to assign.
+        """
+        if isinstance(key, (int, slice, np.ndarray, list, tuple)):
+            super().__setitem__(key, value)
+            return
+
+        try:
+            offset, size = self._offset_map[key]
+            super().__setitem__(slice(offset, offset + size), value)
+        except (KeyError, TypeError):
+            super().__setitem__(key, value)
+
+    def copy(self, order: str = "C") -> "ScatterDofVector":
+        """
+        Create a copy of this ScatterDofVector.
+
+        Parameters
+        ----------
+        order : str, optional
+            The memory layout order ('C' for C-contiguous, 'F' for Fortran-contiguous). Default is 'C'.
+
+        Returns
+        -------
+        ScatterDofVector
+            A new `ScatterDofVector` instance with copied array data and metadata.
+        """
+        new_vec = super().copy(order).view(ScatterDofVector)
+        if self._offset_map is not None:
+            new_vec._offset_map = self._offset_map.copy()
+        if self._entitiesInDofVector is not None:
+            new_vec._entitiesInDofVector = self._entitiesInDofVector.copy()
+        if self._global_indices is not None:
+            new_vec._global_indices = self._global_indices.copy()
+        new_vec._nDof = self._nDof
+        return new_vec
+
+    def assembleInto(self, targetDofVector: np.ndarray, absolute: bool = False) -> None:
+        """
+        Scatter-add values into a global DOF vector.
+
+        Parameters
+        ----------
+        targetDofVector : ndarray
+            The target vector (e.g. `DofVector`) to assemble into.
+        absolute : bool, optional
+            If True, accumulate absolute values. Default is False.
         """
         data = np.abs(self) if absolute else self
         # bincount performs the duplicate-resolving scatter-add in a single pass,
         # considerably faster than the unbuffered np.add.at
         targetDofVector += np.bincount(self._global_indices, weights=data, minlength=self._nDof)
 
-    def toDofVector(self, absolute=False) -> "DofVector":  # noqa: F821
-        """Create a new DofVector from this scatter vector.
+    def toDofVector(self, absolute: bool = False) -> "edelweissfe.numerics.dofvector.DofVector":
+        """
+        Create a new global DofVector by scattering values from this scatter vector.
 
         Parameters
         ----------
-        absolute
-            If True, use absolute values.
+        absolute : bool, optional
+            If True, use absolute values. Default is False.
 
         Returns
         -------
         DofVector
-            The new DofVector.
+            A new `DofVector` containing the accumulated entries.
         """
         new_dof_vector = edelweissfe.numerics.dofvector.DofVector(self._nDof, self._entitiesInDofVector)
         self.assembleInto(new_dof_vector, absolute=absolute)
