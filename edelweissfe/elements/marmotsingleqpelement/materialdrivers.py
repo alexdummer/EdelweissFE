@@ -197,17 +197,17 @@ class MarmotMaterialHypoElasticDriver(BaseMaterialDriver):
         dTime: float,
     ):
         dStrain = np.ascontiguousarray(dU)
-        tangent = np.zeros((6, 6))
 
-        self._material.computeStress(self._stress, tangent, dStrain, time, dTime)
+        # Ke is already the caller's (6, 6) output buffer, so compute the tangent directly
+        # into it instead of allocating a scratch array on every call.
+        self._material.computeStress(self._stress, Ke, dStrain, time, dTime)
 
         self._strain += dStrain
 
         # stored column wise, so that a reshape with order='F' recovers the matrix
-        self._dStress_dStrain[:] = tangent.flatten(order="F")
+        self._dStress_dStrain[:] = Ke.flatten(order="F")
 
         Pe[:] = self._stress
-        Ke[:, :] = tangent
 
     def setCharacteristicElementLength(self, length: float):
         self._material.setCharacteristicElementLength(length)

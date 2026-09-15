@@ -80,6 +80,10 @@ class MarmotMaterialWrappingElement(BaseElement):
         self._nDof = self._driver.nDof
         self._dofIndicesPermutation = np.arange(0, self._nDof, 1, dtype=int)
 
+        # A scratch sink for the tangent computeKernelsExplicit() has no use for, reused across
+        # calls instead of allocating it fresh every time.
+        self._KeScratch = np.zeros((self._nDof, self._nDof))
+
     @property
     def elNumber(self):
         return self._elNumber
@@ -212,7 +216,7 @@ class MarmotMaterialWrappingElement(BaseElement):
     ):
         self._initializeStateVarsTemp()
 
-        self._driver.computeKernels(np.zeros((self._nDof, self._nDof)), Pe, U, dU, time, dTime)
+        self._driver.computeKernels(self._KeScratch, Pe, U, dU, time, dTime)
 
     def computeLumpedInertia(self, Me: np.ndarray):
         """Not implemented for this driver."""

@@ -96,7 +96,11 @@ cdef class MarmotHypoElasticMaterial:
 
         self._material = NULL
 
-        self._materialProperties = np.ascontiguousarray(materialProperties, dtype=float)
+        # np.ascontiguousarray() alone would return the caller's own array unchanged if it is
+        # already contiguous float64, which would let a later in-place mutation of it silently
+        # change this material's behavior, since Marmot only stores the pointer. copy=True
+        # forces an array this instance owns exclusively.
+        self._materialProperties = np.array(materialProperties, dtype=float, order="C", copy=True)
 
         cdef string materialName_ = materialName.encode("UTF-8")
 

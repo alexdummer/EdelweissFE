@@ -95,7 +95,7 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
 
         raise Exception(
             "Unknown Marmot material point base class '{:}'; expected 'hypoelastic', "
-            "'gradientEnhancedHypoElastic' or 'gradientPlasticityHypoElastic'".format(materialName)
+            "'gradientenhancedhypoelastic' or 'gradientplasticityhypoelastic'".format(materialName)
         )
 
     if strCaseCmp(provider, "edelweiss"):

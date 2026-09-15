@@ -352,7 +352,7 @@ class BaseGradientPlasticityHypoElasticMaterial(ABC):
 
     @abstractmethod
     def getResult(self, result: str) -> np.ndarray:
-        """Get the result, as a persistent view which is continiously
+        """Get the result, as a persistent view which is continuously
         updated by the material.
 
         Parameters
