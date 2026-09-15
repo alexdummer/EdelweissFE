@@ -112,32 +112,6 @@ extensions = [
     )
 ]
 
-print("Gather the compiled finite difference cell kernels")
-kernel_dir = join("edelweissfe", "kernels")
-for kernel_source in [
-    "displacementkernel.pyx",
-    "gradientenhanceddisplacementkernel.pyx",
-    "gradientplasticitykernel.pyx",
-]:
-    extensions += [
-        Extension(
-            "*",
-            sources=[join(kernel_dir, kernel_source)],
-            include_dirs=[
-                join(marmot_dir, "include"),
-                numpy.get_include(),
-                eigen_include,
-                # the C++ shims the kernels cimport live next to the material sources
-                join("edelweissfe", "materials", "marmot"),
-            ],
-            libraries=["Marmot"],
-            library_dirs=[join(marmot_dir, "lib")],
-            runtime_library_dirs=[join(marmot_dir, "lib")],
-            language="c++",
-            extra_compile_args=["-O3", "-std=c++20"],
-        )
-    ]
-
 print("Gather the extensions for the point-wise Marmot material interfaces")
 marmot_material_dir = join("edelweissfe", "materials", "marmot")
 for marmot_material_source in [
@@ -347,6 +321,11 @@ setup(
     include_package_data=True,
     package_data={
         "edelweissfe": ["built_extensions.log"],
+        # Downstream packages (e.g. EdelweissFD) compile their own Cython extensions against
+        # the point-wise Marmot material interfaces, so the declarations and C++ shims they
+        # cimport/include have to be part of the installed distribution, not just the source
+        # checkout.
+        "edelweissfe.materials.marmot": ["*.pxd", "*.h"],
     },
 )
 
