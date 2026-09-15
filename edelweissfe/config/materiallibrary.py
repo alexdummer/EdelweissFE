@@ -42,6 +42,18 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
 
     The ``edelweiss`` provider is resolved through the registry (``material`` category).
 
+    The ``marmotmaterialpoint`` provider is different from every other provider here: it is not
+    meant to be used through ``*material`` in an input file at all. ``materialName`` for it is a
+    base-class token (``hypoelastic``, ``gradientenhancedhypoelastic``), not the name of a
+    concrete Marmot material, and the returned class takes ``(materialName, materialProperties)``
+    -- the *actual* Marmot material name plus its properties -- not the single
+    ``materialProperties`` argument ``AbqModelConstructor.createMaterialsFromInputFile`` passes to
+    every other provider's class. It exists purely so external code (e.g. a finite difference
+    stencil in a downstream package) can look up the right point-wise material class generically
+    and construct it itself with the material name and properties *it* has on hand; using it via
+    ``*material, provider=marmotmaterialpoint`` raises or fails with a missing constructor
+    argument instead.
+
     Parameters
     ----------
     materialName
