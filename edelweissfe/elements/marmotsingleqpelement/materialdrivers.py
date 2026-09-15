@@ -75,6 +75,22 @@ class BaseMaterialDriver(ABC):
             The material properties.
         """
 
+    def setMaterial(self, material):
+        """Drive an already constructed material directly, instead of creating a Marmot one
+        from a name and properties as :meth:`createMaterial` does.
+
+        Since a native EdelweissFE material honors the very same interface as its Marmot
+        point-wise counterpart (e.g. :class:`~edelweissfe.materials.base.basehypoelasticmaterial.BaseHypoElasticMaterial`),
+        this lets the same driver evaluate either one interchangeably.
+
+        Parameters
+        ----------
+        material
+            The material to drive, already constructed by the caller.
+        """
+
+        self._material = material
+
     @abstractmethod
     def getNumberOfRequiredStateVars(self) -> int:
         """The total number of state variables, i.e., the driver's own bookkeeping plus
@@ -170,7 +186,7 @@ class MarmotMaterialHypoElasticDriver(BaseMaterialDriver):
             MarmotHypoElasticMaterial,
         )
 
-        self._material = MarmotHypoElasticMaterial(materialName, materialProperties)
+        self.setMaterial(MarmotHypoElasticMaterial(materialName, materialProperties))
 
     def getNumberOfRequiredStateVars(self) -> int:
         return self.nStateVarsOverhead + self._material.getNumberOfRequiredStateVars()
@@ -258,10 +274,13 @@ class MarmotMaterialGradientEnhancedHypoElasticDriver(BaseMaterialDriver):
             MarmotGradientEnhancedHypoElasticMaterial,
         )
 
-        self._material = MarmotGradientEnhancedHypoElasticMaterial(materialName, materialProperties)
+        self.setMaterial(MarmotGradientEnhancedHypoElasticMaterial(materialName, materialProperties))
 
-        if self._material.nNonlocalVariables != 1:
+    def setMaterial(self, material):
+        if material.nNonlocalVariables != 1:
             raise ValueError("This driver supports materials with a single nonlocal variable only.")
+
+        super().setMaterial(material)
 
     def getNumberOfRequiredStateVars(self) -> int:
         return self.nStateVarsOverhead + self._material.getNumberOfRequiredStateVars()
