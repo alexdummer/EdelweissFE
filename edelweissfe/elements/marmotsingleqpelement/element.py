@@ -147,24 +147,29 @@ class MarmotMaterialWrappingElement(BaseElement):
         """
         Not used by this driver"""
 
-    def setMaterial(self, materialName: str, materialProperties: np.ndarray):
-        """Assign a material and material properties to the underlying driver.
-        Furthermore, create two sets of state vars:
+    def setMaterial(self, materialNameOrInstance, materialProperties: np.ndarray = None):
+        """Assign a material to the underlying driver, either a Marmot material by name and
+        properties, or an already constructed one (e.g. a native EdelweissFE material, honoring
+        the same interface as its Marmot point-wise counterpart). Furthermore, create two sets
+        of state vars:
 
             * the actual set,
             * and a temporary set for backup in nonlinear iteration schemes
 
         Parameters
         ----------
-        materialName
-            The name of the requested material.
+        materialNameOrInstance
+            The name of the requested Marmot material, or an already constructed material.
         materialProperties
-            The properties for he requested material.
+            The properties for the requested Marmot material; omitted when passing an already
+            constructed material.
         """
 
-        self._materialProperties = materialProperties
-
-        self._driver.createMaterial(materialName.upper(), materialProperties)
+        if materialProperties is None:
+            self._driver.setMaterial(materialNameOrInstance)
+        else:
+            self._materialProperties = materialProperties
+            self._driver.createMaterial(materialNameOrInstance.upper(), materialProperties)
 
         self._nStateVars = self._driver.getNumberOfRequiredStateVars()
 
