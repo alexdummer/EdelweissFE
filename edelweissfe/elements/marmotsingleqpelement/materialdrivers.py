@@ -398,10 +398,13 @@ class MarmotMaterialGradientPlasticityHypoElasticDriver(BaseMaterialDriver):
             MarmotGradientPlasticityHypoElasticMaterial,
         )
 
-        self._material = MarmotGradientPlasticityHypoElasticMaterial(materialName, materialProperties)
+        self.setMaterial(MarmotGradientPlasticityHypoElasticMaterial(materialName, materialProperties))
 
-        if self._material.nYieldSurfaces != 1:
+    def setMaterial(self, material):
+        if material.nYieldSurfaces != 1:
             raise ValueError("This driver supports materials with a single yield surface only.")
+
+        super().setMaterial(material)
 
     def getNumberOfRequiredStateVars(self) -> int:
         return self.nStateVarsOverhead + self._material.getNumberOfRequiredStateVars()
