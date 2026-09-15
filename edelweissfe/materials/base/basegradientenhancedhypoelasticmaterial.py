@@ -222,7 +222,7 @@ class GradientEnhancedTangents:
         # fill rather than one per entry. The entries are small -- a six by six and five smaller
         # ones -- so for a material point evaluated hundreds of thousands of times in a
         # simulation, the per call overhead of six numpy operations is what dominates, not the
-        # arithmetic, cf. GradientPlasticityTangents.createZero.
+        # arithmetic.
         block = np.zeros(sum(rows * columns for rows, columns in shapes))
 
         views, offset = [], 0

@@ -28,10 +28,8 @@
 """
 The compiled inner loop of a finite difference momentum balance cell.
 
-The counterpart of :mod:`edelweissfe.kernels.gradientplasticitykernel` for the single field
-case, and the same argument applies: the blocks of a cell are small enough that a numpy call
-costs more in dispatch than in arithmetic, so the whole cell is done in C with the interpreter
-lock released.
+For a single field cell, the blocks are small enough that a numpy call costs more in dispatch
+than in arithmetic, so the whole cell is done in C with the interpreter lock released.
 
 This one talks to :class:`MarmotMaterialHypoElastic` directly rather than through a shim, since
 that class is already declared in :mod:`edelweissfe.materials.marmot._marmotmaterials` together

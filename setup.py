@@ -117,7 +117,6 @@ kernel_dir = join("edelweissfe", "kernels")
 for kernel_source in [
     "displacementkernel.pyx",
     "gradientenhanceddisplacementkernel.pyx",
-    "gradientplasticitykernel.pyx",
 ]:
     extensions += [
         Extension(
@@ -143,7 +142,6 @@ marmot_material_dir = join("edelweissfe", "materials", "marmot")
 for marmot_material_source in [
     "marmothypoelastic.pyx",
     "marmotgradientenhancedhypoelastic.pyx",
-    "marmotgradientplasticityhypoelastic.pyx",
 ]:
     extensions += [
         Extension(
