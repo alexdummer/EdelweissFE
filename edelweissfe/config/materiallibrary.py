@@ -26,6 +26,8 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
+from functools import partial
+
 from edelweissfe.config import registry
 from edelweissfe.utils.misc import strCaseCmp
 
@@ -54,6 +56,15 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
     ``*material, provider=marmotmaterialpoint`` raises or fails with a missing constructor
     argument instead.
 
+    The ``marmothypoelastic`` provider is the one to reach for a Marmot material through
+    ``*material`` with an ordinary (non-Marmot) element: ``materialName`` is the actual name
+    Marmot registered the material under, exactly as for every other provider here, and the
+    returned callable takes only ``materialProperties``, matching
+    ``AbqModelConstructor.createMaterialsFromInputFile``. It is deliberately narrower than
+    ``marmotmaterialpoint``: only the hypoelastic family is offered, since that is the only
+    interface an ordinary element's ``computeStress``/``computePlaneStress`` calls understand --
+    the gradient-enhanced family's second field has nowhere to attach on such an element.
+
     Parameters
     ----------
     materialName
@@ -64,7 +75,9 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
     Returns
     -------
     type
-        The material provider class type, or ``None`` for the ``marmotmaterial`` provider.
+        A callable taking ``materialProperties`` alone and returning a material instance, for
+        every provider except ``marmotmaterial`` (``None``) and ``marmotmaterialpoint`` (the bare
+        class, taking ``materialName`` and ``materialProperties``).
 
     Raises
     ------
@@ -102,6 +115,19 @@ def getMaterialClass(materialName: str, provider: str = None) -> type:
             "Unknown Marmot material point base class '{:}'; expected 'hypoelastic' or "
             "'gradientenhancedhypoelastic'".format(materialName)
         )
+
+    if strCaseCmp(provider, "marmothypoelastic"):
+        # Unlike marmotmaterialpoint, materialName here is the real Marmot material name, so
+        # the base class doesn't need stating -- an ordinary element only ever drives the
+        # hypoelastic one. Bind it now so the caller can construct with materialProperties
+        # alone, exactly as it would any other provider's class.
+        from edelweissfe.materials.marmot.marmothypoelastic import (
+            MarmotHypoElasticMaterial,
+        )
+
+        # Marmot's own factory registers names in upper case; matching the case-insensitivity
+        # MarmotMaterialWrappingElement.setMaterial already affords the QP element's path.
+        return partial(MarmotHypoElasticMaterial, materialName.upper())
 
     if strCaseCmp(provider, "edelweiss"):
 
