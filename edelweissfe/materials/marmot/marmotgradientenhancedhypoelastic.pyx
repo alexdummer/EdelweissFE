@@ -89,12 +89,17 @@ cdef class MarmotGradientEnhancedHypoElasticMaterial:
 
         cdef string materialName_ = materialName.encode("UTF-8")
 
-        self._material = new GradientEnhancedHypoElasticShim1(
-            materialName_,
-            &self._materialProperties[0],
-            self._materialProperties.shape[0],
-            materialNumber,
-        )
+        try:
+            self._material = new GradientEnhancedHypoElasticShim1(
+                materialName_,
+                &self._materialProperties[0],
+                self._materialProperties.shape[0],
+                materialNumber,
+            )
+        except Exception:
+            raise NotImplementedError(
+                "Marmot material {:} not found in library.".format(materialName)
+            )
 
         self.materialName = materialName
 

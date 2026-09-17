@@ -104,16 +104,26 @@ cdef class MarmotHypoElasticMaterial:
 
         cdef string materialName_ = materialName.encode("UTF-8")
 
-        self._material = MarmotMaterialHypoElasticFactory.createMaterial(
-            materialName_,
-            &self._materialProperties[0],
-            self._materialProperties.shape[0],
-            materialNumber,
-        )
+        try:
+            self._material = MarmotMaterialHypoElasticFactory.createMaterial(
+                materialName_,
+                &self._materialProperties[0],
+                self._materialProperties.shape[0],
+                materialNumber,
+            )
+            if self._material == NULL:
+                self._material = MarmotMaterialHypoElasticFactory.createMaterial(
+                    materialName.upper().encode("UTF-8"),
+                    &self._materialProperties[0],
+                    self._materialProperties.shape[0],
+                    materialNumber,
+                )
+        except Exception:
+            self._material = NULL
 
         if self._material == NULL:
-            raise ValueError(
-                "Marmot does not provide a hypoelastic material '{:}'".format(materialName)
+            raise NotImplementedError(
+                "Marmot material {:} not found in library.".format(materialName)
             )
 
         self.materialName = materialName
