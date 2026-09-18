@@ -104,16 +104,33 @@ cdef class MarmotHypoElasticMaterial:
 
         cdef string materialName_ = materialName.encode("UTF-8")
 
-        self._material = MarmotMaterialHypoElasticFactory.createMaterial(
-            materialName_,
-            &self._materialProperties[0],
-            self._materialProperties.shape[0],
-            materialNumber,
-        )
+        try:
+            self._material = MarmotMaterialHypoElasticFactory.createMaterial(
+                materialName_,
+                &self._materialProperties[0],
+                self._materialProperties.shape[0],
+                materialNumber,
+            )
+        except Exception:
+            self._material = NULL
+
+        # Marmot's factory throws on an unregistered name rather than returning NULL, so the
+        # uppercase retry has to be its own try/except -- nesting it inside the one above would
+        # never run it, since the first call's exception would already have unwound past it.
+        if self._material == NULL:
+            try:
+                self._material = MarmotMaterialHypoElasticFactory.createMaterial(
+                    materialName.upper().encode("UTF-8"),
+                    &self._materialProperties[0],
+                    self._materialProperties.shape[0],
+                    materialNumber,
+                )
+            except Exception:
+                self._material = NULL
 
         if self._material == NULL:
-            raise ValueError(
-                "Marmot does not provide a hypoelastic material '{:}'".format(materialName)
+            raise NotImplementedError(
+                "Marmot material {:} not found in library.".format(materialName)
             )
 
         self.materialName = materialName

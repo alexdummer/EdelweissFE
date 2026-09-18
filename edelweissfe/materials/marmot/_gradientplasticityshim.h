@@ -39,6 +39,7 @@
 #include "Marmot/MarmotUtils.h"
 
 #include <Eigen/Core>
+#include <cctype>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -74,11 +75,32 @@ namespace EdelweissFE {
                                        int                materialNumber )
       : ownedMaterialProperties( materialProperties, materialProperties + nMaterialProperties )
     {
-      material = MarmotLibrary::MarmotMaterialGradientPlasticityHypoElasticFactory<
-        nYieldSurfaces >::createMaterial( materialName,
-                                          ownedMaterialProperties.data(),
-                                          static_cast< int >( ownedMaterialProperties.size() ),
-                                          materialNumber );
+      try {
+        material = MarmotLibrary::MarmotMaterialGradientPlasticityHypoElasticFactory<
+          nYieldSurfaces >::createMaterial( materialName,
+                                            ownedMaterialProperties.data(),
+                                            static_cast< int >( ownedMaterialProperties.size() ),
+                                            materialNumber );
+      }
+      catch ( ... ) {
+        material = nullptr;
+      }
+
+      if ( material == nullptr ) {
+        std::string upperName = materialName;
+        for ( auto& c : upperName )
+          c = static_cast< char >( toupper( c ) );
+        try {
+          material = MarmotLibrary::MarmotMaterialGradientPlasticityHypoElasticFactory<
+            nYieldSurfaces >::createMaterial( upperName,
+                                              ownedMaterialProperties.data(),
+                                              static_cast< int >( ownedMaterialProperties.size() ),
+                                              materialNumber );
+        }
+        catch ( ... ) {
+          material = nullptr;
+        }
+      }
 
       if ( material == nullptr )
         throw std::invalid_argument( "Marmot does not provide a gradient plasticity hypoelastic material '" +

@@ -42,18 +42,18 @@ cdef extern from "_gradientplasticityshim.h" namespace "EdelweissFE" nogil:
         GradientPlasticityHypoElasticShim1(const string& materialName,
                                            const double* materialProperties,
                                            int nMaterialProperties,
-                                           int materialNumber) except +
+                                           int materialNumber) except +ValueError
 
         @staticmethod
         int getNumberOfYieldSurfaces()
 
         int getNumberOfRequiredStateVars()
 
-        void initializeYourself(double* stateVars, int nStateVars) except +
+        void initializeYourself(double* stateVars, int nStateVars) except +ValueError
 
-        double getDensity(const double* stateVars) except +
+        double getDensity(const double* stateVars) except +ValueError
 
-        StateView getStateView(const string& stateName, double* stateVars) except +
+        StateView getStateView(const string& stateName, double* stateVars) except +ValueError
 
         void computeStress(double* stress,
                            double* f,
@@ -71,4 +71,4 @@ cdef extern from "_gradientplasticityshim.h" namespace "EdelweissFE" nogil:
                            double* stateVars,
                            double time,
                            double dT,
-                           bint planeStress) except +
+                           bint planeStress) except +ValueError

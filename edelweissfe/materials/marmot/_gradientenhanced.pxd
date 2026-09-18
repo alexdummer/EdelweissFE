@@ -43,20 +43,20 @@ cdef extern from "_gradientenhancedshim.h" namespace "EdelweissFE" nogil:
         GradientEnhancedHypoElasticShim1(const string& materialName,
                                          const double* materialProperties,
                                          int nMaterialProperties,
-                                         int materialNumber) except +
+                                         int materialNumber) except +ValueError
 
         @staticmethod
         int getNumberOfNonlocalVariables()
 
         int getNumberOfRequiredStateVars()
 
-        void initializeYourself(double* stateVars, int nStateVars) except +
+        void initializeYourself(double* stateVars, int nStateVars) except +ValueError
 
-        double getDensity(const double* stateVars) except +
+        double getDensity(const double* stateVars) except +ValueError
 
-        StateView getStateView(const string& stateName, double* stateVars) except +
+        StateView getStateView(const string& stateName, double* stateVars) except +ValueError
 
-        void getNonlocalViscosity(const double* stateVars, double* viscosity) except +
+        void getNonlocalViscosity(const double* stateVars, double* viscosity) except +ValueError
 
         void computeStress(double* stress,
                            double* KLocal,
@@ -75,4 +75,4 @@ cdef extern from "_gradientenhancedshim.h" namespace "EdelweissFE" nogil:
                            double* stateVars,
                            double time,
                            double dT,
-                           bint planeStress) except +
+                           bint planeStress) except +ValueError

@@ -43,15 +43,18 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from edelweissfe.materials.base.basegradientenhancedhypoelasticmaterial import (
+    BaseGradientEnhancedHypoElasticMaterial,
     GradientEnhancedIncrement,
     GradientEnhancedResponse,
     GradientEnhancedTangents,
 )
 from edelweissfe.materials.base.basegradientplasticityhypoelasticmaterial import (
+    BaseGradientPlasticityHypoElasticMaterial,
     GradientPlasticityIncrement,
     GradientPlasticityResponse,
     GradientPlasticityTangents,
 )
+from edelweissfe.materials.base.basehypoelasticmaterial import BaseHypoElasticMaterial
 
 
 class BaseMaterialDriver(ABC):
@@ -78,6 +81,14 @@ class BaseMaterialDriver(ABC):
             The name Marmot registered the material under.
         materialProperties
             The material properties.
+
+        Raises
+        ------
+        ImportError
+            If this driver's point-wise material extension was not built. Each concrete driver
+            imports its own extension lazily here, not at module scope: the point-wise material
+            extensions are compiled independently of one another, so a build missing one family
+            must not break every other driver merely by importing this module.
         """
 
     def setMaterial(self, material):
@@ -193,6 +204,15 @@ class MarmotMaterialHypoElasticDriver(BaseMaterialDriver):
 
         self.setMaterial(MarmotHypoElasticMaterial(materialName, materialProperties))
 
+    def setMaterial(self, material):
+        if not isinstance(material, BaseHypoElasticMaterial):
+            raise TypeError(
+                "This driver requires a material implementing BaseHypoElasticMaterial; got "
+                "{:}.".format(type(material).__name__)
+            )
+
+        super().setMaterial(material)
+
     def getNumberOfRequiredStateVars(self) -> int:
         return self.nStateVarsOverhead + self._material.getNumberOfRequiredStateVars()
 
@@ -282,6 +302,12 @@ class MarmotMaterialGradientEnhancedHypoElasticDriver(BaseMaterialDriver):
         self.setMaterial(MarmotGradientEnhancedHypoElasticMaterial(materialName, materialProperties))
 
     def setMaterial(self, material):
+        if not isinstance(material, BaseGradientEnhancedHypoElasticMaterial):
+            raise TypeError(
+                "This driver requires a material implementing "
+                "BaseGradientEnhancedHypoElasticMaterial; got {:}.".format(type(material).__name__)
+            )
+
         if material.nNonlocalVariables != 1:
             raise ValueError("This driver supports materials with a single nonlocal variable only.")
 
@@ -401,6 +427,12 @@ class MarmotMaterialGradientPlasticityHypoElasticDriver(BaseMaterialDriver):
         self.setMaterial(MarmotGradientPlasticityHypoElasticMaterial(materialName, materialProperties))
 
     def setMaterial(self, material):
+        if not isinstance(material, BaseGradientPlasticityHypoElasticMaterial):
+            raise TypeError(
+                "This driver requires a material implementing "
+                "BaseGradientPlasticityHypoElasticMaterial; got {:}.".format(type(material).__name__)
+            )
+
         if material.nYieldSurfaces != 1:
             raise ValueError("This driver supports materials with a single yield surface only.")
 

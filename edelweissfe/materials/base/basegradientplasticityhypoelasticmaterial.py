@@ -181,18 +181,12 @@ class GradientPlasticityTangents:
     dF_dLambda: np.ndarray
     dF_dLaplacian: np.ndarray
 
-    #: The names of all tangent entries, in the order in which Marmot declares them.
-    entryNames: tuple = field(
-        default=(
-            "dStress_dStrain",
-            "dStress_dLambda",
-            "dStress_dLaplacian",
-            "dF_dStrain",
-            "dF_dLambda",
-            "dF_dLaplacian",
-        ),
-        repr=False,
-    )
+    #: The contiguous block createZero() allocates the six entries above as views into, so that
+    #: zero() can reset all of them with a single fill; a declared field (defaulting to unset,
+    #: not an attribute createZero() bolts on afterwards) so zero() can tell the two construction
+    #: paths apart without hasattr/getattr. None for an instance built by hand rather than by
+    #: createZero, which falls back to zeroing each entry individually.
+    _block: np.ndarray = field(default=None, repr=False, compare=False)
 
     @classmethod
     def createZero(cls, nYieldSurfaces: int):
@@ -239,14 +233,19 @@ class GradientPlasticityTangents:
         that the class stays usable either way.
         """
 
-        block = getattr(self, "_block", None)
-
-        if block is not None:
-            block.fill(0.0)
+        if self._block is not None:
+            self._block.fill(0.0)
             return
 
-        for name in self.entryNames:
-            getattr(self, name)[:] = 0.0
+        for entry in (
+            self.dStress_dStrain,
+            self.dStress_dLambda,
+            self.dStress_dLaplacian,
+            self.dF_dStrain,
+            self.dF_dLambda,
+            self.dF_dLaplacian,
+        ):
+            entry[:] = 0.0
 
 
 class BaseGradientPlasticityHypoElasticMaterial(ABC):

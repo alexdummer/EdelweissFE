@@ -186,18 +186,12 @@ class GradientEnhancedTangents:
     dc_dK: np.ndarray
     d2c_dK2: np.ndarray
 
-    #: The names of all tangent entries, in the order in which Marmot declares them.
-    entryNames: tuple = field(
-        default=(
-            "dStress_dStrain",
-            "dStress_dK",
-            "dKLocal_dStrain",
-            "dKLocal_dK",
-            "dc_dK",
-            "d2c_dK2",
-        ),
-        repr=False,
-    )
+    #: The contiguous block createZero() allocates the six entries above as views into, so that
+    #: zero() can reset all of them with a single fill; a declared field (defaulting to unset,
+    #: not an attribute createZero() bolts on afterwards) so zero() can tell the two construction
+    #: paths apart without hasattr/getattr. None for an instance built by hand rather than by
+    #: createZero, which falls back to zeroing each entry individually.
+    _block: np.ndarray = field(default=None, repr=False, compare=False)
 
     @classmethod
     def createZero(cls, nNonlocalVariables: int):
@@ -243,14 +237,19 @@ class GradientEnhancedTangents:
         that the class stays usable either way.
         """
 
-        block = getattr(self, "_block", None)
-
-        if block is not None:
-            block.fill(0.0)
+        if self._block is not None:
+            self._block.fill(0.0)
             return
 
-        for name in self.entryNames:
-            getattr(self, name)[:] = 0.0
+        for entry in (
+            self.dStress_dStrain,
+            self.dStress_dK,
+            self.dKLocal_dStrain,
+            self.dKLocal_dK,
+            self.dc_dK,
+            self.d2c_dK2,
+        ):
+            entry[:] = 0.0
 
 
 class BaseGradientEnhancedHypoElasticMaterial(ABC):
