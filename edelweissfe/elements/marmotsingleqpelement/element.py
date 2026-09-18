@@ -163,13 +163,35 @@ class MarmotMaterialWrappingElement(BaseElement):
         materialProperties
             The properties for the requested Marmot material; omitted when passing an already
             constructed material.
+
+        Raises
+        ------
+        TypeError
+            If ``materialNameOrInstance`` is a ``str`` and ``materialProperties`` is missing, or
+            if it is an already constructed material and ``materialProperties`` is given anyway --
+            dispatching on type rather than only on whether ``materialProperties`` is ``None``
+            catches a caller passing a bare material name and forgetting the properties
+            immediately, instead of silently storing the string as the "material" and failing
+            much later with a confusing ``AttributeError`` out of ``computeKernels``.
         """
 
-        if materialProperties is None:
-            self._driver.setMaterial(materialNameOrInstance)
-        else:
+        if isinstance(materialNameOrInstance, str):
+            if materialProperties is None:
+                raise TypeError(
+                    "setMaterial() requires materialProperties when materialNameOrInstance is "
+                    "a material name; omit it only when passing an already constructed material."
+                )
+
             self._materialProperties = materialProperties
             self._driver.createMaterial(materialNameOrInstance.upper(), materialProperties)
+        else:
+            if materialProperties is not None:
+                raise TypeError(
+                    "setMaterial() does not take materialProperties when materialNameOrInstance "
+                    "is an already constructed material."
+                )
+
+            self._driver.setMaterial(materialNameOrInstance)
 
         self._nStateVars = self._driver.getNumberOfRequiredStateVars()
 
@@ -219,6 +241,14 @@ class MarmotMaterialWrappingElement(BaseElement):
         time: float,
         dTime: float,
     ):
+        """Evaluate the material for explicit dynamics, computing and discarding the tangent.
+
+        Unlike the native ``MarmotElementWrapper``, none of Marmot's point-wise
+        ``computeStress``/``computePlaneStress``/``computeUniaxialStress`` routines this driver
+        calls offer a tangent-free variant -- the tangent is always computed as part of the same
+        call that produces the stress, so there is currently no cheaper path available here.
+        """
+
         self._initializeStateVarsTemp()
 
         self._driver.computeKernels(self._KeScratch, Pe, U, dU, time, dTime)

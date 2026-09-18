@@ -111,15 +111,22 @@ cdef class MarmotHypoElasticMaterial:
                 self._materialProperties.shape[0],
                 materialNumber,
             )
-            if self._material == NULL:
+        except Exception:
+            self._material = NULL
+
+        # Marmot's factory throws on an unregistered name rather than returning NULL, so the
+        # uppercase retry has to be its own try/except -- nesting it inside the one above would
+        # never run it, since the first call's exception would already have unwound past it.
+        if self._material == NULL:
+            try:
                 self._material = MarmotMaterialHypoElasticFactory.createMaterial(
                     materialName.upper().encode("UTF-8"),
                     &self._materialProperties[0],
                     self._materialProperties.shape[0],
                     materialNumber,
                 )
-        except Exception:
-            self._material = NULL
+            except Exception:
+                self._material = NULL
 
         if self._material == NULL:
             raise NotImplementedError(

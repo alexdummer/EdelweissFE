@@ -86,15 +86,15 @@ cdef inline np.ndarray stateViewAsArray(StateView res):
 cdef extern from "Marmot/MarmotMaterialHypoElastic.h":
     cdef cppclass MarmotMaterialHypoElastic nogil:
 
-        StateView getStateView(const string& stateName, double* stateVars) except +
+        StateView getStateView(const string& stateName, double* stateVars) except +ValueError
 
-        void initializeYourself(double* stateVars, int nStateVars) except +
+        void initializeYourself(double* stateVars, int nStateVars) except +ValueError
 
         void setCharacteristicElementLength(double length)
 
         int getNumberOfRequiredStateVars()
 
-        double getDensity(const double* stateVars) except +
+        double getDensity(const double* stateVars) except +ValueError
 
         struct state3D:
             Vector6d stress
@@ -121,17 +121,17 @@ cdef extern from "Marmot/MarmotMaterialHypoElastic.h":
         void computeStress(state3D& state,
                            Matrix6d& dStress_dStrain,
                            const Vector6d& dStrain,
-                           const timeInfo& timeInfo) except +
+                           const timeInfo& timeInfo) except +ValueError
 
         void computePlaneStress(state2D& state,
                                 Matrix3d& dStress_dStrain2D,
                                 const Vector3d& dStrain2D,
-                                const timeInfo& timeInfo) except +
+                                const timeInfo& timeInfo) except +ValueError
 
         void computeUniaxialStress(state1D& state,
                                    double& dStress_dStrain1D,
                                    const double dStrain,
-                                   const timeInfo& timeInfo) except +
+                                   const timeInfo& timeInfo) except +ValueError
 
 
 cdef extern from "Marmot/MarmotMaterialHypoElasticFactory.h" namespace "MarmotLibrary" nogil:
@@ -142,4 +142,4 @@ cdef extern from "Marmot/MarmotMaterialHypoElasticFactory.h" namespace "MarmotLi
                 const string& materialName,
                 const double* materialProperties,
                 int nMaterialProperties,
-                int materialNumber) except +
+                int materialNumber) except +ValueError
