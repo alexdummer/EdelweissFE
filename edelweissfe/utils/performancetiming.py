@@ -323,9 +323,6 @@ def extractIncrementTimeRows(maxLevels: int = 4, skipUnused: bool = False) -> li
         One ``(level, function, time, calls)`` row per timed category, parents before children.
     """
 
-    if not hasattr(extractIncrementTimeRows, "_last_snapshot") or extractIncrementTimeRows._last_snapshot is None:
-        extractIncrementTimeRows._last_snapshot = None
-
     current_state = _mergedSnapshot()
 
     def compute_delta(curr, last):
@@ -357,6 +354,9 @@ def extractIncrementTimeRows(maxLevels: int = 4, skipUnused: bool = False) -> li
         return rows
 
     return flatten_delta(delta_tree, 0)
+
+
+extractIncrementTimeRows._last_snapshot = None
 
 
 def makeIncrementTimesPrettyTable(rows: list[tuple[int, str, float, int]]) -> PrettyTable:
