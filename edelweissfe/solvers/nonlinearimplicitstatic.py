@@ -631,6 +631,8 @@ class NIST(NonlinearSolverBase):
 
         self.applyStepActionsAtIncrementStart(model, timeStep, stepActions)
 
+        self.initializeIncrement(U_n, stepActions, model, timeStep)
+
         dU, isExtrapolatedIncrement = self.extrapolateLastIncrement(
             extrapolation, timeStep, dU, dirichlets, prevTimeStep, model
         )
@@ -650,6 +652,8 @@ class NIST(NonlinearSolverBase):
 
             R[:] = -P
             R += PExt
+
+            self.assembleAdditionalTerms(dU, R, F, K, timeStep)
 
             # Condense the residual BEFORE the Dirichlet handling below: T^T folds slave-row
             # residuals into their master rows, which may themselves carry a prescribed delta --
@@ -703,7 +707,72 @@ class NIST(NonlinearSolverBase):
             dU += ddU
             iterationCounter += 1
 
+        self.finalizeIncrement(model)
+
         return U_np, dU, P, iterationCounter, incrementResidualHistory
+
+    def initializeIncrement(self, U_n: DofVector, stepActions: dict, model: FEModel, timeStep: TimeStep):
+        """Prepare what :meth:`assembleAdditionalTerms` needs during this increment's Newton
+        iterations. Called by :meth:`solveIncrement` once per increment, after the step actions have
+        been applied at the increment's start and before the increment is extrapolated.
+
+        A static analysis needs nothing here. A dynamic one, for example, assembles its mass matrix
+        here and computes the terms the time integration adds to the stiffness for this time
+        increment -- see :class:`~edelweissfe.solvers.nonlinearimplicitdynamic.NonlinearImplicitDynamic`.
+
+        Parameters
+        ----------
+        U_n
+            The solution at the start of the increment.
+        stepActions
+            The active step actions.
+        model
+            The model tree.
+        timeStep
+            The time step.
+        """
+
+    def assembleAdditionalTerms(
+        self, dU: DofVector, R: DofVector, F: DofVector, K: VIJSystemMatrix, timeStep: TimeStep
+    ):
+        """Assemble terms of the equation system beyond the internal and external forces. Called
+        by :meth:`solveIncrement` in every Newton iteration, next to :meth:`computeElements`,
+        :meth:`assembleLoads` and :meth:`assembleConstraints`: right after the residual
+        :math:`R = P_\\mathrm{ext} - P_\\mathrm{int}` is formed, and before the
+        multi-point-constraint condensation, the Dirichlet handling, the convergence test and the
+        linear solve -- which therefore all act on what is added here.
+
+        A static analysis has no such terms. A dynamic one, for example, subtracts the inertia force
+        :math:`M \\ddot{u}` from the residual and adds the corresponding mass term to the stiffness
+        -- see :class:`~edelweissfe.solvers.nonlinearimplicitdynamic.NonlinearImplicitDynamic`.
+
+        Parameters
+        ----------
+        dU
+            The current trial solution increment.
+        R
+            The residual, to be augmented in place.
+        F
+            The reference flux scale of the convergence test, to be augmented in place.
+        K
+            The tangent in VIJ layout, to be augmented in place.
+        timeStep
+            The time step.
+        """
+
+    def finalizeIncrement(self, model: FEModel):
+        """Store what the converged increment leaves behind. Called by :meth:`solveIncrement` once
+        its Newton loop has converged -- only for an accepted increment, since a failing one leaves
+        by exception before it.
+
+        A static analysis stores nothing here. A dynamic one, for example, stores the velocity and
+        acceleration of the converged increment, as the starting point of the next one.
+
+        Parameters
+        ----------
+        model
+            The model tree.
+        """
 
     @performancetiming.timeit("distributed loads")
     def computeDistributedLoads(
