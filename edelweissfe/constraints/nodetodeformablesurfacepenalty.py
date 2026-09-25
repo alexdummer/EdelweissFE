@@ -31,7 +31,13 @@ from dataclasses import dataclass
 import numpy as np
 
 from edelweissfe.constraints.base.constraintbase import ConstraintBase
-from edelweissfe.elements.contactsurfaceelement import facetNormalAndMeasure
+from edelweissfe.constraints.base.forcesonlyexplicitevaluation import (
+    ForcesOnlyExplicitEvaluation,
+)
+from edelweissfe.constraints.base.penaltylaw import (
+    normalPenaltyForce,
+    validatedContactType,
+)
 from edelweissfe.journal.journal import Journal
 from edelweissfe.models.femodel import FEModel
 from edelweissfe.models.meshdependent import MeshDependent
@@ -39,11 +45,15 @@ from edelweissfe.sets.elementset import ElementSet
 from edelweissfe.timesteppers.timestep import TimeStep
 from edelweissfe.utils.facetcontactgeometry import (
     closestFacetCandidates,
+    facetNormalAndMeasure,
     line2ClosestPoint,
     line2GapGradientHessian,
+    line2Projection,
     tria3ClosestPoint,
     tria3GapGradientHessian,
+    tria3Projection,
 )
+from edelweissfe.utils.meshtools import currentNodeCoordinates
 from edelweissfe.utils.schema import buildSchemaFromOptions, schemaField
 
 """
@@ -213,36 +223,7 @@ class DeformableSurfaceContactStiffnessView:
             self.K_fp.append(fp)
 
 
-def _tria3Containment(xs: np.ndarray, x1: np.ndarray, x2: np.ndarray, x3: np.ndarray) -> tuple[float, float, bool]:
-    """Barycentric-like in-plane coordinates (alpha, beta) of the projection of xs onto the
-    (possibly non-orthogonal) basis spanned by (x2-x1, x3-x1), and whether that projection falls
-    inside the triangle."""
-
-    e1 = x2 - x1
-    e2 = x3 - x1
-    r = xs - x1
-    n = np.cross(e1, e2)
-    n = n / np.linalg.norm(n)
-    rTangential = r - r.dot(n) * n
-
-    A = np.array([[e1.dot(e1), e1.dot(e2)], [e1.dot(e2), e2.dot(e2)]])
-    b = np.array([e1.dot(rTangential), e2.dot(rTangential)])
-    alpha, beta = np.linalg.solve(A, b)
-
-    inside = alpha >= 0.0 and beta >= 0.0 and (alpha + beta) <= 1.0
-    return alpha, beta, inside
-
-
-def _line2Containment(xs: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> tuple[float, bool]:
-    """Parametric coordinate t of the projection of xs onto the edge (x1,x2), and whether that
-    projection falls inside the segment."""
-
-    e = x2 - x1
-    t = (xs - x1).dot(e) / e.dot(e)
-    return t, 0.0 <= t <= 1.0
-
-
-class Constraint(ConstraintBase, MeshDependent):
+class Constraint(ForcesOnlyExplicitEvaluation, ConstraintBase, MeshDependent):
     """
     Penalty based unilateral contact between the tributary-area-weighted nodes of a deformable
     slave surface and a deformable master surface, both represented by flat (Tria3/Line2) contact
@@ -391,9 +372,7 @@ class Constraint(ConstraintBase, MeshDependent):
         self.penalty = configuration.penalty
         if self.penalty <= 0.0:
             raise ValueError("The penalty must be positive: a non-positive penalty silently disables contact.")
-        self.type = configuration.contactType.lower()
-        if self.type not in ["linear", "quadratic"]:
-            raise ValueError(f"Constraint type '{self.type}' is not supported. Use 'linear' or 'quadratic'.")
+        self.type = validatedContactType(configuration.contactType)
         self.searchDistance = configuration.searchDistance
 
         self.sliding = configuration.sliding.lower()
@@ -490,14 +469,6 @@ class Constraint(ConstraintBase, MeshDependent):
     def nDof(self) -> int:
         return self._nDof
 
-    def _currentCoordinates(self, nodes: list, model: FEModel, referenceCoords: np.ndarray) -> np.ndarray:
-        dispField = model.nodeFields.get("displacement")
-        if dispField is None or "U" not in dispField:
-            return referenceCoords.copy()
-        idcs = dispField._indicesOfNodesInArray
-        u = np.array([dispField["U"][idcs[n]] if n in idcs else np.zeros(self.nDim) for n in nodes])
-        return referenceCoords + u
-
     def updateConnectivity(self, model: FEModel) -> bool:
         """Re-assign each slave node to its single closest facet, based on the last converged
         configuration. Called once per increment by the solver, before the equation system is
@@ -507,9 +478,9 @@ class Constraint(ConstraintBase, MeshDependent):
 
         # refreshed by FEModel.refreshMeshDependents; nothing extra to do at this tick
 
-        slaveCoords = self._currentCoordinates(self.slaveNodes, model, self._referenceCoordsSlaves)
+        slaveCoords = currentNodeCoordinates(self.slaveNodes, model, self._referenceCoordsSlaves)
         facetCoords = [
-            self._currentCoordinates(el.nodes, model, self._referenceCoordsFacets[i])
+            currentNodeCoordinates(el.nodes, model, self._referenceCoordsFacets[i])
             for i, el in enumerate(self.facetElements)
         ]
 
@@ -773,18 +744,6 @@ class Constraint(ConstraintBase, MeshDependent):
                     J_[k] = pIdcs[j]
                     k += 1
 
-    def applyConstraintExplicit(
-        self,
-        U_np: np.ndarray,
-        dU: np.ndarray,
-        PExt: np.ndarray,
-        timeStep: TimeStep,
-    ):
-        """Forces without a tangent, by running the one loop with ``K=None``. Overrides the base
-        implementation to avoid constructing an unused tangent matrix container."""
-
-        self.applyConstraint(U_np, dU, PExt, None, timeStep)
-
     def applyConstraint(
         self,
         U_np: np.ndarray,
@@ -835,13 +794,13 @@ class Constraint(ConstraintBase, MeshDependent):
                 H = None
             else:
                 if nFacetNodes == 3:
-                    alpha, beta, inside = _tria3Containment(xs, *facetCoords)
+                    alpha, beta, inside = tria3Projection(xs, *facetCoords)
                     if not inside:
                         activeIdx += 1
                         continue
                     g, w, H = tria3GapGradientHessian(xs, *facetCoords)
                 else:
-                    t, inside = _line2Containment(xs, *facetCoords)
+                    t, inside = line2Projection(xs, *facetCoords)
                     if not inside:
                         activeIdx += 1
                         continue
@@ -864,20 +823,15 @@ class Constraint(ConstraintBase, MeshDependent):
                 # multiplier decays to zero within a few increments after separation.
                 f_n = lambdaForce
                 stiffness = 0.0
-            elif self.type == "linear":
-                f_n = lambdaForce + penaltyTimesArea * g
-                stiffness = penaltyTimesArea
             else:
-                # Repulsive force growing quadratically with penetration: f_n must carry the sign
-                # of g (negative in contact) so that PExt -= f_n * w pushes the slave outward,
-                # matching the linear branch; stiffness = df_n/dg is then positive for g < 0.
-                f_n = lambdaForce - 0.5 * penaltyTimesArea * g**2
-                stiffness = -penaltyTimesArea * g
+                # f_n carries the sign of g (negative in contact), so that PExt -= f_n * w pushes
+                # the slave outward; see edelweissfe.constraints.base.penaltylaw.
+                penaltyForce, stiffness = normalPenaltyForce(self.type, penaltyTimesArea, g)
+                f_n = lambdaForce + penaltyForce
 
             PLocal = -f_n * w
 
-            # K is None when the caller discards the tangent -- see
-            # ConstraintBase.applyConstraintExplicit.
+            # K is None in explicit runs -- see ForcesOnlyExplicitEvaluation.
             KLocal = None
             if K is not None:
                 KLocal = stiffness * np.outer(w, w)
@@ -1024,10 +978,8 @@ class Constraint(ConstraintBase, MeshDependent):
                 # zero with the linear measure (there is no penalty force to transfer).
                 if g >= 0.0:
                     penaltyForcePart = penaltyTimesArea * g
-                elif self.type == "linear":
-                    penaltyForcePart = penaltyTimesArea * g
                 else:
-                    penaltyForcePart = -0.5 * penaltyTimesArea * g**2
+                    penaltyForcePart, _ = normalPenaltyForce(self.type, penaltyTimesArea, g)
 
                 self._lambdaN[s] = min(0.0, self._lambdaN[s] + penaltyForcePart)
 

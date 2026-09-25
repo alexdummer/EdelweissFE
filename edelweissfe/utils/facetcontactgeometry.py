@@ -26,9 +26,6 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-import numpy as np
-from scipy.spatial import cKDTree
-
 """
 Exact gap function, gradient, and full Hessian (including the second-derivative term arising
 from the cross-product-then-normalize/rotate-then-normalize construction of the facet normal) for
@@ -48,16 +45,10 @@ Do not hand-edit these formulas without re-verifying them the same way; this kin
 normalize/rotate second-derivative algebra is very easy to get subtly wrong.
 """
 
+import numpy as np
+from scipy.spatial import cKDTree
 
-def _skew(v: np.ndarray) -> np.ndarray:
-    """The skew-symmetric cross-product matrix of a 3-vector, such that ``_skew(v) @ x == v x x``."""
-    return np.array(
-        [
-            [0.0, -v[2], v[1]],
-            [v[2], 0.0, -v[0]],
-            [-v[1], v[0], 0.0],
-        ]
-    )
+from edelweissfe.utils.rotations import skewMatrix
 
 
 def tria3GapGradientHessian(
@@ -93,7 +84,7 @@ def tria3GapGradientHessian(
     blocks = ("xs", "x1", "x2", "x3")
 
     dr_dBlock = {"xs": np.eye(3), "x1": -np.eye(3), "x2": np.zeros((3, 3)), "x3": np.zeros((3, 3))}
-    dc_dBlock = {"xs": np.zeros((3, 3)), "x1": -_skew(x2 - x3), "x2": -_skew(e2), "x3": _skew(e1)}
+    dc_dBlock = {"xs": np.zeros((3, 3)), "x1": -skewMatrix(x2 - x3), "x2": -skewMatrix(e2), "x3": skewMatrix(e1)}
 
     projectorOntoTangentPlane = np.eye(3) - np.outer(n, n)
     dn_dBlock = {k: (projectorOntoTangentPlane @ dc_dBlock[k]) / m for k in blocks}
@@ -129,7 +120,7 @@ def tria3GapGradientHessian(
             crossNormalizeTerm = -(1.0 / m) * (
                 np.outer(dm_dBlock[a], dn_dBlock[b].T @ r) + g * (dc_dBlock[a].T @ dn_dBlock[b])
             )
-            skewArgumentTerm = dcSign[a] * (1.0 / m) * (_skew(rTangential) @ du_dBlock[a][b])
+            skewArgumentTerm = dcSign[a] * (1.0 / m) * (skewMatrix(rTangential) @ du_dBlock[a][b])
             normalizeDenominatorTerm = -(1.0 / m**2) * np.outer(rTangential @ dc_dBlock[a], dm_dBlock[b])
 
             d2n_a_contractedWithR = crossNormalizeTerm + skewArgumentTerm + normalizeDenominatorTerm
@@ -261,6 +252,76 @@ def line2ClosestPoint(xs: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> tuple[n
     weights = np.array([1.0 - t, t])
     closestPoint = weights[0] * x1 + weights[1] * x2
     return weights, float(np.linalg.norm(xs - closestPoint))
+
+
+def tria3Projection(xs: np.ndarray, x1: np.ndarray, x2: np.ndarray, x3: np.ndarray) -> tuple[float, float, bool]:
+    """Barycentric-like in-plane coordinates (alpha, beta) of the projection of xs onto the
+    (possibly non-orthogonal) basis spanned by (x2-x1, x3-x1), and whether that projection falls
+    inside the triangle.
+
+    Unlike :func:`tria3ClosestPoint`, the projection is not clamped to the triangle."""
+
+    e1 = x2 - x1
+    e2 = x3 - x1
+    r = xs - x1
+    n = np.cross(e1, e2)
+    n = n / np.linalg.norm(n)
+    rTangential = r - r.dot(n) * n
+
+    A = np.array([[e1.dot(e1), e1.dot(e2)], [e1.dot(e2), e2.dot(e2)]])
+    b = np.array([e1.dot(rTangential), e2.dot(rTangential)])
+    alpha, beta = np.linalg.solve(A, b)
+
+    inside = alpha >= 0.0 and beta >= 0.0 and (alpha + beta) <= 1.0
+    return alpha, beta, inside
+
+
+def line2Projection(xs: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> tuple[float, bool]:
+    """Parametric coordinate t of the projection of xs onto the edge (x1,x2), and whether that
+    projection falls inside the segment.
+
+    Unlike :func:`line2ClosestPoint`, the projection is not clamped to the segment."""
+
+    e = x2 - x1
+    t = (xs - x1).dot(e) / e.dot(e)
+    return t, 0.0 <= t <= 1.0
+
+
+def facetNormalAndMeasure(coords: np.ndarray) -> tuple[np.ndarray, float]:
+    """The (non-unit-normalized only in intermediate steps) outward normal and measure (area for a
+    Tria3 facet, length for a Line2 facet) of a flat facet, as a function of its current node
+    coordinates.
+
+    Parameters
+    ----------
+    coords
+        Array of shape ``(3, 3)`` (Tria3, 3D) or ``(2, 2)`` (Line2, 2D) with the facet's current
+        node coordinates in its fixed local order.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, float]
+        The outward unit normal, and the facet's measure (area or length).
+    """
+
+    nNodes, domainSize = coords.shape
+
+    if nNodes == 3 and domainSize == 3:
+        e1 = coords[1] - coords[0]
+        e2 = coords[2] - coords[0]
+        c = np.cross(e1, e2)
+        cNorm = np.linalg.norm(c)
+        return c / cNorm, 0.5 * cNorm
+
+    elif nNodes == 2 and domainSize == 2:
+        e = coords[1] - coords[0]
+        eNorm = np.linalg.norm(e)
+        # Outward normal is e rotated by -90 degrees, consistent with a counter-clockwise
+        # (node 1 -> node 2) traversal of the solid's boundary.
+        n = np.array([e[1], -e[0]]) / eNorm
+        return n, eNorm
+
+    raise ValueError(f"facetNormalAndMeasure: unsupported facet shape {coords.shape}.")
 
 
 def closestFacetCandidates(queryPoints: np.ndarray, facetCoords: list, searchDistance: float | None) -> list:
