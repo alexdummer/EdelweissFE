@@ -52,6 +52,15 @@ Formatting and static checks are enforced by pre-commit hooks (`autoflake`, `bla
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#pre-commit-hooks) for hook installation and tool flags, and [CONTRIBUTING.md](CONTRIBUTING.md#conventional-commits) for commit message types and subsystem scopes.
 
+## Git Workflow for Agents
+
+All development happens on a personal fork, never by pushing directly to the main
+[Edelweiss-Numerics/EdelweissFE](https://github.com/Edelweiss-Numerics/EdelweissFE) repository. Push branches only to
+the user's own fork remote (e.g. `origin`), open the pull request from there, and never push to a `main`/upstream
+remote pointing at the Edelweiss-Numerics organization — even for a maintainer, direct pushes bypass the
+fork → branch → PR → review → merge flow described in [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests). Before
+pushing, check `git remote -v` if unsure which remote is the fork.
+
 ## Coding Style for Agents
 
 - **No `getattr`/`hasattr`, ever**: never probe for an attribute's existence or fall back with a default via
