@@ -26,6 +26,8 @@
 #  ---------------------------------------------------------------------
 # Created on Sat Jan  21 12:18:10 2017
 
+import math
+
 from edelweissfe.journal.journal import Journal
 from edelweissfe.timesteppers.base.timestepperbase import TimeStepperBase
 from edelweissfe.timesteppers.timestep import TimeStep
@@ -56,6 +58,10 @@ class AdaptiveTimeStepper(TimeStepperBase):
         The ratio to increase the increments in case of good convergence.
     makeZeroIncrementFirst
         If True, the first increment will be zero.
+    goodIncrementsBeforeIncrease
+        The number of good increments that must already have passed before an accepted increment lets the next one
+        grow: counted from the step start (the zero increment included), or from the last cutback, which itself counts
+        as one. From then on, every further good increment lets the next one grow.
     """
 
     identification = "AdaptiveTimeStepper"
@@ -80,7 +86,15 @@ class AdaptiveTimeStepper(TimeStepperBase):
         journal: Journal,
         increaseFactor: float = 1.1,
         makeZeroIncrementFirst: bool = True,
+        goodIncrementsBeforeIncrease: int = 3,
     ):
+        if not (math.isfinite(increaseFactor) and increaseFactor >= 1.0):
+            raise ValueError("increaseFactor must be finite and at least 1, got {:}".format(increaseFactor))
+        if goodIncrementsBeforeIncrease < 1:
+            raise ValueError(
+                "goodIncrementsBeforeIncrease must be at least 1, got {:}".format(goodIncrementsBeforeIncrease)
+            )
+
         self.startIncrement = startIncrement
         self.maxIncrement = maxIncrement
         self.minIncrement = minIncrement
@@ -88,13 +102,14 @@ class AdaptiveTimeStepper(TimeStepperBase):
         self.stepLength = stepLength
         self.journal = journal
         self.increaseFactor = increaseFactor
+        self.goodIncrementsBeforeIncrease = goodIncrementsBeforeIncrease
         self.makeZeroIncrementFirst = makeZeroIncrementFirst
 
         #: The start time of the step.
         self.currentTime = currentTime
         #: The number of the next increment; the zero increment, if any, is number 0.
         self.incrementCounter = 0
-        #: Counts the good increments; the increment grows once three have passed.
+        #: Counts the good increments; the increment grows once goodIncrementsBeforeIncrease have passed.
         self.nPassedGoodIncrements = 0
         #: The accepted progress within the step, from 0 to 1.
         self.finishedStepProgress = 0.0
@@ -139,7 +154,7 @@ class AdaptiveTimeStepper(TimeStepperBase):
     def acceptTimeStep(self, timeStep: TimeStep):
         self.finishedStepProgress = timeStep.stepProgress
 
-        if self.nPassedGoodIncrements >= 3 and self.allowedToIncreasedNext:
+        if self.nPassedGoodIncrements >= self.goodIncrementsBeforeIncrease and self.allowedToIncreasedNext:
             self.increment = min(self.increment * self.increaseFactor, self.maxIncrement)
         self.allowedToIncreasedNext = True
 
@@ -155,8 +170,8 @@ class AdaptiveTimeStepper(TimeStepperBase):
             self.journal.errorMessage("Cannot reduce increment size", self.identification)
             raise ReachedMinIncrementSize()
 
-        # The retried increment counts as the first good one after the cutback, so the increment
-        # grows again once two more have passed.
+        # The cutback itself counts as the first good increment, so with goodIncrementsBeforeIncrease=1
+        # the increment already grows again after the retried increment is accepted.
         self.nPassedGoodIncrements = 1
         self.allowedToIncreasedNext = True
 
