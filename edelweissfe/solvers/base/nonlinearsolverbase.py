@@ -928,7 +928,8 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
         Returns
         -------
         MultiPointConstraintTransformation | None
-            The assembled transformation, or None if the model has no multi-point constraints.
+            The assembled transformation, or None if the model has no multi-point constraints or
+            none of them currently constrains a DOF.
         """
 
         if not model.multiPointConstraints:
@@ -943,6 +944,12 @@ class NonlinearSolverBase(OptionSchemaProvider, ABC):
 
         if stepActions is not None:
             records = self._reconcileMPCDirichletConflicts(records, stepActions)
+
+        # Without a record T is the identity. Condensing with it would still cost a T^T K T + C product
+        # per Newton iteration, and the zero pruning after it changes the sparsity pattern between
+        # iterations, which defeats any pattern-keyed reuse in the linear solver.
+        if not records:
+            return None
 
         transformation = MultiPointConstraintTransformation(
             records,
