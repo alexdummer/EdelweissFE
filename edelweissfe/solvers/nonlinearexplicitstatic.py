@@ -182,10 +182,12 @@ class NESTSchema:
     pruneCondensedMatrixZeros: bool | None = schemaField(
         description=(
             "Compact explicitly stored zeros out of the multi-point-constraint-condensed system "
-            "matrix before solving. See NISTSchema for the trade-off; default True."
+            "matrix before solving. See NISTSchema for the trade-off; unset (the default) decides "
+            "automatically from the linear solver in force."
         ),
         dtype=bool,
-        default=True,
+        default=None,
+        documentedDefault="auto",
     )
 
 
@@ -214,7 +216,7 @@ class NEST(NIST):
         "runge-kutta-error-control": "on",
         "linsolver": "",
         "linsolverConfigFile": "",
-        "pruneCondensedMatrixZeros": True,
+        "pruneCondensedMatrixZeros": None,
     }
 
     #: Not restartable: no restart scenario covers this solver, so it does not claim to be.

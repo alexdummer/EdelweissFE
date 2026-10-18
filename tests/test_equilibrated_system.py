@@ -176,3 +176,50 @@ def test_the_outer_solver_rejects_a_right_hand_side_of_the_wrong_length(system):
     solver = PyAMGCLLGMRESSolver(A.shape[0], {"M": 10})
     with pytest.raises(ValueError, match="length"):
         solver.solve(equilibrated, np.ones(A.shape[0] - 1), lambda r: r, 1e-8, 20)
+
+
+def test_the_unscaled_operator_is_scipys_bit_for_bit(system):
+    A, As, dinv, equilibrated = system
+    unscaled = PyAMGCLEquilibratedSystem()
+    unscaled.build(A, dinv, _FIELDS, unscaled=True)
+    x = np.random.default_rng(7).standard_normal(A.shape[0])
+    rhs = np.random.default_rng(8).standard_normal(A.shape[0])
+    assert np.array_equal(unscaled.matvec(x, unscaled=True), A @ x)
+    assert np.array_equal(unscaled.residual(rhs, x, unscaled=True), rhs - A @ x)
+    # only the operator built for is stored
+    with pytest.raises(RuntimeError, match="not kept"):
+        equilibrated.matvec(x, unscaled=True)
+    with pytest.raises(RuntimeError, match="not kept"):
+        unscaled.matvec(x)
+
+
+def test_the_blocks_are_the_same_whichever_operator_is_stored(system):
+    # with A stored, the entries of As the field split reads are formed from A's by the expression As is assembled
+    # with: bit for bit the same blocks
+    A, As, dinv, equilibrated = system
+    unscaled = PyAMGCLEquilibratedSystem()
+    unscaled.build(A, dinv, _FIELDS, unscaled=True)
+    rng = np.random.default_rng(10)
+    for f, (start, stop) in enumerate(_FIELDS):
+        expected, actual = equilibrated.diagonalBlock(f), unscaled.diagonalBlock(f)
+        assert np.array_equal(expected.indptr, actual.indptr) and np.array_equal(expected.indices, actual.indices)
+        assert np.array_equal(expected.data, actual.data)
+        x = rng.standard_normal(stop - start)
+        assert np.array_equal(unscaled.diagonalBlockMatvec(f, x), equilibrated.diagonalBlockMatvec(f, x))
+        for g, (gStart, gStop) in enumerate(_FIELDS):
+            if g != f:
+                v = rng.standard_normal(gStop - gStart)
+                assert np.array_equal(unscaled.couplingMatvec(f, g, v), equilibrated.couplingMatvec(f, g, v))
+
+
+def test_a_tiny_right_hand_side_is_solved_like_any_other(system):
+    # AMGCL's lgmres returns x = 0 for ||rhs|| < 4.4e-16; the wrapper solves for rhs scaled by a power of two,
+    # which is exact, so the solution is the scaled one bit for bit
+    from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLLGMRESSolver
+
+    A, As, dinv, equilibrated = system
+    solver = PyAMGCLLGMRESSolver(A.shape[0], {"M": 30})
+    rhs = np.random.default_rng(9).standard_normal(A.shape[0])
+    x = solver.solve(equilibrated, rhs, lambda r: r, 1e-8, 200)
+    tiny = solver.solve(equilibrated, np.ldexp(rhs, -80), lambda r: r, 1e-8, 200)
+    assert np.any(x != 0.0) and np.array_equal(tiny, np.ldexp(x, -80))

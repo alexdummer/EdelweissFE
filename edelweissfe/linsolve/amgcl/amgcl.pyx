@@ -292,10 +292,12 @@ cdef class PyAMGCLEquilibratedSystem:
                                             _doubleData(out))
         return out
 
-    def build(self, object A, object scaling, object fieldBounds):
+    def build(self, object A, object scaling, object fieldBounds, bint unscaled=False):
         """
         A: scipy.sparse csr_matrix (square); scaling: the equilibration, length n; fieldBounds: a
-        sequence of ``(start, stop)`` DOF ranges, one per field, disjoint.
+        sequence of ``(start, stop)`` DOF ranges, one per field, disjoint. unscaled: store A itself instead
+        of ``As``, for :meth:`matvec`/:meth:`residual` with ``unscaled`` and an outer solve on it; the blocks of
+        ``As`` are the same either way.
         """
         if A.shape[0] != A.shape[1]:
             raise ValueError("A must be square, got shape {:}".format(A.shape))
@@ -306,11 +308,12 @@ cdef class PyAMGCLEquilibratedSystem:
         if bounds.shape[0] % 2:
             raise ValueError("fieldBounds must be (start, stop) pairs, got {:} numbers".format(bounds.shape[0]))
         self.system.build(n, _intData(indptr), _intData(indices), _constDoubleData(data),
-                          _constDoubleData(scalingArray), bounds.shape[0] // 2, _intData(bounds))
+                          _constDoubleData(scalingArray), bounds.shape[0] // 2, _intData(bounds), unscaled)
         self.n = n
 
-    def diagonalBlock(self, int field):
-        """``As[field, field]`` as a new scipy.sparse csr_matrix (sorted columns if ``A``'s were)."""
+    def diagonalBlock(self, int field, bint unscaled=False):
+        """``As[field, field]`` -- or with ``unscaled`` ``A[field, field]``, exactly A's entries if :meth:`build`
+        stored A -- as a new scipy.sparse csr_matrix (sorted columns if ``A``'s were)."""
         cdef int size = self.system.diagonalBlockSize(field)
         cdef int nnz = self.system.diagonalBlockNnz(field)
         cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.empty(size + 1, dtype=np.int32)
@@ -319,21 +322,22 @@ cdef class PyAMGCLEquilibratedSystem:
         cdef int[::1] indptr_ = indptr
         cdef int[::1] indices_ = indices
         cdef double[::1] data_ = data
-        self.system.fillDiagonalBlock(field, &indptr_[0], &indices_[0], &data_[0])
+        self.system.fillDiagonalBlock(field, &indptr_[0], &indices_[0], &data_[0], unscaled)
         return scipy.sparse.csr_matrix((data[:nnz], indices[:nnz], indptr), shape=(size, size), copy=False)
 
-    def matvec(self, object x):
-        """Returns ``As @ x`` as a new float64 array."""
+    def matvec(self, object x, bint unscaled=False):
+        """Returns ``As @ x`` -- or with ``unscaled``, ``A @ x`` -- as a new float64 array: the operator
+        :meth:`build` stored."""
         xArray = _vector(x, self.n, "x")
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(self.n, dtype=np.float64)
-        self.system.matvec(_constDoubleData(xArray), _doubleData(y))
+        self.system.matvec(_constDoubleData(xArray), _doubleData(y), unscaled)
         return y
 
-    def residual(self, object rhs, object x):
-        """Returns ``rhs - As @ x`` as a new float64 array."""
+    def residual(self, object rhs, object x, bint unscaled=False):
+        """Returns ``rhs - As @ x`` -- or with ``unscaled``, ``rhs - A @ x`` -- as a new float64 array."""
         rhsArray, xArray = _vector(rhs, self.n, "rhs"), _vector(x, self.n, "x")
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(self.n, dtype=np.float64)
-        self.system.residual(_constDoubleData(rhsArray), _constDoubleData(xArray), _doubleData(r))
+        self.system.residual(_constDoubleData(rhsArray), _constDoubleData(xArray), _doubleData(r), unscaled)
         return r
 
     def diagonalBlockMatvec(self, int field, object x):
@@ -448,7 +452,8 @@ cdef class PyAMGCLLGMRESSolver:
     cdef readonly double lastError
     """The relative residual ``||rhs - Op x|| / ||rhs||`` AMGCL's lgmres reached in the most recent solve,
     recomputed at its exit, of the operator it iterated on: the equilibrated system, so not the true
-    residual. lgmres's own convergence test is this value below ``tol``. NaN before the first solve."""
+    residual, or with ``onUnscaledOperator`` the unscaled one. lgmres's own convergence test is this
+    value below ``tol``. NaN before the first solve."""
     cdef object _precondCallable
     cdef object _pendingException
 
@@ -482,10 +487,11 @@ cdef class PyAMGCLLGMRESSolver:
             del self.solver
 
     def solve(self, PyAMGCLEquilibratedSystem system, object rhs, object applyPreconditioner, double tol,
-              int maxiter, object x0=None):
+              int maxiter, object x0=None, bint onUnscaledOperator=False):
         """
         system
-            This solve's equilibrated full coupled operator.
+            This solve's equilibrated full coupled operator -- or, with ``onUnscaledOperator``, the
+            unscaled one it stored (``build(..., unscaled=True)``).
         rhs
             array-like, converted to 1D float64 (C-contiguous).
         applyPreconditioner
@@ -501,6 +507,10 @@ cdef class PyAMGCLLGMRESSolver:
         x0
             Optional initial guess (warm start), e.g. blockamg.py's true-residual continuation retry.
             Defaults to zero.
+
+        AMGCL's lgmres returns ``x = 0`` at once for ``||rhs|| < 2 eps`` (about 4.4e-16), whatever the units of
+        the system. So the solve runs on ``rhs`` (and ``x0``) scaled by a power of two to a norm in [0.5, 1), and
+        its solution is scaled back: exact in floating point, so the iterates are those of the unscaled solve.
         """
         cdef int n = system.n
         if n != self.n:
@@ -518,6 +528,10 @@ cdef class PyAMGCLLGMRESSolver:
         else:
             x = _vector(x0, n, "x0").copy()
 
+        cdef int exponent = np.frexp(np.linalg.norm(rhs_arr))[1]
+        rhs_arr = np.ldexp(rhs_arr, -exponent)
+        x = np.ldexp(x, -exponent)
+
         cdef double[::1] rhs_ = rhs_arr
         cdef double[::1] x_ = x
 
@@ -534,7 +548,7 @@ cdef class PyAMGCLLGMRESSolver:
         try:
             self.solver.solve(
                 system.system[0], &rhs_[0], &x_[0],
-                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error
+                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, onUnscaledOperator
             )
         except RuntimeError:
             # the C++ side's report of a failed callback: raise the callback's own exception instead
@@ -550,7 +564,7 @@ cdef class PyAMGCLLGMRESSolver:
 
         self.lastIterations = iters
         self.lastError = error
-        return x
+        return np.ldexp(x, exponent)
 
 
 cdef class PyAMGCLSpGEMM:
