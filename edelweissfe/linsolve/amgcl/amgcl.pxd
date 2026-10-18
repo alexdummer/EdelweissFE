@@ -50,15 +50,6 @@ cdef extern from "amgcl-wrapper.hpp":
     # 3x3 blocks set up in double and stored in float), owned by the caller.
     AMGCLSolverInterface* makeAMGCLSolver(const char* json_params, int blockSize, bint isFloat) except +
 
-    # A standalone, OpenMP-threaded relaxation smoother -- e.g. the p-two-grid
-    # preconditioner's fine sweep, one level below a full AMG hierarchy. Its own constructor
-    # parameter tree is flat ({"type": "chebyshev", ...}), not nested under "precond.relax".
-    cdef cppclass RelaxationSmoother:
-        RelaxationSmoother(const char* json_params) except +
-        void build(int n, const int* ptr, const int* col, const double* val) except +
-        void applyStep(int n, const double* rhs, double* x) except +
-        void residual(int n, const double* rhs, const double* x, double* r) except +
-
     # blockamg's equilibrated, field-split system As = D A D: the outer Krylov operator, the
     # coupling blocks between fields and, on demand, the diagonal blocks -- built in one threaded
     # pass, see EquilibratedSystemT's own comment.
@@ -113,3 +104,29 @@ cdef extern from "amgcl-wrapper.hpp":
         int resultNCols() except +
         int resultNnz() except +
         void copyResult(int* ptrOut, int* colOut, double* valOut) except +
+
+    # The p-two-grid (P1) preconditioner of edelweissfe/linsolve/blockamg/ptwogrid.py, built and
+    # applied entirely in C++ (OpenMP) -- see PTwoGridPreconditionerT's own comment.
+    cdef cppclass PTwoGridPreconditioner:
+        PTwoGridPreconditioner(const char* json_params) except +
+
+        @staticmethod
+        void dirichletRowMask(int n, const int* ptr, const int* col, const double* val, char* isDirichlet) except +
+        void build(int n, const int* ptr, const int* col, const double* val,
+                   int nNodes, const signed char* isCorner, const int* edgeEndpoints,
+                   const double* nullspace, int nullspaceRows, int nullspaceCols,
+                   double spectralRadius, const double* dominantVector, int dominantVectorSize) except +
+        void apply(int n, const double* r, double* x) except +
+        double fineSpectralRadius()
+        int fineSpectralRadiusSource()
+        int fineDominantVectorSize()
+        void copyFineDominantVector(double* out)
+        int nCoarseFree()
+        string report() except +
+        double setupDirichletAndPSeconds_
+        double setupGalerkinSeconds_
+        double setupCoarseSeconds_
+        double setupFineOperatorSeconds_
+        double setupSpectralRadiusSeconds_
+        double applyFineSeconds_
+        double applyCoarseSeconds_

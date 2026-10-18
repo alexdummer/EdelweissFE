@@ -547,6 +547,37 @@ Block preconditioner and per-field hierarchies
       - ``[]``
       - **Experimental, opt-in, not recommended as a default.** Vector fields to precondition with
         the p-multigrid two-grid variant instead of the single-level default; see below.
+    * - ``p1Nu``
+      - ``1``
+      - p-multigrid: fine Chebyshev sweeps before and after the coarse-grid correction.
+    * - ``p1NuPre``, ``p1NuPost``
+      - ``p1Nu``
+      - p-multigrid: separate pre- and post-smoothing sweep counts, e.g. ``0`` / ``1`` for a cycle
+        that starts with the coarse-grid correction and ends on one smoothing sweep.
+    * - ``p1FineDegree``
+      - ``5``
+      - p-multigrid: fine Chebyshev polynomial degree.
+    * - ``p1FineBlockSize``
+      - ``1``
+      - p-multigrid: storage of the fine operator, ``1`` (scalar entries) or ``3`` (node-wise
+        :math:`3\times 3` blocks, 3D fields only); see below.
+    * - ``p1FineValueType``
+      - ``"double"``
+      - p-multigrid: value type of the fine operator for the smoother and residual, ``"double"`` or
+        ``"float"``; see below.
+    * - ``p1CoarseValueType``
+      - ``"double"``
+      - p-multigrid: value type of the coarse AMGCL hierarchy, ``"double"`` or ``"float"`` (AMGCL's
+        single-precision backend, setup included).
+    * - ``p1FineSpectralRadiusReuse``
+      - ``false``
+      - p-multigrid: estimate the fine smoother's spectral radius in full on a field's first build
+        only, and only re-check it on later rebuilds; see below.
+    * - ``p1CoarsePrecond``
+      - ``null``
+      - p-multigrid: the coarse level's AMGCL preconditioner tree. Unset, it is smoothed
+        aggregation (``eps_strong`` 0.01) with a degree-4 Chebyshev smoother and ``npre`` =
+        ``npost`` = 2.
 
 Overriding a field's parameter tree replaces the default outright, so start from the shipped default
 and change only what is intended. The defaults are
@@ -709,8 +740,8 @@ is shown.
     Adds one line per true-residual continuation attempt.
 
 Per-stage wall-clock -- equilibration, the equilibrated system (the scaled operator and the coupling
-blocks between fields, built in one threaded pass), hierarchy build (per field), near-null-space
-construction, outer solve, and continuations -- is recorded through
+blocks between fields, built in one threaded pass), hierarchy build (per field, and per stage of a
+p-multigrid build), near-null-space construction, outer solve, and continuations -- is recorded through
 :mod:`~edelweissfe.utils.performancetiming` regardless of verbosity, and appears nested under "linear
 solve" in the job's performance table. That table, not the log, is the first place to look when
 deciding whether a run is dominated by hierarchy builds or by outer iterations.
@@ -770,6 +801,32 @@ confirmed it helps on their own model. Enable it per field with ``p1FieldNames``
 computed once, lazily, from the model. A field whose mesh is not entirely quadratic serendipity falls
 back to the single-level default with a warning. Note that the cached map is never rebuilt, including
 across adaptive refinement, which is one more reason to treat this path as experimental.
+
+The whole cycle, and every stage of its build, runs in C++ and is OpenMP-threaded. The Dirichlet
+DOFs of the field's block -- rows whose only nonzero is the diagonal, which includes the identity
+slave rows of the multi-point-constraint condensation -- are decoupled exactly rather than removed:
+the fine right-hand side and iterate are kept zero on them, which a Dirichlet row
+preserves under every residual and every smoothing step, and :math:`P` has no rows or columns for
+them. This is the free-submatrix cycle up to floating-point summation order, without extracting the
+free submatrix, and it allows ``p1FineBlockSize = 3``: the fine operator is stored in node-wise
+:math:`3\times 3` blocks even where a node is only partially constrained, which roughly halves the
+memory traffic of the fine smoother and residual -- the dominant cost of the apply.
+``p1FineValueType = "float"`` halves the bytes per stored entry once more. Only the stored entries
+are rounded: vectors and every sum stay double (a float matrix times a double vector), and the
+spectral radius is estimated and re-checked on the double operator before it is rounded -- unlike
+``backendPrecision = "float"``, where AMGCL's own power iteration runs in single precision.
+
+The fine Chebyshev smoother uses AMGCL's polynomial, with the bounds of the vector-field default
+(``lower`` 0.01, ``higher`` 1.1 times the spectral radius; AMGCL's own defaults are 1/30 and 1), but its
+spectral-radius estimate -- 300 power iterations, the most
+expensive stage of the build -- starts from a deterministic, thread-count-independent vector, and can
+be reduced to a re-check: with ``p1FineSpectralRadiusReuse`` a field's first build estimates it in
+full, and every later rebuild continues the power iteration for 15 steps from the previous build's
+dominant vector. A re-check estimate up to 1% above the previous radius keeps it (the full estimate is
+itself converged only to about 1e-5); one further above replaces it; and one above it by more than the
+10% margin of ``higher`` -- an operator that stiffened more than the smoother's bounds cover -- triggers
+the full estimate again. The cache is dropped when the model
+changes (e.g. after adaptive refinement).
 
 
 Practical guidance

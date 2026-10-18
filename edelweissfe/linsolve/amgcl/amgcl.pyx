@@ -75,6 +75,16 @@ cdef inline double* _doubleData(double[::1] values):
     return &values[0] if values.shape[0] > 0 else NULL
 
 
+cdef inline const signed char* _byteData(const signed char[::1] values):
+    """See :func:`_intData`."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline char* _writableByteData(signed char[::1] values):
+    """See :func:`_intData` -- for an output array the C++ side writes."""
+    return <char*> &values[0] if values.shape[0] > 0 else NULL
+
+
 cdef class PyAMGCLSolver:
     cdef AMGCLSolverInterface* solver
     cdef readonly bint isFloat
@@ -247,78 +257,6 @@ cdef class PyAMGCLSolver:
         self.lastError = error
 
         return x
-
-
-cdef class PyAMGCLRelaxationSmoother:
-    """A standalone, OpenMP-threaded relaxation smoother -- e.g. the p-two-grid
-    preconditioner's fine sweep (:mod:`edelweissfe.linsolve.blockamg.ptwogrid`), one level below a
-    full AMG hierarchy. Wraps ``amgcl::runtime::relaxation::wrapper``, which is itself
-    runtime-selectable via the ``type`` key (``chebyshev``, ``gauss_seidel``, ``ilu0``, ``spai0``,
-    ...) -- the same smoother catalogue as a hierarchy's own ``relax`` sub-tree, just applied directly
-    as a preconditioner-shaped object instead of on an AMG level.
-
-    Unlike :class:`PyAMGCLSolver`, this exposes a single in-place smoothing step
-    (:meth:`applyStep`, ``amgcl``'s ``apply_pre``) rather than a full solve: callers decide "start
-    from zero" (zero ``x`` themselves) and "how many sweeps" (call :meth:`applyStep` repeatedly) --
-    see :mod:`ptwogrid`'s ``smooth(x, rhs, sweeps)`` closure.
-    """
-    cdef RelaxationSmoother* smoother
-
-    def __cinit__(self, dict params):
-        """
-        params: the relaxation's own flat parameter tree, e.g.
-        {"type": "chebyshev", "degree": 5, "power_iters": 50, "lower": 0.01}
-        -- not nested under "precond.relax" like :class:`PyAMGCLSolver`, since there is no hierarchy
-        here.
-        """
-        cdef bytes json_bytes = json.dumps(params).encode("utf-8")
-        cdef const char* c_json = json_bytes
-        self.smoother = new RelaxationSmoother(c_json)
-
-    def __dealloc__(self):
-        if self.smoother != NULL:
-            del self.smoother
-
-    def build(self, object A):
-        """Build the smoother for A once, for repeated :meth:`applyStep` calls. A: scipy.sparse
-        csr_matrix."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef int n = A.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] data_ = data
-        self.smoother.build(n, &indptr_[0], &indices_[0], &data_[0])
-
-    def applyStep(self, object x, object rhs):
-        """One in-place smoothing step: ``x`` is updated in place, continuing the relaxation's own
-        recursion from its current value (zero it first for a from-zero application). ``x`` must be a
-        1D float64 (C-contiguous) numpy array; ``rhs`` is converted to the same."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = x
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef int n = x_arr.shape[0]
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] rhs_ = rhs_arr
-        self.smoother.applyStep(n, &rhs_[0], &x_[0])
-
-    def residual(self, object rhs, object x):
-        """``rhs - A@x`` on the same OpenMP-threaded backend matrix :meth:`build` already converted --
-        a plain ``scipy.sparse`` CSR matvec is not thread-parallel regardless of ``OMP_NUM_THREADS``
-        so callers computing the fine-level residual for a two-grid restriction should use
-        this instead of ``A @ x`` in Python. Returns a new float64 array; does not mutate ``x``."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef int n = rhs_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(n, dtype=np.float64)
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] r_ = r
-        self.smoother.residual(n, &rhs_[0], &x_[0], &r_[0])
-        return r
 
 
 cdef class PyAMGCLEquilibratedSystem:
@@ -667,3 +605,131 @@ cdef class PyAMGCLSpGEMM:
         self.helper.sum(alpha, A.shape[0], _intData(aPtr), _intData(aCol), _constDoubleData(aVal),
                         beta, B.shape[0], _intData(bPtr), _intData(bCol), _constDoubleData(bVal))
         return self._copyOut()
+
+
+cdef class PyAMGCLPTwoGrid:
+    """The p-two-grid (P1) preconditioner of :mod:`edelweissfe.linsolve.blockamg.ptwogrid`, built and
+    applied entirely in C++: Dirichlet detection, the restricted prolongation ``P``, the Galerkin
+    coarse operator ``P^T A P``, the coarse AMGCL hierarchy, the fine Chebyshev smoother and the
+    whole two-grid cycle, all OpenMP-threaded -- no Python runs inside :meth:`applyPreconditioner`.
+    See ``PTwoGridPreconditionerT`` in ``amgcl-wrapper.hpp`` for the Dirichlet scheme and the
+    fine spectral-radius estimate.
+    """
+    cdef PTwoGridPreconditioner* preconditioner
+
+    def __cinit__(self, dict params):
+        """
+        params: the flat parameter tree, e.g.
+        {"nuPre": 1, "nuPost": 1, "fineDegree": 5, "fineLower": 0.01, "fineHigher": 1.1, "finePowerIters": 300,
+        "fineRecheckIters": 15, "fineBlockSize": 1, "fineValueType": "double", "coarseValueType": "double",
+        "coarse": {<AMGCL preconditioner tree>}}
+        (``nu`` sets both sweep counts). The sweep counts, ``fineDegree`` (at least 1), the block size
+        and the value types are validated here, before any build.
+        """
+        cdef bytes json_bytes = json.dumps(params).encode("utf-8")
+        cdef const char* c_json = json_bytes
+        self.preconditioner = new PTwoGridPreconditioner(c_json)
+
+    def __dealloc__(self):
+        if self.preconditioner != NULL:
+            del self.preconditioner
+
+    @staticmethod
+    def dirichletRows(object A):
+        """The rows of a scipy.sparse CSR matrix this preconditioner treats as Dirichlet rows: a nonzero
+        diagonal and no nonzero off-diagonal entry (explicitly stored zeros, which the Dirichlet
+        elimination keeps, do not count) -- the identity slave rows of the multi-point-constraint
+        condensation included. Returns a bool array."""
+        A, indptr, indices, data = _csrArrays(A)
+        mask = np.zeros(A.shape[0], dtype=np.int8)
+        PTwoGridPreconditioner.dirichletRowMask(A.shape[0], _intData(indptr), _intData(indices), _constDoubleData(data),
+                                                _writableByteData(mask))
+        return mask.astype(bool)
+
+    def build(self, object A, object isCorner, object edgeEndpoints, object nullspace=None,
+              double spectralRadius=0.0, object dominantVector=None):
+        """
+        Build the preconditioner for A (scipy.sparse csr_matrix, the field's equilibrated diagonal
+        block with its Dirichlet identity rows).
+
+        isCorner: (nNodes,) bool/int8; edgeEndpoints: (nNodes, 2) int, read for midside nodes only.
+        nullspace: (nFreeCoarseDofs, k) float64 coarse near null-space, or None.
+        spectralRadius: > 0 to start from this fine spectral radius instead of estimating it in full.
+        dominantVector: with spectralRadius, the previous build's :attr:`fineDominantVector`; the
+        radius is then re-checked by a few power iterations from it (``fineRecheckIters``) and
+        raised, or re-estimated in full, if the operator has stiffened.
+        """
+        if not scipy.sparse.isspmatrix_csr(A):
+            A = A.tocsr()
+        if not A.has_sorted_indices:
+            A = A.sorted_indices()
+        A, indptr, indices, data = _csrArrays(A)
+        corner = np.ascontiguousarray(isCorner, dtype=np.int8)
+        endpoints = np.ascontiguousarray(np.asarray(edgeEndpoints, dtype=np.int32).reshape(-1))
+        cdef int nNodes = corner.shape[0]
+        if endpoints.shape[0] != 2 * nNodes or (nNodes > 0 and np.ndim(edgeEndpoints) != 2):
+            raise ValueError("edgeEndpoints must have shape (nNodes, 2)")
+        B = np.zeros((0, 0)) if nullspace is None else np.ascontiguousarray(nullspace, dtype=np.float64)
+        if B.ndim != 2:
+            raise ValueError("the coarse near null-space must be a 2D array")
+        dominant = np.zeros(0) if dominantVector is None else np.ascontiguousarray(dominantVector, dtype=np.float64)
+        self.preconditioner.build(A.shape[0], _intData(indptr), _intData(indices), _constDoubleData(data),
+                                  nNodes, _byteData(corner), _intData(endpoints),
+                                  _constDoubleData(B.reshape(-1)), B.shape[0], B.shape[1],
+                                  spectralRadius, _constDoubleData(dominant), dominant.shape[0])
+
+    def applyPreconditioner(self, object r):
+        """One two-grid cycle: returns M^-1 r as a new float64 array (Dirichlet rows solved exactly)."""
+        rArray = np.ascontiguousarray(r, dtype=np.float64).reshape(-1)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.empty(rArray.shape[0], dtype=np.float64)
+        # the C++ apply checks the length against the built size
+        self.preconditioner.apply(rArray.shape[0], _constDoubleData(rArray), _doubleData(x))
+        return x
+
+    @property
+    def fineSpectralRadius(self):
+        """The fine operator's spectral radius the Chebyshev smoother was built with -- estimated, or
+        the one handed to :meth:`build`."""
+        return self.preconditioner.fineSpectralRadius()
+
+    @property
+    def fineDominantVector(self):
+        """The power iteration's last iterate, the estimate of the fine operator's dominant
+        eigenvector -- hand it back to the next :meth:`build` with :attr:`fineSpectralRadius`. Empty
+        if the radius was used as supplied, without a re-check."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] v = np.empty(
+            self.preconditioner.fineDominantVectorSize(), dtype=np.float64
+        )
+        cdef double[::1] v_ = v
+        if v.shape[0] > 0:
+            self.preconditioner.copyFineDominantVector(&v_[0])
+        return v
+
+    @property
+    def fineSpectralRadiusSource(self):
+        """How the last build arrived at its fine spectral radius: ``"estimated"`` in full,
+        ``"supplied"`` and kept, ``"raised"`` by the re-check, or ``"re-estimated"`` in full because
+        the re-check found the operator stiffened beyond the smoother's margin."""
+        return ("estimated", "supplied", "raised", "re-estimated")[self.preconditioner.fineSpectralRadiusSource()]
+
+    @property
+    def nCoarseFree(self):
+        """The number of free coarse DOFs (rows of the Galerkin operator)."""
+        return self.preconditioner.nCoarseFree()
+
+    def timings(self):
+        """Cumulative wall time [s] of the build stages (of the last build) and of the apply (fine
+        smoothing incl. the residual, coarse correction incl. restriction and prolongation)."""
+        return {
+            "setup: dirichlet + P": self.preconditioner.setupDirichletAndPSeconds_,
+            "setup: galerkin P^T A P": self.preconditioner.setupGalerkinSeconds_,
+            "setup: coarse hierarchy": self.preconditioner.setupCoarseSeconds_,
+            "setup: fine operator": self.preconditioner.setupFineOperatorSeconds_,
+            "setup: fine spectral radius": self.preconditioner.setupSpectralRadiusSeconds_,
+            "apply: fine": self.preconditioner.applyFineSeconds_,
+            "apply: coarse": self.preconditioner.applyCoarseSeconds_,
+        }
+
+    def report(self):
+        """The coarse level's AMGCL hierarchy report."""
+        return self.preconditioner.report().decode("utf-8")

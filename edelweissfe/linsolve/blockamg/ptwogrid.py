@@ -35,24 +35,24 @@ call shape closely enough to slot into the same per-field sweep, so
 :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver` needs no change beyond choosing
 which class to build (see ``blockamg.py``'s ``p1Maps`` option).
 
-This is an **opt-in, experimental variant of the field-split AMG preconditioner**, not the shipped
-default. The underlying two-grid algorithm converges (fewer outer GMRES iterations than the
-single-level default is common), but it carries two structural costs the single-level default does
-not: a fixed per-solve setup cost (the Galerkin projection ``P^T A P`` and the coarse hierarchy build
-happen fresh every solve, since the operator's sparsity pattern generally changes every Newton
-iteration on a model with contact/tie constraints, leaving nothing stable to cache), and a
-near-null-space handling gap -- the coarse solve can be given the same rigid-body near-null-space
-treatment the single-level default uses (restricted to the corner-node subset), but the fine-level
-Chebyshev smoother, unlike a full recursive AMG hierarchy, has no coarsening step of its own and
-receives no near-null-space information at all. Whether the iteration-count win outweighs these
-costs is problem-dependent; it has been measured to lose to the single-level default overall on at
-least one real reference model in the regime tested, so it should not be assumed to help without
-checking on the model at hand.
+The whole cycle -- and every stage of its build -- runs in C++ (``PTwoGridPreconditionerT`` in
+``edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp``, wrapped as
+:class:`~edelweissfe.linsolve.amgcl.amgcl.PyAMGCLPTwoGrid`), OpenMP-threaded throughout; this module
+only chooses the parameters and builds the coarse near null-space, which is cheap.
+
+This is an **opt-in variant of the field-split AMG preconditioner**, not the shipped default. It is
+rebuilt exactly when blockamg's single-level hierarchies are, and its rebuild is cheaper than theirs;
+the coarse solve gets the same rigid-body near-null-space treatment as the single-level default
+(restricted to the corner-node subset), while the fine-level Chebyshev smoother needs none. Measured
+against blockamg's recommended single-level configuration with the same outer settings, it was about
+12% slower on one reference model and level within noise on another -- worth measuring on a model
+with expensive hierarchy rebuilds, not assumed to help.
 
 **Dirichlet handling is load-bearing, do not simplify away.** A field's diagonal block still carries
-its Dirichlet identity rows (production applies Dirichlet elimination upstream of blockamg). Both
-the fine smoothing and the Galerkin projection must operate on the *free* submatrix with Dirichlet
-rows/columns removed entirely, not merely masked in place -- masking in place for the fine smoother
+its Dirichlet identity rows (production applies Dirichlet elimination upstream of blockamg), and
+the identity rows of multi-point-constraint slaves, which are treated alike. Both
+the fine smoothing and the Galerkin projection must act on the *free* DOFs only, with the Dirichlet
+DOFs decoupled entirely, not merely masked in place -- masking in place for the fine smoother
 alone was tried and diverged outright (17-80x residual growth). The mechanism is not a genuine
 non-symmetry in the physical operator: a raw, Dirichlet-row-included diagonal block looks roughly
 50% non-symmetric by a simple ``‖B-Bᵀ‖/‖B‖`` measure, but that figure collapses to ~0.6% once the
@@ -61,13 +61,20 @@ Dirichlet-eliminated row is represented in a sparse matrix, not physics. A free 
 edge-endpoint corner is Dirichlet-constrained keeps only the surviving ½-weight on its free endpoint
 -- no renormalization (the constrained corner contributes exactly zero to a homogeneous Newton
 correction, which the dropped weight already encodes).
+
+The C++ implementation does not extract the free submatrix, it decouples the Dirichlet DOFs exactly
+inside the full block layout instead: the fine right-hand side and iterate are kept zero on them (a
+Dirichlet row holds only its diagonal, so every residual and every Chebyshev update stays zero
+there, whatever the columns hold), and ``P`` has no rows or columns for them. That is the
+free-submatrix cycle up to floating-point summation order, and it is what allows a node-wise 3x3
+block storage of the fine operator (``fineBlockSize``) on partially constrained nodes.
 """
 
 import numpy as np
-import scipy.sparse as sp
 
 from edelweissfe.linsolve.base import FieldBlock
 from edelweissfe.linsolve.nullspace import rigidBodyNullspace, translationNullspace
+from edelweissfe.utils import performancetiming
 
 #: Coarse-level Chebyshev degree/sweep-count configuration, from a config sweep across degree and
 #: npre/npost on a real coupled system: halving the Chebyshev degree (8 -> 4) at npre=2/npost=2
@@ -93,67 +100,21 @@ _DEFAULT_COARSE_PRECOND = {
 #: R2's winning fine-smoother configuration: nu=1 sweeps, Chebyshev degree 5.
 _DEFAULT_NU = 1
 _DEFAULT_FINE_DEGREE = 5
-
-
-def _buildChebyshevSmoother(A, degree, powerIters=300, lower=0.01, higher=1.1):
-    """The fine smoother, backed by AMGCL's own OpenMP-threaded ``runtime::relaxation::wrapper``
-    instead of a serial scipy/numpy polynomial -- a serial fine smoother was measured costing 81%+ of
-    this preconditioner's own apply time on a real reference model, so it must run OpenMP-threaded
-    like every other AMGCL kernel here to be worth using at all. The spectral radius (power
-    iteration; a short/badly-under-converged estimate can make Chebyshev smoothing diverge outright)
-    is computed inside AMGCL's own chebyshev constructor via its own algorithm, so it no longer needs
-    a separate Python-side pass. ``higher`` defaults to 1.1, a safety margin above the estimated
-    spectral radius -- AMGCL's own chebyshev defaults ``higher`` to 1.0, which would silently retune
-    the fine smoother relative to what has been validated here.
-
-    Also returns ``residual``, computed on this same object's cached backend matrix: a plain
-    ``A @ x`` scipy CSR matvec is not OpenMP-threaded regardless of ``OMP_NUM_THREADS`` (scipy sparse
-    matvec is single-threaded C code), and was measured costing ~30ms/call on a real ~190k-DOF free
-    displacement block -- silently charged to ``coarseSeconds`` in
-    :meth:`PTwoGridPreconditioner.applyPreconditioner`, since that is the timing block it shared,
-    even though it has nothing to do with the coarse level."""
-    from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLRelaxationSmoother
-
-    smoother = PyAMGCLRelaxationSmoother(
-        {"type": "chebyshev", "degree": degree, "power_iters": powerIters, "lower": lower, "higher": higher}
-    )
-    smoother.build(A)
-
-    def smooth(x, rhs, sweeps):
-        for _ in range(sweeps):
-            smoother.applyStep(x, rhs)
-        return x
-
-    return smooth, smoother.residual
-
-
-def buildNodeLevelP(isCorner: np.ndarray, edgeEndpoints: np.ndarray) -> sp.csr_matrix:
-    """The node-level P1 restriction operator: identity on corners, ½/½ on each exclusive midside
-    from its two edge-endpoint corners (:func:`edelweissfe.numerics.p1topology.buildP1Map`'s output, in its own node order).
-    """
-    nNodes = len(isCorner)
-    cornerNodeRows = np.nonzero(isCorner)[0]
-    nCorners = len(cornerNodeRows)
-    cornerLocalIdx = -np.ones(nNodes, dtype=int)
-    cornerLocalIdx[cornerNodeRows] = np.arange(nCorners)
-
-    rows, cols, vals = [], [], []
-    for node in range(nNodes):
-        if isCorner[node]:
-            rows.append(node)
-            cols.append(cornerLocalIdx[node])
-            vals.append(1.0)
-        else:
-            a, b = edgeEndpoints[node]
-            rows += [node, node]
-            cols += [cornerLocalIdx[a], cornerLocalIdx[b]]
-            vals += [0.5, 0.5]
-    return sp.csr_matrix((vals, (rows, cols)), shape=(nNodes, nCorners))
+#: The fine Chebyshev smoother's spectral bounds and power iteration: ``higher`` = 1.1 is a safety
+#: margin above the estimated spectral radius (AMGCL's own chebyshev defaults it to 1.0, which would
+#: silently retune the validated smoother); a short, badly under-converged power iteration can make
+#: Chebyshev smoothing diverge outright, hence 300 iterations.
+_DEFAULT_FINE_LOWER = 0.01
+_DEFAULT_FINE_HIGHER = 1.1
+_DEFAULT_FINE_POWER_ITERS = 300
+#: Power iterations of the re-check of a reused fine spectral radius, from the previous build's dominant
+#: vector -- a few sparse products instead of the full estimate's 300.
+_DEFAULT_FINE_RECHECK_ITERS = 15
 
 
 class PTwoGridPreconditioner:
-    """A p-two-grid preconditioner for one vector field's diagonal block, built once per solve
-    (mirroring :class:`~edelweissfe.linsolve.amgcl.amgcl.PyAMGCLSolver`'s ``build`` /
+    """A p-two-grid preconditioner for one vector field's diagonal block, built once per hierarchy
+    refresh (mirroring :class:`~edelweissfe.linsolve.amgcl.amgcl.PyAMGCLSolver`'s ``build`` /
     ``applyPreconditioner`` life cycle) and applied many times within the outer GMRES.
 
     Parameters
@@ -163,6 +124,15 @@ class PTwoGridPreconditioner:
         field's own node order.
     nu
         Fine Chebyshev sweeps before *and* after the coarse-grid correction.
+    nuPre, nuPost
+        Separate pre- and post-smoothing sweep counts, each ``None`` (default) for ``nu``. With
+        ``nuPre = 0`` the cycle starts with the coarse-grid correction of the right-hand side itself
+        (the residual of x = 0) and ends with ``nuPost`` sweeps: one smoother application fewer per
+        cycle than a symmetric one, at the price of a nonsymmetric preconditioner -- of no concern to
+        the right-preconditioned GMRES around it, which needs a fixed linear operator, not a symmetric
+        one. Ending on the smoother is the right way round for that one sweep: it damps the
+        high-frequency error the prolongated correction leaves on the fine level; starting with it
+        (``nuPre = 1, nuPost = 0``) leaves that error in the result.
     fineDegree
         Fine Chebyshev polynomial degree.
     coarsePrecond
@@ -175,6 +145,36 @@ class PTwoGridPreconditioner:
         mirroring :class:`~edelweissfe.linsolve.blockamg.blockamg.BlockAMGSolver`'s own
         ``useRigidBodyNullspace`` fallback behaviour for the full field, since this is the same
         construction restricted to the corner-node subset.
+    fineBlockSize
+        Storage of the fine operator for the smoother and residual sparse matrix-vector products:
+        ``1`` (scalar entries) or ``3`` (node-wise 3x3 blocks, a 3D field only) -- roughly half the
+        memory traffic per product, the dominant cost of the apply. Both give the same cycle up to
+        floating-point summation order.
+    fineSpectralRadius, fineDominantVector
+        The fine operator's spectral radius for the Chebyshev bounds, or ``None`` to estimate it by
+        ``finePowerIters`` power iterations from a deterministic start vector -- the single most
+        expensive stage of :meth:`build`. A caller rebuilding on a slowly changing operator can hand
+        back a previous build's :attr:`fineSpectralRadius` and :attr:`fineDominantVector` (see
+        blockamg's ``p1FineSpectralRadiusReuse``). The radius is then not reused blindly but
+        re-checked by ``fineRecheckIters`` power iterations continued from that vector: a re-check
+        estimate more than 1% above the supplied radius replaces it, and one beyond the ``fineHigher`` safety
+        margin -- the operator stiffened more than the smoother's bounds cover -- triggers the full
+        estimate. A radius without a vector is used as supplied.
+    fineValueType
+        ``"double"`` (default) or ``"float"``: the value type the fine operator is stored in for the
+        smoother and the residual -- about 80 % of an outer iteration is fine smoothing, which is
+        bound by the bytes per entry read. Vectors and every accumulation stay double (a float
+        matrix times a double vector, summed in double), and the spectral-radius estimate and its
+        re-check run on the double operator before it is rounded, so float only rounds the stored
+        entries (relative 6e-8).
+    coarseValueType
+        ``"double"`` (default) or ``"float"``: the value type of the whole coarse AMGCL hierarchy
+        (AMGCL's own single-precision backend, so its setup -- including its Chebyshev smoother's power
+        iteration -- runs in float too); the coarse right-hand side and correction are converted at
+        the boundary.
+    fineLower, fineHigher, finePowerIters, fineRecheckIters
+        The fine Chebyshev spectral bounds relative to the spectral radius, the power iteration
+        count of its full estimate, and that of the re-check of a reused one.
     """
 
     def __init__(
@@ -182,48 +182,78 @@ class PTwoGridPreconditioner:
         isCorner: np.ndarray,
         edgeEndpoints: np.ndarray,
         nu: int = _DEFAULT_NU,
+        nuPre: int = None,
+        nuPost: int = None,
         fineDegree: int = _DEFAULT_FINE_DEGREE,
         coarsePrecond: dict = None,
         useCoarseNullspace: bool = True,
-        pNode: "sp.csr_matrix | None" = None,
+        fineBlockSize: int = 1,
+        fineValueType: str = "double",
+        coarseValueType: str = "double",
+        fineSpectralRadius: float = None,
+        fineDominantVector: np.ndarray = None,
+        fineLower: float = _DEFAULT_FINE_LOWER,
+        fineHigher: float = _DEFAULT_FINE_HIGHER,
+        finePowerIters: int = _DEFAULT_FINE_POWER_ITERS,
+        fineRecheckIters: int = _DEFAULT_FINE_RECHECK_ITERS,
     ):
-        self._isCorner = isCorner
-        # ``pNode`` lets the caller supply an already-built restriction operator. It is a pure
-        # function of (isCorner, edgeEndpoints) -- both fixed for a given mesh -- while this class is
-        # reconstructed on every hierarchy refresh, i.e. potentially every Newton iteration on a
-        # churning contact model. Rebuilding it there would repeat the same O(nNodes) Python loop for
-        # an identical result; see BlockAMGSolver's own cache.
-        self._P_node = buildNodeLevelP(isCorner, edgeEndpoints) if pNode is None else pNode
-        self._nu = nu
-        self._fineDegree = fineDegree
-        self._coarsePrecond = dict(coarsePrecond) if coarsePrecond is not None else dict(_DEFAULT_COARSE_PRECOND)
+        self._isCorner = np.ascontiguousarray(isCorner, dtype=np.int8)
+        self._edgeEndpoints = np.ascontiguousarray(edgeEndpoints, dtype=np.int32)
         self._useCoarseNullspace = useCoarseNullspace
-        # cumulative wall time, fine (Chebyshev smoother) vs. coarse (AMGCL, OpenMP-threaded) --
-        # kept measured, not assumed, since the fine/coarse cost split determines whether a serial
-        # fine smoother is acceptable or must be threaded (see _buildChebyshevSmoother above).
-        self.fineSeconds = 0.0
-        self.coarseSeconds = 0.0
-        self.applyCalls = 0
+        self._fineSpectralRadius = fineSpectralRadius
+        self._fineDominantVector = fineDominantVector
+        self._params = {
+            "nuPre": int(nu if nuPre is None else nuPre),
+            "nuPost": int(nu if nuPost is None else nuPost),
+            "fineDegree": int(fineDegree),
+            "fineLower": float(fineLower),
+            "fineHigher": float(fineHigher),
+            "finePowerIters": int(finePowerIters),
+            "fineRecheckIters": int(fineRecheckIters),
+            "fineBlockSize": int(fineBlockSize),
+            "fineValueType": fineValueType,
+            "coarseValueType": coarseValueType,
+            "coarse": dict(coarsePrecond) if coarsePrecond is not None else dict(_DEFAULT_COARSE_PRECOND),
+        }
+        from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLPTwoGrid
+
+        # The C++ class parses and validates every parameter in its constructor -- the one place they are
+        # checked -- so a bad value fails here, before anything is built.
+        try:
+            self._preconditioner = PyAMGCLPTwoGrid(self._params)
+        except RuntimeError as error:
+            raise ValueError(str(error)) from error
 
     @property
-    def pNode(self):
-        """The node-level P1 restriction operator this preconditioner uses.
+    def fineSpectralRadius(self) -> float:
+        """The fine spectral radius the smoother was built with (estimated, or the one supplied).
 
-        Exposed so a caller that reconstructs this object per hierarchy refresh can cache the
-        operator and hand it back via the ``pNode`` constructor argument -- it depends only on the
-        mesh topology, not on the matrix.
+        Exposed so a caller that reconstructs this object per hierarchy refresh can hand it back via
+        the ``fineSpectralRadius`` constructor argument instead of paying for the estimate again.
         """
-        return self._P_node
+        return self._preconditioner.fineSpectralRadius
 
-    def build(self, A: sp.csr_matrix, dinv: np.ndarray, coords: np.ndarray = None) -> None:
-        """Build the free submatrix, the restricted ``P``, the Galerkin coarse operator, its AMGCL
-        hierarchy, and the fine Chebyshev smoother -- everything :meth:`applyPreconditioner` needs.
+    @property
+    def fineDominantVector(self) -> np.ndarray:
+        """The estimate of the fine operator's dominant eigenvector, to hand back together with
+        :attr:`fineSpectralRadius` for the re-check of a reused radius."""
+        return self._preconditioner.fineDominantVector
+
+    @property
+    def fineSpectralRadiusSource(self) -> str:
+        """``"estimated"``, ``"supplied"``, ``"raised"`` or ``"re-estimated"`` -- see the
+        ``fineSpectralRadius`` parameter."""
+        return self._preconditioner.fineSpectralRadiusSource
+
+    def build(self, A, dinv: np.ndarray, coords: np.ndarray = None) -> None:
+        """Build the restricted ``P``, the Galerkin coarse operator, its AMGCL hierarchy, and the fine
+        Chebyshev smoother -- everything :meth:`applyPreconditioner` needs, all in C++.
 
         Parameters
         ----------
         A
-            This field's equilibrated diagonal block (``As[slice, slice]``), still carrying its
-            Dirichlet identity rows.
+            This field's equilibrated diagonal block (``As[slice, slice]``, scipy CSR), still carrying
+            its Dirichlet identity rows.
         dinv
             This field's own slice of the global equilibration vector (``dinv[block.start:block.stop]``),
             needed to scale the coarse near-null-space consistently with ``A``'s own scaling
@@ -233,98 +263,62 @@ class PTwoGridPreconditioner:
             ``useCoarseNullspace`` is set, the coarse solve's near null-space is the full rigid-body
             basis (translations + rotations) on the corner-node subset instead of translations alone.
         """
-        from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLSolver
+        from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLPTwoGrid
 
         A = A.tocsr()
         n = A.shape[0]
         nNodes = len(self._isCorner)
-        if n % nNodes != 0:
+        if (nNodes == 0) != (n == 0) or (nNodes > 0 and n % nNodes != 0):
             raise ValueError(
                 "ptwogrid: block size {:} is not a multiple of the topology map's node count {:} -- "
                 "the map does not match this field.".format(n, nNodes)
             )
-        nDim = n // nNodes
-        P_dof = sp.kron(self._P_node, sp.identity(nDim), format="csr")
+        nDim = n // nNodes if nNodes > 0 else 0
 
-        dirichletMaskBool = np.diff(A.indptr) == 1
-        self._dirichletRows = np.nonzero(dirichletMaskBool)[0]
-        self._freeRows = np.nonzero(~dirichletMaskBool)[0]
+        with performancetiming.timeit("coarse nullspace"):
+            nullspace = None
+            if self._useCoarseNullspace and n > 0:
+                # Build the full (unrestricted) coarse-DOF near null-space first, then restrict to the
+                # free coarse DOFs -- same two-step shape as the rest of blockamg's null-space
+                # construction, just applied to the corner-node subset's own synthetic block instead of
+                # the full field. The coarse DOFs are the corners' DOFs in node order; the Dirichlet rows
+                # are the C++ build's own (a nonzero diagonal and no nonzero off-diagonal entry).
+                isDirichlet = PyAMGCLPTwoGrid.dirichletRows(A)
+                cornerNodeRows = np.nonzero(self._isCorner)[0]
+                nCorners = len(cornerNodeRows)
+                fullDofRowsForCorners = np.repeat(cornerNodeRows, nDim) * nDim + np.tile(np.arange(nDim), nCorners)
+                freeCoarseCols = np.nonzero(~isDirichlet[fullDofRowsForCorners])[0]
+                coarseBlock = FieldBlock("coarse", 0, nCorners * nDim, nDim)
+                cornerScaling = dinv[fullDofRowsForCorners]
+                if coords is not None:
+                    cornerCoords = np.asarray(coords, dtype=float)[cornerNodeRows]
+                    fullNullspace = rigidBodyNullspace(coarseBlock, cornerCoords, cornerScaling)
+                else:
+                    fullNullspace = translationNullspace(coarseBlock, cornerScaling)
+                nullspace = fullNullspace[freeCoarseCols, :]
 
-        A_free = A[self._freeRows, :][:, self._freeRows].tocsr()
-
-        cornerNodeRows = np.nonzero(self._isCorner)[0]
-        nCorners = len(cornerNodeRows)
-        fullDofRowsForCorners = np.repeat(cornerNodeRows, nDim) * nDim + np.tile(np.arange(nDim), nCorners)
-        coarseColIsFree = ~dirichletMaskBool[fullDofRowsForCorners]
-        freeCoarseCols = np.nonzero(coarseColIsFree)[0]
-
-        # restrict P to free fine rows x free coarse columns -- slicing alone implements the "no
-        # renormalization" interpolation rule (a free midside's 1/2 weight to a Dirichlet corner is
-        # simply dropped, not redistributed).
-        P_free = P_dof[self._freeRows, :][:, freeCoarseCols].tocsr()
-        rowSums = np.asarray(np.abs(P_free).sum(axis=1)).flatten()
-        orphanRows = np.nonzero(rowSums == 0)[0]
-        if len(orphanRows):
-            raise AssertionError(
-                "ptwogrid: {:} free midside row(s) of the restricted P are entirely zero -- both "
-                "edge-endpoint corners are Dirichlet-constrained, an orphan the topology map "
-                "disagrees with the Dirichlet data on. First bad row: {:}.".format(len(orphanRows), orphanRows[0])
+        with performancetiming.timeit("C++ build"):
+            # a build that throws leaves the C++ object unbuilt: applyPreconditioner then raises
+            self._preconditioner.build(
+                A,
+                self._isCorner,
+                self._edgeEndpoints,
+                nullspace,
+                self._fineSpectralRadius if self._fineSpectralRadius is not None else 0.0,
+                self._fineDominantVector,
             )
 
-        self._As_free = A_free
-        self._P_free = P_free
-
-        A1_free = (P_free.T @ A_free @ P_free).tocsr()
-
-        coarseSolver = PyAMGCLSolver({"precond": self._coarsePrecond, "backendBlockSize": 1})
-        if self._useCoarseNullspace:
-            # Build the full (unrestricted) coarse-DOF near null-space first, then restrict to the
-            # free coarse columns -- same two-step shape as the rest of blockamg's null-space
-            # construction, just applied to the corner-node subset's own synthetic block instead of
-            # the full field.
-            coarseBlock = FieldBlock("coarse", 0, nCorners * nDim, nDim)
-            fullCornerDinv = dinv[fullDofRowsForCorners]
-            if coords is not None:
-                cornerCoords = np.asarray(coords, dtype=float)[cornerNodeRows]
-                fullNullspace = rigidBodyNullspace(coarseBlock, cornerCoords, fullCornerDinv)
-            else:
-                fullNullspace = translationNullspace(coarseBlock, fullCornerDinv)
-            coarseSolver.set_nullspace(fullNullspace[freeCoarseCols, :])
-        coarseSolver.build(A1_free)
-        self._coarseSolver = coarseSolver
-
-        self._smooth, self._residual = _buildChebyshevSmoother(A_free, self._fineDegree)
-
     def applyPreconditioner(self, r: np.ndarray) -> np.ndarray:
-        """One two-grid V-cycle: pre-smooth, coarse-grid correction, post-smooth, on the free
-        submatrix; Dirichlet rows pass through unchanged (``A[i, i] = 1`` there by construction, so
-        the exact local solve is ``x[i] = r[i]``)."""
-        import time
+        """One two-grid V-cycle: pre-smooth, coarse-grid correction, post-smooth, on the free DOFs;
+        Dirichlet rows are solved exactly, ``x[i] = r[i] / A[i, i]`` (``r[i]`` itself for the unit diagonal of
+        an equilibrated block)."""
+        return self._preconditioner.applyPreconditioner(r)
 
-        self.applyCalls += 1
-        rFree = r[self._freeRows]
-        xFree = np.zeros_like(rFree)
-
-        t0 = time.perf_counter()
-        self._smooth(xFree, rFree, self._nu)
-        self.fineSeconds += time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        res = self._residual(rFree, xFree)
-        resCoarse = self._P_free.T @ res
-        corrCoarse = self._coarseSolver.applyPreconditioner(resCoarse)
-        xFree = xFree + self._P_free @ corrCoarse
-        self.coarseSeconds += time.perf_counter() - t0
-
-        t0 = time.perf_counter()
-        self._smooth(xFree, rFree, self._nu)
-        self.fineSeconds += time.perf_counter() - t0
-
-        x = np.empty_like(r)
-        x[self._freeRows] = xFree
-        x[self._dirichletRows] = r[self._dirichletRows]
-        return x
+    def timings(self) -> dict:
+        """Wall time [s] of the last build's stages and the cumulative apply (fine vs. coarse) --
+        kept measured, not assumed, since the split decides where the next optimization goes."""
+        return self._preconditioner.timings()
 
     def report(self) -> str:
         """The coarse level's AMGCL hierarchy report (context/diagnostics only, not a convergence gate)."""
-        return self._coarseSolver.report()
+        return self._preconditioner.report()
