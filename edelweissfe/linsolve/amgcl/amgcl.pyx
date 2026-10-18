@@ -76,18 +76,18 @@ cdef inline double* _doubleData(double[::1] values):
 
 
 cdef class PyAMGCLSolver:
-    cdef LinearSolver* solver
-    cdef LinearSolverFloat* solverFloat
-    cdef LinearSolverBlock2* solverBlock2
-    cdef LinearSolverBlock3* solverBlock3
+    cdef AMGCLSolverInterface* solver
     cdef readonly bint isFloat
-    """True if this instance runs the mixed-precision (builtin<float>) hierarchy."""
+    """True if this instance runs a mixed-precision hierarchy: builtin<float> for the scalar backend, or
+    3x3 blocks set up in double but stored in float (``LinearSolverBlock3Float``) for block size 3."""
     cdef readonly int blockSize
     """1 (scalar, default), 2, or 3 -- the AMGCL backend's block size."""
     cdef readonly int lastIterations
     """The iteration count AMGCL reported for the most recent solve, -1 before the first."""
     cdef readonly double lastError
     """The relative residual AMGCL reported for the most recent solve, NaN before the first."""
+    cdef readonly int n
+    """The size of the matrix of the last :meth:`build`, -1 before the first."""
 
     def __cinit__(self, dict params=None):
         """
@@ -106,11 +106,19 @@ cdef class PyAMGCLSolver:
 
         ``backendBlockSize``: ``1`` (default, scalar), ``2``, or ``3``. Selects a block-valued backend
         operating on node-major B x B nodal blocks instead of scalar entries -- shrinks the
-        CSR index traffic by ~B² and lets block-aware smoothers (block-ILU0, block-GS) invert each
-        node's coupling exactly. The matrix still arrives as a plain scalar CSR; the wrapper adapts it
-        internally. Not yet combinable with ``backendPrecision == "float"`` (raises) -- float-block is
-        a follow-up, not implemented in this pass. :meth:`set_nullspace` always raises on a block
-        backend -- AMGCL's own near-null-space path is unimplemented for block value types.
+        CSR index traffic by ~B² and, with ``backendPrecision == "double"`` (block size 2 or 3), lets
+        block-aware smoothers (block-ILU0, block-GS) invert each node's coupling exactly: both run on
+        plain ``amgcl::backend::builtin<BlockType>``, the same backend the scalar solver uses, just over
+        B x B blocks instead of scalar entries. The matrix still arrives as a plain scalar CSR; the
+        wrapper adapts it internally. With ``backendPrecision == "float"``, block size 3
+        (``LinearSolverBlock3Float``) sets the hierarchy up in double -- coarsening, Galerkin products
+        and every Chebyshev spectral-radius estimate -- and stores only the level matrices the cycle
+        reads in float, with double vectors and double accumulation; on *that* backend block-GS is
+        unsupported (AMGCL rejects it at construction, since the float-stored level matrices do not
+        provide a row iterator) and block-ILU0/ILUk/ILUT/ILUP fall back to AMGCL's generic approximate
+        triangular solve instead of the exact one plain ``builtin`` gets. Block size 2 with float raises.
+        :meth:`set_nullspace` always raises on a block backend -- AMGCL's own near-null-space path is
+        unimplemented for block value types.
 
         Example params:
         {
@@ -139,39 +147,23 @@ cdef class PyAMGCLSolver:
         if blockSize not in (1, 2, 3):
             raise ValueError(f"backendBlockSize must be 1, 2, or 3, got {blockSize!r}")
         self.blockSize = blockSize
-        if self.blockSize > 1 and self.isFloat:
+        if self.blockSize == 2 and self.isFloat:
             raise NotImplementedError(
-                "backendBlockSize > 1 combined with backendPrecision='float' is not implemented."
+                "backendBlockSize 2 combined with backendPrecision='float' is not implemented."
             )
 
         self.lastIterations = -1
         self.lastError = float("nan")
+        self.n = -1
 
         # Convert dict to JSON string for C++
         cdef bytes json_bytes = json.dumps(params).encode("utf-8")
         cdef const char* c_json = json_bytes
-        self.solver = NULL
-        self.solverFloat = NULL
-        self.solverBlock2 = NULL
-        self.solverBlock3 = NULL
-        if self.blockSize == 2:
-            self.solverBlock2 = new LinearSolverBlock2(c_json)
-        elif self.blockSize == 3:
-            self.solverBlock3 = new LinearSolverBlock3(c_json)
-        elif self.isFloat:
-            self.solverFloat = new LinearSolverFloat(c_json)
-        else:
-            self.solver = new LinearSolver(c_json)
+        self.solver = makeAMGCLSolver(c_json, self.blockSize, self.isFloat)
 
     def __dealloc__(self):
         if self.solver != NULL:
             del self.solver
-        if self.solverFloat != NULL:
-            del self.solverFloat
-        if self.solverBlock2 != NULL:
-            del self.solverBlock2
-        if self.solverBlock3 != NULL:
-            del self.solverBlock3
 
     def set_nullspace(self, object B):
         """
@@ -193,64 +185,23 @@ cdef class PyAMGCLSolver:
         cdef int cols = B_arr.shape[1]
         cdef double[:, ::1] B_view
         if cols == 0:
-            if self.blockSize == 2:
-                self.solverBlock2.set_nullspace(<const double*> 0, rows, 0)
-            elif self.blockSize == 3:
-                self.solverBlock3.set_nullspace(<const double*> 0, rows, 0)
-            elif self.isFloat:
-                self.solverFloat.set_nullspace(<const double*> 0, rows, 0)
-            else:
-                self.solver.set_nullspace(<const double*> 0, rows, 0)
+            self.solver.set_nullspace(<const double*> 0, rows, 0)
             return
         B_view = B_arr
-        if self.blockSize == 2:
-            self.solverBlock2.set_nullspace(&B_view[0, 0], rows, cols)
-        elif self.blockSize == 3:
-            self.solverBlock3.set_nullspace(&B_view[0, 0], rows, cols)
-        elif self.isFloat:
-            self.solverFloat.set_nullspace(&B_view[0, 0], rows, cols)
-        else:
-            self.solver.set_nullspace(&B_view[0, 0], rows, cols)
+        self.solver.set_nullspace(&B_view[0, 0], rows, cols)
 
     def build(self, object A):
         """
         Build the AMG hierarchy for A once, for repeated preconditioner application via
         :meth:`applyPreconditioner` -- the build-once / apply-many split :meth:`solve` fuses.
 
-        A: scipy.sparse.csr_matrix. Its values narrow to float32 first if ``backendPrecision ==
-        "float"`` -- cheap here (build() runs once per solve, not once per outer Krylov iteration). A
-        block backend (``blockSize > 1``) instead takes the plain scalar CSR unchanged and adapts it
-        to node-major blocks inside the C++ wrapper.
+        A: scipy.sparse.csr_matrix, passed as double; a float backend rounds its values inside the C++
+        wrapper (build() runs once per solve, not once per outer Krylov iteration), and a block
+        backend (``blockSize > 1``) adapts the scalar CSR to node-major blocks there.
         """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef int n = A.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-
-        cdef np.ndarray[np.float32_t, ndim=1, mode="c"] dataFloat
-        cdef float[::1] dataFloat_
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data
-        cdef double[::1] data_
-
-        if self.blockSize == 2 or self.blockSize == 3:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            if self.blockSize == 2:
-                self.solverBlock2.build(n, &indptr_[0], &indices_[0], &data_[0])
-            else:
-                self.solverBlock3.build(n, &indptr_[0], &indices_[0], &data_[0])
-        elif self.isFloat:
-            dataFloat = np.ascontiguousarray(A.data, dtype=np.float32)
-            dataFloat_ = dataFloat
-            self.solverFloat.build(n, &indptr_[0], &indices_[0], &dataFloat_[0])
-        else:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            self.solver.build(n, &indptr_[0], &indices_[0], &data_[0])
+        A, indptr, indices, data = _csrArrays(A)
+        self.solver.build(A.shape[0], _intData(indptr), _intData(indices), _constDoubleData(data))
+        self.n = A.shape[0]
 
     def applyPreconditioner(self, object rhs):
         """
@@ -260,20 +211,9 @@ cdef class PyAMGCLSolver:
         any backend-specific narrowing/widening or block reinterpretation happens inside the C++
         wrapper, not here, since this is called once per outer Krylov iteration.
         """
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef int n = rhs_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(n, dtype=np.float64)
-
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x
-        if self.blockSize == 2:
-            self.solverBlock2.applyPreconditioner(n, &rhs_[0], &x_[0])
-        elif self.blockSize == 3:
-            self.solverBlock3.applyPreconditioner(n, &rhs_[0], &x_[0])
-        elif self.isFloat:
-            self.solverFloat.applyPreconditioner(n, &rhs_[0], &x_[0])
-        else:
-            self.solver.applyPreconditioner(n, &rhs_[0], &x_[0])
+        rhsArray = _vector(rhs, self.n, "rhs")
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(self.n, dtype=np.float64)
+        self.solver.applyPreconditioner(self.n, _constDoubleData(rhsArray), _doubleData(x))
         return x
 
     def report(self):
@@ -283,12 +223,6 @@ cdef class PyAMGCLSolver:
 
         Raises RuntimeError if nothing has been built yet.
         """
-        if self.blockSize == 2:
-            return self.solverBlock2.report().decode("utf-8")
-        if self.blockSize == 3:
-            return self.solverBlock3.report().decode("utf-8")
-        if self.isFloat:
-            return self.solverFloat.report().decode("utf-8")
         return self.solver.report().decode("utf-8")
 
     def solve(self, object A, object rhs):
@@ -296,92 +230,14 @@ cdef class PyAMGCLSolver:
         A: scipy.sparse.csr_matrix
         rhs: array-like, will be converted to 1D float64 (C-contiguous)
         """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.asarray(rhs, dtype=np.float64, order="C")
-        if rhs_arr.ndim != 1:
-            raise ValueError("rhs must be a 1D array-like")
-
+        A, indptr, indices, data = _csrArrays(A)
         cdef int n = A.shape[0]
-        if rhs_arr.shape[0] != n:
-            raise ValueError(f"Dimension mismatch: Matrix {n}x{n}, RHS {rhs_arr.shape[0]}")
-        if n > np.iinfo(np.int32).max:
-            raise OverflowError(f"Matrix dimension {n} exceeds supported int32 range for AMGCL wrapper")
-
-        cdef long long int32_max = np.iinfo(np.int32).max
-        cdef long long nnz = A.nnz
-        if nnz > int32_max:
-            raise OverflowError(f"CSR nnz value {nnz} exceeds supported int32 range for AMGCL wrapper")
-        if int(A.indptr.min()) < 0:
-            raise OverflowError("CSR indptr contains negative values, which are unsupported")
-        if A.indices.size > 0:
-            if int(A.indices.max()) > int32_max:
-                raise OverflowError("CSR indices contain values that exceed int32 range for AMGCL wrapper")
-            if int(A.indices.min()) < 0:
-                raise OverflowError("CSR indices contain negative values, which are unsupported")
-
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = A.indptr.astype(np.int32, copy=False)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = A.indices.astype(np.int32, copy=False)
-
-        # Ensure contiguous (astype might return non-contiguous if copy=False was possible)
-        if not indptr.flags["C_CONTIGUOUS"]:
-            indptr = np.ascontiguousarray(indptr)
-        if not indices.flags["C_CONTIGUOUS"]:
-            indices = np.ascontiguousarray(indices)
-
+        rhsArray = _vector(rhs, n, "rhs")
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x = np.zeros(n, dtype=np.float64)
-
         cdef int iters = 0
         cdef double error = 0.0
-
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x
-
-        cdef np.ndarray[np.float32_t, ndim=1, mode="c"] dataFloat
-        cdef float[::1] dataFloat_
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data
-        cdef double[::1] data_
-
-        if self.blockSize == 2 or self.blockSize == 3:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            if self.blockSize == 2:
-                self.solverBlock2.solve(
-                        n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0], iters, error
-                    )
-            else:
-                self.solverBlock3.solve(
-                        n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0], iters, error
-                    )
-        elif self.isFloat:
-            dataFloat = np.ascontiguousarray(A.data, dtype=np.float32)
-            dataFloat_ = dataFloat
-            self.solverFloat.solve(
-                    n,
-                    &indptr_[0],
-                    &indices_[0],
-                    &dataFloat_[0],
-                    &rhs_[0],
-                    &x_[0],
-                    iters,
-                    error
-                )
-        else:
-            data = np.ascontiguousarray(A.data, dtype=np.float64)
-            data_ = data
-            self.solver.solve(
-                    n,
-                    &indptr_[0],
-                    &indices_[0],
-                    &data_[0],
-                    &rhs_[0],
-                    &x_[0],
-                    iters,
-                    error
-                )
+        self.solver.solve(n, _intData(indptr), _intData(indices), _constDoubleData(data), _constDoubleData(rhsArray),
+                          _doubleData(x), iters, error)
 
         # AMGCL reports these by reference and they were being dropped on the floor, which left an
         # unconverged solve indistinguishable from a converged one: an iterative solver that hits
