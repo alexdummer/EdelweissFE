@@ -32,6 +32,49 @@ import scipy.sparse
 cimport numpy as np
 
 
+def _csrArrays(object A):
+    """``A`` as a CSR matrix (converted if needed) and its arrays as C-contiguous int32 row pointers, int32
+    column indices and float64 values -- the form every C++ entry point of this module takes, and the one
+    place their int32 range is checked."""
+    if not scipy.sparse.isspmatrix_csr(A):
+        A = A.tocsr()
+    int32Max = np.iinfo(np.int32).max
+    if max(A.shape) > int32Max or A.nnz > int32Max:
+        raise OverflowError("a {:}x{:} CSR matrix with {:} entries exceeds the int32 range of the AMGCL wrapper".format(
+            A.shape[0], A.shape[1], A.nnz))
+    return (
+        A,
+        np.ascontiguousarray(A.indptr, dtype=np.int32),
+        np.ascontiguousarray(A.indices, dtype=np.int32),
+        np.ascontiguousarray(A.data, dtype=np.float64),
+    )
+
+
+def _vector(object x, int n, str name):
+    """``x`` as a C-contiguous float64 vector of length ``n``. The C++ side reads exactly ``n`` entries without
+    bounds checks, so a wrong length (e.g. a vector of the mesh before adaptive refinement) must raise here."""
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] v = np.ascontiguousarray(x, dtype=np.float64).reshape(-1)
+    if v.shape[0] != n:
+        raise ValueError("{:} has length {:}, expected {:}".format(name, v.shape[0], n))
+    return v
+
+
+cdef inline const int* _intData(const int[::1] values):
+    """The first entry's address, or NULL for an empty array -- bounds checking is off in this module, so an
+    empty array must not be indexed."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline const double* _constDoubleData(const double[::1] values):
+    """See :func:`_intData`."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
+cdef inline double* _doubleData(double[::1] values):
+    """See :func:`_intData`."""
+    return &values[0] if values.shape[0] > 0 else NULL
+
+
 cdef class PyAMGCLSolver:
     cdef LinearSolver* solver
     cdef LinearSolverFloat* solverFloat
@@ -422,94 +465,99 @@ cdef class PyAMGCLRelaxationSmoother:
         return r
 
 
-cdef class PyAMGCLMatrix:
-    """A plain OpenMP-threaded matvec/residual wrapper, no smoother attached.
+cdef class PyAMGCLEquilibratedSystem:
+    """blockamg's equilibrated, field-split system ``As = D A D`` (``D = diag(dinv)``), built in one
+    OpenMP-threaded pass over ``A``: the outer Krylov operator (:meth:`matvec`, :meth:`residual`, and
+    the operator :meth:`PyAMGCLLGMRESSolver.solve` iterates on), the coupling blocks between fields
+    (:meth:`couplingMatvec`) and, on demand, a field's diagonal block (:meth:`diagonalBlock`).
 
-    The shipped default's outer GMRES operator (``gmres(As, bs, ...)`` in
-    :mod:`edelweissfe.linsolve.blockamg.blockamg`) previously called ``As`` directly as a
-    ``scipy.sparse`` CSR matrix -- not thread-parallel regardless of ``OMP_NUM_THREADS`` (scipy
-    sparse matvec is single-threaded C code; measured at ~15% of the shipped arm's own wall-clock on
-    a real reference model). Wrap ``As`` once per solve with
-    :meth:`build`, then pass ``scipy.sparse.linalg.LinearOperator(matvec=this.matvec)`` as the
-    operator instead of ``As`` itself.
+    Replaces a chain of serial SciPy operations -- a full copy of ``A`` scaled in place, a threaded
+    copy of that for the operator, row and column slices for every coupling and diagonal block --
+    measured at about 4 s of every solve on a 0.8-1.1M DOF system. The operator is bitwise the former
+    one (see ``EquilibratedSystemT`` in ``amgcl-wrapper.hpp``).
     """
-    cdef ThreadedMatrix* matrix
-    cdef int _nrows
+    cdef EquilibratedSystem* system
+    cdef readonly int n
+    """The system size."""
 
     def __cinit__(self):
-        self.matrix = new ThreadedMatrix()
-        self._nrows = 0
+        self.system = new EquilibratedSystem()
+        self.n = 0
 
     def __dealloc__(self):
-        if self.matrix != NULL:
-            del self.matrix
+        if self.system != NULL:
+            del self.system
 
-    def build(self, object A):
-        """Convert A (scipy.sparse csr_matrix) once. Not amortized across solves -- this pattern's
-        sparsity churns every solve on a model with contact/tie constraints, so the conversion is
-        paid fresh every call."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
+    @staticmethod
+    def absoluteDiagonal(object A):
+        """``abs(A.diagonal())`` of a scipy.sparse CSR matrix, threaded."""
+        A, indptr, indices, data = _csrArrays(A)
         cdef int n = A.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] out = np.empty(n, dtype=np.float64)
+        EquilibratedSystem.absoluteDiagonal(n, _intData(indptr), _intData(indices), _constDoubleData(data),
+                                            _doubleData(out))
+        return out
+
+    def build(self, object A, object dinv, object fieldBounds):
+        """
+        A: scipy.sparse csr_matrix (square); dinv: the equilibration, length n; fieldBounds: a
+        sequence of ``(start, stop)`` DOF ranges, one per field, disjoint.
+        """
+        if A.shape[0] != A.shape[1]:
+            raise ValueError("A must be square, got shape {:}".format(A.shape))
+        A, indptr, indices, data = _csrArrays(A)
+        cdef int n = A.shape[0]
+        dinvArray = _vector(dinv, n, "dinv")
+        bounds = np.ascontiguousarray(np.asarray(fieldBounds, dtype=np.int32).reshape(-1))
+        if bounds.shape[0] % 2:
+            raise ValueError("fieldBounds must be (start, stop) pairs, got {:} numbers".format(bounds.shape[0]))
+        self.system.build(n, _intData(indptr), _intData(indices), _constDoubleData(data), _constDoubleData(dinvArray),
+                          bounds.shape[0] // 2, _intData(bounds))
+        self.n = n
+
+    def diagonalBlock(self, int field):
+        """``As[field, field]`` as a new scipy.sparse csr_matrix (sorted columns if ``A``'s were)."""
+        cdef int size = self.system.diagonalBlockSize(field)
+        cdef int nnz = self.system.diagonalBlockNnz(field)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.empty(size + 1, dtype=np.int32)
+        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.empty(max(nnz, 1), dtype=np.int32)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.empty(max(nnz, 1), dtype=np.float64)
         cdef int[::1] indptr_ = indptr
         cdef int[::1] indices_ = indices
         cdef double[::1] data_ = data
-        self.matrix.build(n, &indptr_[0], &indices_[0], &data_[0])
+        self.system.fillDiagonalBlock(field, &indptr_[0], &indices_[0], &data_[0])
+        return scipy.sparse.csr_matrix((data[:nnz], indices[:nnz], indptr), shape=(size, size), copy=False)
 
     def matvec(self, object x):
-        """Returns A @ x as a new float64 array."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef int n = x_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(n, dtype=np.float64)
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] y_ = y
-        self.matrix.matvec(n, &x_[0], &y_[0])
-        return y
-
-    def buildRect(self, object A):
-        """Convert a *rectangular* A (scipy.sparse csr_matrix, nrows x ncols) for matvecRect().
-
-        Needed for the off-diagonal field-coupling blocks of blockamg's block Gauss-Seidel sweep:
-        build()/matvec() above assume a square operator and size the output by the input length.
-        """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef int nrows = A.shape[0]
-        cdef int ncols = A.shape[1]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] data_ = data
-        self.matrix.buildRect(nrows, ncols, &indptr_[0], &indices_[0], &data_[0])
-        self._nrows = nrows
-
-    def matvecRect(self, object x):
-        """Returns A @ x (length nrows) for a matrix built with buildRect()."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(self._nrows, dtype=np.float64)
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] y_ = y
-        self.matrix.matvecRect(&x_[0], &y_[0])
+        """Returns ``As @ x`` as a new float64 array."""
+        xArray = _vector(x, self.n, "x")
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(self.n, dtype=np.float64)
+        self.system.matvec(_constDoubleData(xArray), _doubleData(y))
         return y
 
     def residual(self, object rhs, object x):
-        """Returns rhs - A @ x as a new float64 array."""
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
-        cdef int n = rhs_arr.shape[0]
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(n, dtype=np.float64)
-        cdef double[::1] rhs_ = rhs_arr
-        cdef double[::1] x_ = x_arr
-        cdef double[::1] r_ = r
-        self.matrix.residual(n, &rhs_[0], &x_[0], &r_[0])
+        """Returns ``rhs - As @ x`` as a new float64 array."""
+        rhsArray, xArray = _vector(rhs, self.n, "rhs"), _vector(x, self.n, "x")
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] r = np.empty(self.n, dtype=np.float64)
+        self.system.residual(_constDoubleData(rhsArray), _constDoubleData(xArray), _doubleData(r))
         return r
+
+    def couplingMatvec(self, int field, int otherField, object x):
+        """Returns ``As[field, otherField] @ x`` (``x`` of the other field's size) as a new float64
+        array of this field's size."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        if x_arr.shape[0] != self.system.diagonalBlockSize(otherField):
+            raise ValueError("x has the wrong length for field {:}".format(otherField))
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(
+            self.system.diagonalBlockSize(field), dtype=np.float64
+        )
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] y_ = y
+        if x_arr.shape[0] == 0 or y.shape[0] == 0:
+            y[:] = 0.0
+            return y
+        self.system.couplingMatvec(field, otherField, &x_[0], &y_[0])
+        return y
 
 
 cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
@@ -630,13 +678,13 @@ cdef class PyAMGCLLGMRESSolver:
         if self.solver != NULL:
             del self.solver
 
-    def solve(self, object A, object rhs, object applyPreconditioner, double tol, int maxiter, object x0=None,
-              bint resetOnce=False):
+    def solve(self, PyAMGCLEquilibratedSystem system, object rhs, object applyPreconditioner, double tol,
+              int maxiter, object x0=None, bint resetOnce=False):
         """
-        A
-            scipy.sparse.csr_matrix, this solve's (equilibrated) full coupled operator -- converted
-            fresh every call (its pattern churns every solve, same as :class:`PyAMGCLMatrix`; only the
-            recycled Krylov *vectors* persist across calls, never a cached matrix conversion).
+        system
+            This solve's equilibrated full coupled operator, built fresh for every solve (its pattern
+            churns every solve; only the recycled Krylov *vectors* persist across calls, never a
+            matrix).
         rhs
             array-like, converted to 1D float64 (C-contiguous).
         applyPreconditioner
@@ -660,10 +708,7 @@ cdef class PyAMGCLLGMRESSolver:
             discarding this persistent instance itself. Default ``False`` -- recycling continues
             uninterrupted unless a caller explicitly asks for a one-shot reset.
         """
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-
-        cdef int n = A.shape[0]
+        cdef int n = system.n
         if n != self.n:
             raise ValueError(
                 "PyAMGCLLGMRESSolver: matrix size {:} does not match the size {:} this instance was "
@@ -671,9 +716,6 @@ cdef class PyAMGCLLGMRESSolver:
                 "change.".format(n, self.n)
             )
 
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indices = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] data = np.ascontiguousarray(A.data, dtype=np.float64)
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
 
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x
@@ -682,9 +724,6 @@ cdef class PyAMGCLLGMRESSolver:
         else:
             x = np.ascontiguousarray(x0, dtype=np.float64).copy()
 
-        cdef int[::1] indptr_ = indptr
-        cdef int[::1] indices_ = indices
-        cdef double[::1] data_ = data
         cdef double[::1] rhs_ = rhs_arr
         cdef double[::1] x_ = x
 
@@ -700,7 +739,7 @@ cdef class PyAMGCLLGMRESSolver:
         cdef void* ctx = <void*> self
         try:
             self.solver.solve(
-                n, &indptr_[0], &indices_[0], &data_[0], &rhs_[0], &x_[0],
+                system.system[0], &rhs_[0], &x_[0],
                 tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, resetOnce
             )
         finally:
@@ -759,48 +798,16 @@ cdef class PyAMGCLSpGEMM:
 
     def product(self, object A, object B):
         """Returns A @ B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-        if not scipy.sparse.isspmatrix_csr(B):
-            B = B.tocsr()
-
-        cdef int aN = A.shape[0]
-        cdef int bN = B.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
-        cdef int[::1] aPtr_ = aPtr
-        cdef int[::1] aCol_ = aCol
-        cdef double[::1] aVal_ = aVal
-        cdef int[::1] bPtr_ = bPtr
-        cdef int[::1] bCol_ = bCol
-        cdef double[::1] bVal_ = bVal
-        self.helper.product(aN, &aPtr_[0], &aCol_[0], &aVal_[0], bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        A, aPtr, aCol, aVal = _csrArrays(A)
+        B, bPtr, bCol, bVal = _csrArrays(B)
+        self.helper.product(A.shape[0], _intData(aPtr), _intData(aCol), _constDoubleData(aVal),
+                            B.shape[0], _intData(bPtr), _intData(bCol), _constDoubleData(bVal))
         return self._copyOut()
 
     def sum(self, double alpha, object A, double beta, object B):
         """Returns alpha*A + beta*B (both square scipy.sparse CSR, same size) as a new csr_matrix."""
-        if not scipy.sparse.isspmatrix_csr(A):
-            A = A.tocsr()
-        if not scipy.sparse.isspmatrix_csr(B):
-            B = B.tocsr()
-
-        cdef int aN = A.shape[0]
-        cdef int bN = B.shape[0]
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aPtr = np.ascontiguousarray(A.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] aCol = np.ascontiguousarray(A.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] aVal = np.ascontiguousarray(A.data, dtype=np.float64)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bPtr = np.ascontiguousarray(B.indptr, dtype=np.int32)
-        cdef np.ndarray[np.int32_t, ndim=1, mode="c"] bCol = np.ascontiguousarray(B.indices, dtype=np.int32)
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] bVal = np.ascontiguousarray(B.data, dtype=np.float64)
-        cdef int[::1] aPtr_ = aPtr
-        cdef int[::1] aCol_ = aCol
-        cdef double[::1] aVal_ = aVal
-        cdef int[::1] bPtr_ = bPtr
-        cdef int[::1] bCol_ = bCol
-        cdef double[::1] bVal_ = bVal
-        self.helper.sum(alpha, aN, &aPtr_[0], &aCol_[0], &aVal_[0], beta, bN, &bPtr_[0], &bCol_[0], &bVal_[0])
+        A, aPtr, aCol, aVal = _csrArrays(A)
+        B, bPtr, bCol, bVal = _csrArrays(B)
+        self.helper.sum(alpha, A.shape[0], _intData(aPtr), _intData(aCol), _constDoubleData(aVal),
+                        beta, B.shape[0], _intData(bPtr), _intData(bCol), _constDoubleData(bVal))
         return self._copyOut()
