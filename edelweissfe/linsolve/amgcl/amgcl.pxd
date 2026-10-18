@@ -58,7 +58,7 @@ cdef extern from "amgcl-wrapper.hpp":
 
         @staticmethod
         void absoluteDiagonal(int n, const int* ptr, const int* col, const double* val, double* out) except +
-        void build(int n, const int* ptr, const int* col, const double* val, const double* dinv,
+        void build(int n, const int* ptr, const int* col, const double* val, const double* scaling,
                    int nFields, const int* fieldBounds) except +
         int diagonalBlockSize(int f) except +
         int diagonalBlockNnz(int f) except +
@@ -66,17 +66,16 @@ cdef extern from "amgcl-wrapper.hpp":
         void matvec(const double* x, double* y) except +
         void residual(const double* rhs, const double* x, double* r) except +
         void couplingMatvec(int f, int g, const double* x, double* y) except +
+        void diagonalBlockMatvec(int f, const double* x, double* y) except +
 
     # Callback signature bridging AMGCL's native lgmres Krylov loop back into a Python-level
     # preconditioner -- see amgcl-wrapper.hpp's own comment on PyPrecondApplyFn/
     # PyLGMRESPrecondT for why this is a bare function pointer + opaque context rather than a
     # Cython-overridden C++ virtual method.
-    ctypedef void (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
+    ctypedef int (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
 
-    # AMGCL's own native outer Krylov solve, in place of scipy.sparse.linalg.gmres. Persists
-    # its recycled/augmented Krylov vectors across solve() calls on the same instance whenever
-    # always_reset is set to false in the constructor's params -- see LGMRESOuterSolverT's own
-    # comment for why this class is meant to be built once per BlockAMGSolver, not once per solve.
+    # AMGCL's own native outer Krylov solve, in place of scipy.sparse.linalg.gmres; one instance per
+    # system size, no augmentation vectors carried across calls -- see LGMRESOuterSolverT.
     cdef cppclass LGMRESOuterSolver:
         LGMRESOuterSolver(int n, const char* json_params) except +
         void solve(const EquilibratedSystem& system,
@@ -87,8 +86,7 @@ cdef extern from "amgcl-wrapper.hpp":
                    PyPrecondApplyFn applyFn,
                    void* ctx,
                    int& iters,
-                   double& error,
-                   bint resetOnce) except +
+                   double& error) except +
 
     # OpenMP-threaded sparse-matrix product/sum, wired into
     # edelweissfe/numerics/mpctransformation.py's T^T K T + C condensation as an opt-in alternative

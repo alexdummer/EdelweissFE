@@ -460,14 +460,14 @@ inline double rowDiagonal( const int* ptr, const int* col, const double* val, pt
 /// The equilibrated, field-split system of blockamg.py's outer solve, built in one OpenMP-threaded
 /// pass over A's CSR arrays instead of a chain of serial SciPy copies and slices.
 ///
-/// blockamg solves A x = b as (D A D)(D^-1 x) = D b, D = diag(dinv), and its block Gauss-Seidel
+/// blockamg solves A x = b as (D A D)(D^-1 x) = D b, D = diag(scaling), and its block Gauss-Seidel
 /// sweep needs every field's equilibrated diagonal block (for the per-field preconditioners, on a
 /// hierarchy rebuild) and the equilibrated coupling blocks between fields (on every solve). This
 /// class holds
 ///
 ///   * the equilibrated operator As = D A D, the outer Krylov operator: matvec(), residual(), and the
 ///     operator LGMRESOuterSolverT::solve() iterates on. Each entry is formed exactly as SciPy's
-///     former `As.data *= dinv[As.indices]; As.data *= dinv[rows]` did, (a_ij * dinv_j) * dinv_i, so
+///     former `As.data *= scaling[As.indices]; As.data *= scaling[rows]` did, (a_ij * s_j) * s_i, s = scaling, so
 ///     the operator is bitwise the former one;
 ///   * the coupling blocks As[field i, field j], i != j, rectangular, with field-local column
 ///     indices: couplingMatvec();
@@ -502,19 +502,19 @@ public:
   /// previous system intact.
   /// @param n, ptr, col, val A, square CSR in canonical form: sorted columns, no duplicates -- the diagonal
   /// blocks inherit its column order, and AMGCL's block backends require it sorted.
-  /// @param dinv the equilibration, D = diag(dinv).
+  /// @param scaling the equilibration, D = diag(scaling).
   /// @param nFields, fieldBounds the fields' DOF ranges, [fieldBounds[2k], fieldBounds[2k+1]),
   /// disjoint.
   void build( int           n,
               const int*    ptr,
               const int*    col,
               const double* val,
-              const double* dinv,
+              const double* scaling,
               int           nFields,
               const int*    fieldBounds )
   {
     EquilibratedSystemT assembled;
-    assembled.assemble( n, ptr, col, val, dinv, nFields, fieldBounds );
+    assembled.assemble( n, ptr, col, val, scaling, nFields, fieldBounds );
     *this = std::move( assembled );
   }
 
@@ -523,7 +523,7 @@ public:
                  const int*    ptr,
                  const int*    col,
                  const double* val,
-                 const double* dinv,
+                 const double* scaling,
                  int           nFields,
                  const int*    fieldBounds )
   {
@@ -578,7 +578,7 @@ public:
       for ( int j = ptr[i]; j < ptr[i + 1]; ++j ) {
         if ( val[j] != 0.0 ) {
           operator_->col[head]   = col[j];
-          operator_->val[head++] = ( val[j] * dinv[col[j]] ) * dinv[i];
+          operator_->val[head++] = ( val[j] * scaling[col[j]] ) * scaling[i];
         }
       }
     }
@@ -709,6 +709,27 @@ public:
     auto xRange   = amgcl::make_iterator_range( x, x + n_ );
     auto rRange   = amgcl::make_iterator_range( r, r + n_ );
     amgcl::backend::residual( rhsRange, *operator_, xRange, rRange );
+  }
+
+  /// @brief y (field f) <- As[field f, field f] x (field f), read straight from the operator's rows
+  /// (the diagonal blocks are only materialized for a hierarchy rebuild). Only the block Gauss-Seidel
+  /// sweep's revisits of a field need it -- sweeps > 1 or symmetric.
+  void diagonalBlockMatvec( int f, const double* x, double* y ) const
+  {
+    checkField( f );
+    const int       start = fieldStart_[f];
+    const ptrdiff_t nRows = fieldStop_[f] - fieldStart_[f];
+#pragma omp parallel for
+    for ( ptrdiff_t local = 0; local < nRows; ++local ) {
+      const ptrdiff_t i   = start + local;
+      double          sum = 0.0;
+      for ( int j = operator_->ptr[i]; j < operator_->ptr[i + 1]; ++j ) {
+        const int c = operator_->col[j];
+        if ( fieldOfDof_[c] == f )
+          sum += operator_->val[j] * x[c - start];
+      }
+      y[local] = sum;
+    }
   }
 
   /// @brief y (field f) <- As[field f, field g] x (field g), f != g
@@ -853,8 +874,9 @@ public:
 // whatever Cython-side state the callback needs (the calling PyAMGCLLGMRESSolver instance, in
 // practice) -- this header never interprets it as anything other than a pass-through argument. `n` is
 // duplicated here (also known to the caller) purely so the callback does not need to reach back into
-// any C++-side state to learn it.
-typedef void ( *PyPrecondApplyFn )( void* ctx, int n, const double* rhs, double* x );
+// any C++-side state to learn it. It returns 0 on success and anything else if it failed (a Python
+// exception, which the caller keeps and re-raises).
+typedef int ( *PyPrecondApplyFn )( void* ctx, int n, const double* rhs, double* x );
 
 // Adapts a PyPrecondApplyFn callback to amgcl::solver::lgmres's Precond interface: a single const
 // apply(rhs, x) method (see amgcl/solver/precond_side.hpp's spmv() -- with the default
@@ -872,9 +894,13 @@ class PyLGMRESPrecondT {
 public:
   PyLGMRESPrecondT( PyPrecondApplyFn applyFn, void* ctx, int n ) : applyFn_( applyFn ), ctx_( ctx ), n_( n ) {}
 
+  /// @brief x <- M^-1 rhs through the callback.
+  /// @throw std::runtime_error if the callback failed: the exception unwinds lgmres at once, instead of
+  /// letting it run to maxiter on a meaningless x.
   void apply( const amgcl::backend::builtin< double >::vector& rhs, amgcl::backend::builtin< double >::vector& x ) const
   {
-    applyFn_( ctx_, n_, rhs.data(), x.data() );
+    if ( applyFn_( ctx_, n_, rhs.data(), x.data() ) != 0 )
+      throw std::runtime_error( "LGMRESOuterSolverT: the preconditioner callback failed" );
   }
 
 private:
@@ -883,46 +909,22 @@ private:
   int              n_;
 };
 
-// Wraps amgcl::solver::lgmres<builtin<double>> as blockamg.py's outer Krylov solve, in place of
-// scipy.sparse.linalg.gmres, at both of that path's call sites (the main solve and the true-residual
-// continuation retry -- see blockamg.py's __call__).
-//
-// One instance is meant to be constructed once per BlockAMGSolver and reused for that solver's entire
-// lifetime, not rebuilt per solve like the per-field AMG hierarchies (see blockamg.py's own
-// mustRefresh bookkeeping for those). This persistence is independent of `always_reset`: it is what
-// lets tol/maxiter be mutated per call onto the same underlying object (see below) without paying
-// construction cost every solve, and it is what `always_reset=false` would use *if* enabled -- but an
-// attribution ablation found cross-call
-// recycling (`outer_v` surviving across separate operator() calls, AMGCL's own doc comment on `K`
-// naming "solving multiple similar problems" as the intended use) contributes nothing measurable on
-// 9 representative systems and, on a live pryout trajectory, actively compounds a struggling solve's
-// poorly-conditioned subspace into a much more expensive (and once, NaN) subsequent one. `blockamg.py`
-// now defaults `always_reset=True` (AMGCL's own upstream default) accordingly -- this class still
-// earns its keep over plain scipy GMRES from threading and lgmres's own intra-call restart-cycle
-// augmentation alone (independent of `always_reset`, see the ablation), not from cross-call memory.
-//
-// The system matrix itself is *not* cached across calls the way the AMG hierarchies are -- every
-// solve() call iterates on the EquilibratedSystemT it is given, built fresh for that solve (the
-// pattern churns every solve regardless on a model with contact/tie constraints, so there is
-// nothing to amortize). lgmres's
-// own header comment explicitly names this usage pattern too: "The system matrix may differ from the
-// matrix used during initialization[...] used for the solution of non-stationary problems with
-// slowly changing coefficients."
-//
-// tol/maxiter are *not* baked into the params this instance was constructed with -- they are set on
-// every solve() call by mutating the underlying amgcl::solver::lgmres object's own public `prm`
-// member directly (see solve() below). This is what lets a single persistent instance still honour a
-// different Eisenstat--Walker forcing tolerance and true-residual-continuation tolerance on every
-// call (blockamg.py's `eta`/`continuationEta`) without reconstructing the object and losing the
-// recycled Krylov vectors `always_reset=false` exists to keep -- rebuild-per-call and reuse-across-
-// calls are mutually exclusive if tol/maxiter could only be set at construction, so mutating `prm` in
-// place is what reconciles them.
-//
-// The problem size n is fixed at construction (lgmres preallocates every scratch vector -- Arnoldi
-// basis, augmentation vectors -- for a fixed n in its own constructor); a field-structure or dof-count
-// change (AMR, a new increment with a resized system) needs a fresh instance. blockamg.py's Python
-// side already tracks exactly this condition for the AMG hierarchies (mustRefresh's `n != self._n`)
-// and reuses that same signal to decide when to rebuild this object too.
+/// Wraps amgcl::solver::lgmres<builtin<double>> as blockamg.py's outer Krylov solve, in place of
+/// scipy.sparse.linalg.gmres, at both of that path's call sites (the main solve and the true-residual
+/// continuation retry -- see blockamg.py's __call__).
+///
+/// One instance lives as long as the system size does: lgmres preallocates every scratch vector
+/// (Arnoldi basis, augmentation vectors) for a fixed n in its own constructor, so a size change (AMR)
+/// needs a fresh instance, and blockamg.py rebuilds it then -- and when its own settings change. Every
+/// call starts from an empty augmentation subspace (lgmres's always_reset, forced here): carrying the
+/// augmentation vectors across calls ("recycling") was measured to buy nothing on 9 representative
+/// systems and, on a live trajectory, to compound a struggling solve's subspace into much more
+/// expensive and once NaN subsequent ones, so it is not offered. The intra-call restart-cycle
+/// augmentation (K) is unaffected.
+///
+/// tol/maxiter are set on every call on the solver's own public prm member -- blockamg's forcing and
+/// continuation tolerances change per call -- and every call iterates on the EquilibratedSystemT it is
+/// given, built fresh for that solve.
 class LGMRESOuterSolverT {
 public:
   typedef amgcl::backend::builtin< double > Backend;
@@ -931,34 +933,24 @@ public:
   std::unique_ptr< Solver > solver_;
   int                       n_;
 
-  // Constructed once for a fixed problem size n. json_params is lgmres::params' own sub-tree, e.g.
-  // {"M": 30, "K": 3, "always_reset": true} -- forwarded 1:1 to amgcl::solver::lgmres::params'
-  // ptree constructor with no translation layer, matching every field name AMGCL itself uses (M, K,
-  // always_reset, pside, maxiter, tol, abstol, ns_search, verbose). tol/maxiter passed here only set
-  // the *initial* defaults; solve() overrides both on every call (see the class comment above) --
-  // included anyway so a caller that never overrides them still gets sane, explicit values rather
-  // than silently depending on AMGCL's own defaults.
+  /// @brief Construct for a fixed problem size n.
+  /// @param json_params lgmres::params' own sub-tree, e.g. {"M": 30, "K": 3}, forwarded verbatim;
+  /// always_reset is forced to true (see the class comment).
   LGMRESOuterSolverT( int n, const char* json_params ) : n_( n )
   {
-    boost::property_tree::ptree prm;
-    std::string                 json_str( json_params );
-    if ( !json_str.empty() ) {
-      std::stringstream ss( json_str );
-      boost::property_tree::read_json( ss, prm );
-    }
+    boost::property_tree::ptree prm = parseJsonParameters( json_params );
+    prm.put( "always_reset", true );
+    // right preconditioning, whatever the caller's tree says: lgmres's own convergence test is then on the
+    // residual of the operator it iterates on, which blockamg relies on (see its cap-hit and true-residual
+    // logic); left preconditioning would test the preconditioned residual instead
+    prm.put( "pside", "right" );
     Solver::params p( prm );
     solver_.reset( new Solver( static_cast< size_t >( n ), p ) );
   }
 
-  // x <- A^-1 rhs, right-preconditioned by the callback (applyFn/ctx), continuing this instance's own
-  // recycled/augmented Krylov vectors from any previous solve() call unless always_reset was
-  // requested at construction. x provides the initial guess on input (matching amgcl::solver::
-  // lgmres::operator()'s own x0-in/solution-out contract -- callers doing a warm-started continuation
-  // retry, as blockamg.py's true-residual continuation loop does, must pre-fill x themselves) and
-  // holds the solution on output. tol/maxiter are applied to this call (and every subsequent one,
-  // until next changed) by mutating the underlying solver's own public `prm` member in place -- see
-  // the class comment above for why this, rather than reconstructing the object, is required to keep
-  // both per-call tolerances and cross-call Krylov-vector recycling at the same time.
+  /// @brief x <- A^-1 rhs, right-preconditioned by the callback (applyFn/ctx). x holds the initial
+  /// guess on input (blockamg's warm-started continuation retry pre-fills it) and the solution on
+  /// output; iters/error return lgmres's iteration count and its own scaled relative residual.
   void solve( const EquilibratedSystemT& system,
               const double*              rhs,
               double*                    x,
@@ -967,50 +959,17 @@ public:
               PyPrecondApplyFn           applyFn,
               void*                      ctx,
               int&                       iters,
-              double&                    error,
-              bool                       resetOnce = false )
+              double&                    error )
   {
     system.checkBuilt();
     const int n = system.n_;
     if ( n != n_ ) {
       throw std::runtime_error( "LGMRESOuterSolverT::solve(): n=" + std::to_string( n ) + " does not match the size " +
-                                std::to_string( n_ ) +
-                                " this instance was constructed for -- construct a fresh instance on "
-                                "any field-structure/size change (blockamg.py's own mustRefresh "
-                                "condition already detects this for the AMG hierarchies; the same "
-                                "signal is reused here)." );
+                                std::to_string( n_ ) + " this instance was constructed for." );
     }
 
     solver_->prm.tol     = tol;
     solver_->prm.maxiter = static_cast< size_t >( maxiter );
-
-    // A caller-requested one-shot reset
-    // of the recycled/augmented Krylov vectors (`outer_v`), without discarding the persistent solver_
-    // object or reconstructing it. AMGCL's own operator() clears outer_v itself, unconditionally,
-    // whenever prm.always_reset is true (verified directly in lgmres.hpp: the very first statement in
-    // operator()) -- so flipping it true for exactly this one call and restoring it immediately after
-    // reuses that already-correct mechanism instead of reaching into outer_v/outer_v_data directly.
-    // blockamg.py wires this to its own `newIncrement` signal: reset across increment/cutback
-    // boundaries (where a stale recycled subspace is hypothesized to cost pure overhead), keep
-    // recycling within an increment's own Newton sequence (AMGCL's own
-    // intended use for K, and where every other ord showed recycling helping, not hurting).
-    // RAII, not a plain save/mutate/restore: `(*solver_)(...)` below can throw (AMGCL internals,
-    // e.g. an allocation failure -- not a Python exception from the preconditioner callback, which
-    // never becomes a C++ exception here, see PyLGMRESPrecondT/the trampoline). A bare save-then-
-    // restore-at-the-end would leave `always_reset` permanently flipped on the persistent, reused
-    // `solver_` object if that call threw, silently changing every subsequent solve()'s recycling
-    // behaviour. This guard restores unconditionally, on every exit path.
-    struct AlwaysResetGuard {
-      Solver::params& prm_;
-      bool            saved_;
-      AlwaysResetGuard( Solver::params& prm, bool resetOnce ) : prm_( prm ), saved_( prm.always_reset )
-      {
-        if ( resetOnce ) {
-          prm_.always_reset = true;
-        }
-      }
-      ~AlwaysResetGuard() { prm_.always_reset = saved_; }
-    } alwaysResetGuard( solver_->prm, resetOnce );
 
     PyLGMRESPrecondT precond( applyFn, ctx, n );
 
@@ -1111,15 +1070,23 @@ inline void ptwogridFineResidual( const amgcl::backend::crs< MatrixValueType, in
 template < typename ValueType, typename MatrixValueType = ValueType >
 class PTwoGridFineLevelT : public PTwoGridFineSmoother {
 public:
-  typedef amgcl::backend::crs< MatrixValueType, int, int >   Matrix;
-  typedef typename amgcl::math::rhs_of< ValueType >::type    RhsType;
+  /// @brief The fine operator's storage: CSR with 32-bit indices and MatrixValueType entries.
+  typedef amgcl::backend::crs< MatrixValueType, int, int > Matrix;
+  /// @brief The vector entry type matching ValueType (double, or a double 3-vector).
+  typedef typename amgcl::math::rhs_of< ValueType >::type RhsType;
+  /// @brief The scalar type of ValueType (double).
   typedef typename amgcl::math::scalar_of< ValueType >::type ScalarType;
-  static const int                                           BlockSize = amgcl::math::static_rows< ValueType >::value;
+  /// @brief Scalar rows per stored row: 1 for scalar entries, B for BxB blocks.
+  static const int BlockSize = amgcl::math::static_rows< ValueType >::value;
 
+  /// @brief The fine operator the smoother and the residual act on.
   std::shared_ptr< Matrix > A_;
-  std::vector< double >     r_, p_;
-  unsigned                  degree_ = 0;
-  double                    d_ = 0.0, c_ = 0.0;
+  /// @brief Work vectors of the Chebyshev iteration (residual r and search direction p), one entry per scalar row.
+  std::vector< double > r_, p_;
+  /// @brief Chebyshev polynomial degree, i.e. matrix products per smoothing sweep.
+  unsigned degree_ = 0;
+  /// @brief Centre d and half-width c of the Chebyshev interval [d - c, d + c] (setPolynomial()).
+  double d_ = 0.0, c_ = 0.0;
 
   /// @brief Take over the operator A (already in this storage format).
   void setOperator( std::shared_ptr< Matrix > A )

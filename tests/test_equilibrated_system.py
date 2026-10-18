@@ -139,3 +139,40 @@ def test_a_vector_of_the_wrong_length_raises(system):
         equilibrated.matvec(np.zeros(A.shape[0] + 1))
     with pytest.raises(ValueError, match="length"):
         equilibrated.residual(np.zeros(A.shape[0]), np.zeros(A.shape[0] - 3))
+
+
+def test_a_failing_preconditioner_is_called_once_and_its_exception_raised(system):
+    from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLLGMRESSolver
+
+    A, As, dinv, equilibrated = system
+    calls = []
+
+    def failing(r):
+        calls.append(1)
+        raise RuntimeError("preconditioner failed")
+
+    solver = PyAMGCLLGMRESSolver(A.shape[0], {"M": 10, "K": 2})
+    with pytest.raises(RuntimeError, match="preconditioner failed"):
+        solver.solve(equilibrated, np.ones(A.shape[0]), failing, 1e-10, 50)
+    assert len(calls) == 1
+
+    # the failure ended the AMGCL call at once; the instance solves again
+    x = solver.solve(equilibrated, np.ones(A.shape[0]), lambda r: r, 1e-8, 400)
+    assert np.isfinite(x).all() and 0 < solver.lastIterations
+
+
+def test_a_diagonal_block_product_is_the_scipy_one_bit_for_bit(system):
+    A, As, dinv, equilibrated = system
+    x = np.random.default_rng(6).standard_normal(A.shape[0])
+    for field, (start, stop) in enumerate(_FIELDS):
+        block = As[start:stop, start:stop]
+        assert np.array_equal(equilibrated.diagonalBlockMatvec(field, x[start:stop]), block @ x[start:stop])
+
+
+def test_the_outer_solver_rejects_a_right_hand_side_of_the_wrong_length(system):
+    from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLLGMRESSolver
+
+    A, As, dinv, equilibrated = system
+    solver = PyAMGCLLGMRESSolver(A.shape[0], {"M": 10})
+    with pytest.raises(ValueError, match="length"):
+        solver.solve(equilibrated, np.ones(A.shape[0] - 1), lambda r: r, 1e-8, 20)

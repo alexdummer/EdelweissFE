@@ -26,8 +26,10 @@ may be able to end the run. The malformed-config cases below are the reason this
 import inspect
 import json
 
+import numpy as np
 import pytest
 
+from edelweissfe.linsolve.base import FieldBlock
 from edelweissfe.linsolve.blockamg.blockamg import BlockAMGSolver
 
 
@@ -214,7 +216,7 @@ def test_every_constructor_setting_is_reloadable_or_explicitly_ignored(configure
         name
         for name in settingNames
         if name not in BlockAMGSolver._HOT_RELOAD_IGNORED
-        and not hasattr(solver, BlockAMGSolver._HOT_RELOAD_ALIASES.get(name, "_" + name))
+        and BlockAMGSolver._HOT_RELOAD_ALIASES.get(name, "_" + name) not in vars(solver)
     ]
 
     assert unclassified == []
@@ -250,3 +252,141 @@ def test_the_factory_defaults_the_hot_reload_path_to_off():
 
     assert solver._hotReloadConfigFile is None
     assert solver._maybeHotReloadConfig() is False
+
+
+def test_reloaded_lgmres_settings_rebuild_the_outer_solver(configuredSolver):
+    solver, configPath = configuredSolver
+    _reload(solver)
+    solver._lgmresSolver = "standing"
+
+    _write(configPath, {"lgmresM": 50, "hotReloadConfigFile": str(configPath)})
+
+    assert _reload(solver) is True
+    assert solver._lgmresM == 50
+    assert solver._lgmresSolver is None
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    [
+        ("outerSolver", "amgcl-lgmres"),
+        ("outerSolver", "scipy"),
+        ("lgmresM", 0),
+        ("p1FineBlockSize", 2),
+        ("p1FineValueType", "half"),
+        ("p1FineDegree", 0),
+        ("p1CoarsePrecond", 3),
+        ("fieldPreconds", {"displacement": 3}),
+        ("fieldPreconds", {"displacement": {"backendBlockSize": 2, "backendPrecision": "float"}}),
+        ("lgmresAlwaysReset", False),
+    ],
+)
+def test_a_value_the_run_could_not_use_is_rejected(configuredSolver, name, value):
+    solver, configPath = configuredSolver
+    _reload(solver)
+    before = dict(vars(solver))
+
+    _write(configPath, {name: value, "hotReloadConfigFile": str(configPath)})
+
+    assert _reload(solver) is False
+    assert solver._refreshNext is False
+    assert solver._outerSolver == before["_outerSolver"]
+    assert solver._lgmresM == before["_lgmresM"]
+
+
+def test_a_reloaded_dump_directory_is_created_and_the_context_window_resized(configuredSolver, tmp_path):
+    solver, configPath = configuredSolver
+    _reload(solver)
+    dumpDir = tmp_path / "dumps"
+
+    _write(
+        configPath,
+        {
+            "dumpOnDegradationDir": str(dumpDir),
+            "dumpOnDegradationContextSolves": 4,
+            "hotReloadConfigFile": str(configPath),
+        },
+    )
+
+    assert _reload(solver) is True
+    assert dumpDir.is_dir()
+    assert solver._recentSolveHistory.maxlen == 4
+
+
+def _withFields(solver):
+    """The solver after a solve on a 3D displacement and a scalar nonlocal damage field."""
+    solver._blocks = [
+        FieldBlock("displacement", 0, 30, 3),
+        FieldBlock("nonlocal damage", 30, 40, 1),
+    ]
+    return solver
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"fieldPreconds": {"nonlocal damage": {"backendBlockSize": 3}}},
+        {"p1FieldNames": ["nonlocal damage"], "p1FineBlockSize": 3},
+    ],
+    ids=["block size", "p1 block size"],
+)
+def test_a_block_size_that_does_not_match_the_field_is_rejected(configuredSolver, options):
+    solver, configPath = configuredSolver
+    _reload(_withFields(solver))
+
+    # p1FieldNames and p1FineBlockSize in one edit: each fits the settings in force, only together they do not
+    _write(configPath, {**options, "hotReloadConfigFile": str(configPath)})
+
+    assert _reload(solver) is False
+    assert solver._fieldPreconds == {}
+    assert solver._p1FieldNamesRequested == set()
+
+
+def test_a_field_precond_for_a_field_the_system_lacks_is_accepted(configuredSolver):
+    solver, configPath = configuredSolver
+    _reload(_withFields(solver))
+    fieldPreconds = {"temperature": {"backendBlockSize": 1}, "displacement": {"backendBlockSize": 3}}
+
+    _write(configPath, {"fieldPreconds": fieldPreconds, "hotReloadConfigFile": str(configPath)})
+
+    assert _reload(solver) is True
+    assert solver._fieldPreconds == fieldPreconds
+
+
+@pytest.mark.parametrize(
+    "alongside",
+    [{}, {"lgmresM": 40}, {"outerMaxiter": 5}],
+    ids=["alone", "with lgmresM", "with outerMaxiter"],
+)
+def test_settings_the_build_fails_with_are_rolled_back(configuredSolver, alongside):
+    from _blockamgsystems import displacementDamageSystem
+
+    solver, configPath = configuredSolver
+    # large enough for a multi-level hierarchy: a block AMGCL solves directly never constructs its smoother
+    A, b, blocks = displacementDamageSystem(12)
+    solver.setFieldStructure(blocks)
+    messages = []
+    solver._log = lambda level, message: messages.append(message)
+    solver(A, b)
+
+    # valid as far as the checks see, but AMGCL knows no smoother of that name
+    badTree = {"displacement": {"relax": {"type": "chebychev"}}}
+    _write(configPath, {"fieldPreconds": badTree, **alongside, "hotReloadConfigFile": str(configPath)})
+    x = solver(A, b)
+
+    assert np.linalg.norm(b - A @ x) <= 1e-2 * np.linalg.norm(b)
+    assert solver._fieldPreconds == {} and solver._lgmresM == 30 and solver._outerSolver == "amgcl_lgmres"
+    assert any("ROLLED BACK" in message for message in messages)
+    # the file is recorded as seen: the next solve does not try it again
+    messages.clear()
+    solver(A, b)
+    assert not any("hot reload" in message for message in messages)
+
+
+def test_a_null_dump_threshold_reloaded_means_the_warning_threshold(tmp_path):
+    configPath = tmp_path / "blockamg.json"
+    options = {"dumpOnDegradationDir": str(tmp_path / "dumps"), "dumpOnDegradationThreshold": None}
+    _write(configPath, {**options, "hotReloadConfigFile": str(configPath)})
+    solver = BlockAMGSolver(**options, hotReloadConfigFile=str(configPath))
+    _reload(solver)
+    assert solver._degradationThreshold() == solver._warnOuterIterationsThreshold

@@ -97,7 +97,8 @@ _DEFAULT_COARSE_PRECOND = {
     "npre": 2,
     "npost": 2,
 }
-#: R2's winning fine-smoother configuration: nu=1 sweeps, Chebyshev degree 5.
+#: The fine smoother's defaults, the best of a sweep over sweep counts and degrees on a coupled system: one sweep
+#: of a degree-5 Chebyshev polynomial.
 _DEFAULT_NU = 1
 _DEFAULT_FINE_DEGREE = 5
 #: The fine Chebyshev smoother's spectral bounds and power iteration: ``higher`` = 1.1 is a safety
@@ -245,7 +246,7 @@ class PTwoGridPreconditioner:
         ``fineSpectralRadius`` parameter."""
         return self._preconditioner.fineSpectralRadiusSource
 
-    def build(self, A, dinv: np.ndarray, coords: np.ndarray = None) -> None:
+    def build(self, A, scaling: np.ndarray, coords: np.ndarray = None) -> None:
         """Build the restricted ``P``, the Galerkin coarse operator, its AMGCL hierarchy, and the fine
         Chebyshev smoother -- everything :meth:`applyPreconditioner` needs, all in C++.
 
@@ -254,8 +255,8 @@ class PTwoGridPreconditioner:
         A
             This field's equilibrated diagonal block (``As[slice, slice]``, scipy CSR), still carrying
             its Dirichlet identity rows.
-        dinv
-            This field's own slice of the global equilibration vector (``dinv[block.start:block.stop]``),
+        scaling
+            This field's own slice of the global equilibration vector (``scaling[block.start:block.stop]``),
             needed to scale the coarse near-null-space consistently with ``A``'s own scaling
             (:func:`~edelweissfe.linsolve.nullspace.translationNullspace`'s convention).
         coords
@@ -289,7 +290,7 @@ class PTwoGridPreconditioner:
                 fullDofRowsForCorners = np.repeat(cornerNodeRows, nDim) * nDim + np.tile(np.arange(nDim), nCorners)
                 freeCoarseCols = np.nonzero(~isDirichlet[fullDofRowsForCorners])[0]
                 coarseBlock = FieldBlock("coarse", 0, nCorners * nDim, nDim)
-                cornerScaling = dinv[fullDofRowsForCorners]
+                cornerScaling = scaling[fullDofRowsForCorners]
                 if coords is not None:
                     cornerCoords = np.asarray(coords, dtype=float)[cornerNodeRows]
                     fullNullspace = rigidBodyNullspace(coarseBlock, cornerCoords, cornerScaling)
@@ -322,3 +323,14 @@ class PTwoGridPreconditioner:
     def report(self) -> str:
         """The coarse level's AMGCL hierarchy report (context/diagnostics only, not a convergence gate)."""
         return self._preconditioner.report()
+
+
+def parameterRejection(**parameters) -> "str | None":
+    """Why these p-two-grid settings -- :class:`PTwoGridPreconditioner` keywords -- cannot be used, or ``None``.
+    The C++ class validates them in its constructor, the one place they are checked; this asks it, without a
+    topology map."""
+    try:
+        PTwoGridPreconditioner(np.zeros(0, dtype=bool), np.zeros((0, 2), dtype=int), **parameters)
+    except (TypeError, ValueError) as error:
+        return str(error)
+    return None

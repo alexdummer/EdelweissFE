@@ -260,7 +260,7 @@ cdef class PyAMGCLSolver:
 
 
 cdef class PyAMGCLEquilibratedSystem:
-    """blockamg's equilibrated, field-split system ``As = D A D`` (``D = diag(dinv)``), built in one
+    """blockamg's equilibrated, field-split system ``As = D A D`` (``D = diag(scaling)``), built in one
     OpenMP-threaded pass over ``A``: the outer Krylov operator (:meth:`matvec`, :meth:`residual`, and
     the operator :meth:`PyAMGCLLGMRESSolver.solve` iterates on), the coupling blocks between fields
     (:meth:`couplingMatvec`) and, on demand, a field's diagonal block (:meth:`diagonalBlock`).
@@ -292,21 +292,21 @@ cdef class PyAMGCLEquilibratedSystem:
                                             _doubleData(out))
         return out
 
-    def build(self, object A, object dinv, object fieldBounds):
+    def build(self, object A, object scaling, object fieldBounds):
         """
-        A: scipy.sparse csr_matrix (square); dinv: the equilibration, length n; fieldBounds: a
+        A: scipy.sparse csr_matrix (square); scaling: the equilibration, length n; fieldBounds: a
         sequence of ``(start, stop)`` DOF ranges, one per field, disjoint.
         """
         if A.shape[0] != A.shape[1]:
             raise ValueError("A must be square, got shape {:}".format(A.shape))
         A, indptr, indices, data = _csrArrays(A)
         cdef int n = A.shape[0]
-        dinvArray = _vector(dinv, n, "dinv")
+        scalingArray = _vector(scaling, n, "scaling")
         bounds = np.ascontiguousarray(np.asarray(fieldBounds, dtype=np.int32).reshape(-1))
         if bounds.shape[0] % 2:
             raise ValueError("fieldBounds must be (start, stop) pairs, got {:} numbers".format(bounds.shape[0]))
-        self.system.build(n, _intData(indptr), _intData(indices), _constDoubleData(data), _constDoubleData(dinvArray),
-                          bounds.shape[0] // 2, _intData(bounds))
+        self.system.build(n, _intData(indptr), _intData(indices), _constDoubleData(data),
+                          _constDoubleData(scalingArray), bounds.shape[0] // 2, _intData(bounds))
         self.n = n
 
     def diagonalBlock(self, int field):
@@ -336,6 +336,19 @@ cdef class PyAMGCLEquilibratedSystem:
         self.system.residual(_constDoubleData(rhsArray), _constDoubleData(xArray), _doubleData(r))
         return r
 
+    def diagonalBlockMatvec(self, int field, object x):
+        """Returns ``As[field, field] @ x`` as a new float64 array of this field's size."""
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x_arr = np.ascontiguousarray(x, dtype=np.float64)
+        if x_arr.shape[0] != self.system.diagonalBlockSize(field):
+            raise ValueError("x has the wrong length for field {:}".format(field))
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] y = np.empty(x_arr.shape[0], dtype=np.float64)
+        if x_arr.shape[0] == 0:
+            return y
+        cdef double[::1] x_ = x_arr
+        cdef double[::1] y_ = y
+        self.system.diagonalBlockMatvec(field, &x_[0], &y_[0])
+        return y
+
     def couplingMatvec(self, int field, int otherField, object x):
         """Returns ``As[field, otherField] @ x`` (``x`` of the other field's size) as a new float64
         array of this field's size."""
@@ -354,7 +367,7 @@ cdef class PyAMGCLEquilibratedSystem:
         return y
 
 
-cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
+cdef int _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, double* x) noexcept:
     """The C-callable trampoline bridging amgcl::solver::lgmres's per-``apply()`` Precond callback
     back into Python -- passed to :class:`LGMRESOuterSolver` as a bare function pointer (see
     ``amgcl-wrapper.hpp``'s ``PyPrecondApplyFn``/``PyLGMRESPrecondT``).
@@ -376,22 +389,24 @@ cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, dou
     codebase's actual threading model does not use.
 
     A Python exception raised by the preconditioner callable cannot propagate through this C
-    function-pointer boundary (there is no C++ exception handler on the AMGCL side expecting one), so
-    it is caught here and stashed on the calling instance instead; :meth:`PyAMGCLLGMRESSolver.solve`
-    re-raises it once the (now-abandoned) AMGCL call returns. ``x`` is zeroed on that path so the
-    (about-to-be-discarded) AMGCL iteration continues on defined, if meaningless, numbers rather than
-    whatever uninitialized/stale data happened to be there.
+    function-pointer boundary, so it is caught here and stashed on the calling instance instead, and the
+    function returns 1 (0 on success). The C++ side then throws, which ends AMGCL's lgmres at once, and
+    :meth:`PyAMGCLLGMRESSolver.solve` re-raises the stashed exception in place of the C++ one.
     """
     cdef PyAMGCLLGMRESSolver self = <PyAMGCLLGMRESSolver> ctx
     cdef Py_ssize_t i
     # rhs arrives as a `const double*` (it is AMGCL's own internal Arnoldi-vector storage, never meant
     # to be written through) -- copied element-by-element into a fresh, ordinary (non-const) numpy
     # array rather than wrapped in a zero-copy memoryview, which would need casting away the pointer's
-    # constness. n is at most the outer Krylov restart length, so this copy is not the cost driver
-    # here -- the Python-level preconditioner call below is.
-    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr = np.empty(n, dtype=np.float64)
+    # constness. n is the system size, so this is one pass over a vector per preconditioner
+    # application -- small against the application itself (a block Gauss-Seidel sweep of AMG cycles),
+    # which reads every matrix entry at least once.
+    cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr
     cdef double[::1] xView
     try:
+        # inside the try: a MemoryError here must be stashed and re-raised like any other failure, not
+        # swallowed by this noexcept function, which would leave x stale and the solve "successful"
+        rhsArr = np.empty(n, dtype=np.float64)
         for i in range(n):
             rhsArr[i] = rhs[i]
         result = self._precondCallable(rhsArr)
@@ -405,8 +420,8 @@ cdef void _lgmresPrecondApplyTrampoline(void* ctx, int n, const double* rhs, dou
             x[i] = xView[i]
     except BaseException as exc:
         self._pendingException = exc
-        for i in range(n):
-            x[i] = 0.0
+        return 1
+    return 0
 
 
 cdef class PyAMGCLLGMRESSolver:
@@ -420,18 +435,10 @@ cdef class PyAMGCLLGMRESSolver:
     PTwoGridPreconditioner` objects) to AMGCL's native ``Precond`` interface via
     :func:`_lgmresPrecondApplyTrampoline`, called once per Arnoldi vector.
 
-    One instance should be constructed once per ``BlockAMGSolver`` and reused for that solver's entire
-    lifetime (see ``blockamg.py``'s construction site), not rebuilt per solve -- this lets tol/maxiter
-    be mutated per call onto the same object without paying construction cost every solve (see
-    :meth:`solve`), independent of ``always_reset``. ``always_reset: false`` would additionally let
-    AMGCL's own recycled/augmented Krylov vectors survive *across* separate :meth:`solve` calls, but
-    an attribution ablation and a live gate found that recycling contributes nothing measurable and
-    can actively compound a struggling solve's poorly-conditioned
-    subspace into a much more expensive (or NaN) subsequent one -- ``blockamg.py`` now defaults
-    ``always_reset=True`` accordingly; this class still earns its keep over plain scipy GMRES from
-    threading and lgmres's own intra-call restart-cycle augmentation alone. The problem size ``n`` is
-    fixed at construction (AMGCL preallocates every scratch vector for it); a field-structure/dof-count
-    change needs a fresh instance.
+    One instance per system size (AMGCL preallocates every scratch vector for it), reused across solves
+    with per-call tolerances. Every call starts from an empty augmentation subspace (``always_reset`` is
+    forced): carrying the augmentation vectors across calls was measured to buy nothing and to turn a
+    struggling solve's subspace into much more expensive or NaN subsequent ones, so it is not offered.
     """
     cdef LGMRESOuterSolver* solver
     cdef readonly int n
@@ -439,8 +446,9 @@ cdef class PyAMGCLLGMRESSolver:
     cdef readonly int lastIterations
     """The iteration count AMGCL's lgmres reported for the most recent solve, -1 before the first."""
     cdef readonly double lastError
-    """The relative (preconditioned) residual AMGCL's lgmres reported for the most recent solve, NaN
-    before the first."""
+    """The relative residual ``||rhs - Op x|| / ||rhs||`` AMGCL's lgmres reached in the most recent solve,
+    recomputed at its exit, of the operator it iterated on: the equilibrated system, so not the true
+    residual. lgmres's own convergence test is this value below ``tol``. NaN before the first solve."""
     cdef object _precondCallable
     cdef object _pendingException
 
@@ -450,7 +458,8 @@ cdef class PyAMGCLLGMRESSolver:
             The fixed problem size this instance is built for.
         params
             AMGCL's own ``lgmres::params`` field names, forwarded verbatim as JSON (``M``, ``K``,
-            ``always_reset``, ``pside``, ``maxiter``, ``tol``, ``abstol``, ``ns_search``, ``verbose``)
+            ``maxiter``, ``tol``, ``abstol``, ``ns_search``, ``verbose``; ``always_reset`` is forced to true
+            and ``pside`` to right preconditioning)
             -- unlike :class:`PyAMGCLSolver`, there is no ``precond``/``solver`` nesting here, since
             this wraps a single ``amgcl::solver::lgmres`` object directly, not ``amgcl::make_solver``.
             ``maxiter``/``tol`` given here only set the *initial* defaults -- :meth:`solve` overrides
@@ -473,34 +482,25 @@ cdef class PyAMGCLLGMRESSolver:
             del self.solver
 
     def solve(self, PyAMGCLEquilibratedSystem system, object rhs, object applyPreconditioner, double tol,
-              int maxiter, object x0=None, bint resetOnce=False):
+              int maxiter, object x0=None):
         """
         system
-            This solve's equilibrated full coupled operator, built fresh for every solve (its pattern
-            churns every solve; only the recycled Krylov *vectors* persist across calls, never a
-            matrix).
+            This solve's equilibrated full coupled operator.
         rhs
             array-like, converted to 1D float64 (C-contiguous).
         applyPreconditioner
             A Python callable, ``residual (1D float64 array) -> correction (1D float64 array)`` --
             exactly :mod:`~edelweissfe.linsolve.blockamg.blockamg`'s ``blockGaussSeidel`` closure's own
-            shape. Called once per Arnoldi vector via :func:`_lgmresPrecondApplyTrampoline`; any
-            exception it raises is re-raised here once the (now-abandoned) AMGCL call returns.
+            shape. Called once per Arnoldi vector via :func:`_lgmresPrecondApplyTrampoline`; an
+            exception it raises ends the AMGCL call at once and is re-raised here.
         tol, maxiter
             This call's relative residual tolerance and maximum total Arnoldi iterations (across every
             internal restart -- AMGCL's own ``maxiter`` semantics differ from scipy's restart x maxiter,
-            see blockamg.py's call site). Mutates the underlying ``amgcl::solver::lgmres`` object's own
-            ``prm`` in place rather than reconstructing it, so the recycled Krylov vectors survive.
+            see blockamg.py's call site), set on the underlying ``amgcl::solver::lgmres`` object's own
+            ``prm`` for this call.
         x0
             Optional initial guess (warm start), e.g. blockamg.py's true-residual continuation retry.
             Defaults to zero.
-        resetOnce
-            Discard this instance's recycled/augmented Krylov vectors for this call only
-            (by temporarily flipping the underlying solver's ``prm.always_reset`` to true and restoring
-            it immediately after -- see ``amgcl-wrapper.hpp``'s ``LGMRESOuterSolverT::solve`` for why
-            this reuses AMGCL's own reset mechanism rather than touching ``outer_v`` directly), without
-            discarding this persistent instance itself. Default ``False`` -- recycling continues
-            uninterrupted unless a caller explicitly asks for a one-shot reset.
         """
         cdef int n = system.n
         if n != self.n:
@@ -510,13 +510,13 @@ cdef class PyAMGCLLGMRESSolver:
                 "change.".format(n, self.n)
             )
 
-        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = np.ascontiguousarray(rhs, dtype=np.float64)
+        cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhs_arr = _vector(rhs, n, "rhs")
 
         cdef np.ndarray[np.float64_t, ndim=1, mode="c"] x
         if x0 is None:
             x = np.zeros(n, dtype=np.float64)
         else:
-            x = np.ascontiguousarray(x0, dtype=np.float64).copy()
+            x = _vector(x0, n, "x0").copy()
 
         cdef double[::1] rhs_ = rhs_arr
         cdef double[::1] x_ = x
@@ -534,8 +534,12 @@ cdef class PyAMGCLLGMRESSolver:
         try:
             self.solver.solve(
                 system.system[0], &rhs_[0], &x_[0],
-                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error, resetOnce
+                tol, maxiter, _lgmresPrecondApplyTrampoline, ctx, iters, error
             )
+        except RuntimeError:
+            # the C++ side's report of a failed callback: raise the callback's own exception instead
+            if self._pendingException is None:
+                raise
         finally:
             self._precondCallable = None
 
