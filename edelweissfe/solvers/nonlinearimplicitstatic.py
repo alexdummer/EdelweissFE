@@ -48,6 +48,7 @@ from edelweissfe.solvers.base.convergencecriteria import (
     ConvergenceCriterionBase,
     LegacyConvergenceCriterion,
 )
+from edelweissfe.solvers.base.convergencetable import ConvergenceTable
 from edelweissfe.solvers.base.dirichlet import applyDirichletToStiffness
 from edelweissfe.solvers.base.nonlinearsolverbase import NonlinearSolverBase
 from edelweissfe.stepactions.base.stepactionbase import StepActionBase
@@ -347,6 +348,11 @@ class NIST(NonlinearSolverBase):
             the state the retry starts from.
         """
 
+        # The separator opens this increment's block here, before the topology update, so that what the
+        # update reports (refinement, contact status) heads the increment it belongs to instead of
+        # trailing the previous one.
+        self.journal.printSeperationLine()
+
         topologyUpdate = self.updateTopologyAndConnectivity(model, step, offerModelModifiers=not isRetry)
         self._modelHasChanged = topologyUpdate.topologyChanged
         self._connectivityHasChanged = (
@@ -384,12 +390,10 @@ class NIST(NonlinearSolverBase):
         connectivityHasChanged = self._connectivityHasChanged
         U, dU, P, K = self._U, self._dU, self._P, self._K
 
-        # One separator, marking the start of this increment's block. Everything about this
-        # increment -- an equation-system rebuild if one is needed, the MPC/Dirichlet
-        # diagnostics that come with it, the Newton table, all of it -- is printed after this
-        # single header, nested one level deeper (see the messages below), instead of being
-        # sandwiched between a second separator of its own.
-        self.journal.printSeperationLine()
+        # The header of this increment's block (opened by the separator in prepareIncrement). Everything
+        # about the solution -- an equation-system rebuild if one is needed, the MPC/Dirichlet
+        # diagnostics that come with it, the Newton table, all of it -- is printed after it, nested one
+        # level deeper (see the messages below).
         self.journal.message(
             "increment {:}: {:8f}, {:8f}; time {:10f} to {:10f}".format(
                 timeStep.number,
@@ -454,21 +458,7 @@ class NIST(NonlinearSolverBase):
                     "scalar variables",
                 ]
 
-            # Centers each label over its 12-wide value+marker cell (see checkConvergence's
-            # iterationMessageTemplate).
-            subHeaderCell = "{:^12}{:^12} "
-            self.iterationHeader = ("{:^25}" * len(presentVariableNames)).format(*presentVariableNames)
-            self.iterationHeader2 = subHeaderCell.format("||R||∞", "||ddU||∞") * len(presentVariableNames)
-
-            if self.linSolver.reportsSolveSummary:
-                # Extra column for the linear solver's diagnostics; checkConvergence appends
-                # the matching row cell. Gap capped at 1 space -- wider wraps the row past the
-                # Journal's 76-char limit for level-2 messages.
-                gap = " "
-                self.iterationHeader += gap + "{:^25}".format("linear solve")
-                self.iterationHeader2 += gap + subHeaderCell.format("iters", "‖r‖")
-
-            self.iterationMessageTemplate = "{:11.2e}{:1}{:11.2e}{:1} "
+            self.convergenceTable = ConvergenceTable(presentVariableNames, self.linSolver.reportsSolveSummary)
 
             K = self.theDofManager.constructVIJSystemMatrix()
             self.csrGenerator = CSRGenerator(K)
@@ -506,8 +496,7 @@ class NIST(NonlinearSolverBase):
             "notes": "",
         }
 
-        self.journal.message(self.iterationHeader, self.identification, level=2)
-        self.journal.message(self.iterationHeader2, self.identification, level=2)
+        self.journal.preformatted(self.convergenceTable.headerLines(), self.identification, level=2)
 
         if modelHasChanged and equilibrateAfterModelChange:
             # Settle the warm-started refined mesh to equilibrium at the LAST converged load
