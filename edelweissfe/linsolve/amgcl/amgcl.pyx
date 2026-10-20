@@ -127,8 +127,8 @@ cdef class PyAMGCLSolver:
         unsupported (AMGCL rejects it at construction, since the float-stored level matrices do not
         provide a row iterator) and block-ILU0/ILUk/ILUT/ILUP fall back to AMGCL's generic approximate
         triangular solve instead of the exact one plain ``builtin`` gets. Block size 2 with float raises.
-        :meth:`set_nullspace` always raises on a block backend -- AMGCL's own near-null-space path is
-        unimplemented for block value types.
+        On a block backend :meth:`set_nullspace` takes the B translations only (the rotations are carried by the
+        scalar backend), see there.
 
         Example params:
         {
@@ -187,8 +187,15 @@ cdef class PyAMGCLSolver:
         B: an (n, cols) array-like; column j is the j-th near null-space vector (float64). Copied into
         the C++ solver, so the array need not be kept alive. Must be called before the first solve().
         Passing an (n, 0) array clears any previously set null-space. Always double, regardless of
-        ``backendPrecision`` -- see the class docstring. Raises on a block backend (``blockSize > 1``)
-        -- AMGCL's own near-null-space path is unimplemented for block value types.
+        ``backendPrecision`` -- see the class docstring.
+
+        A block backend (``blockSize > 1``) takes the B translations only: an (n, B) array with one diagonal
+        B x B block of positive weights per node, e.g. the translations ``D^-1 t`` of an equilibrated block
+        ``D A D`` (:func:`~edelweissfe.linsolve.nullspace.translationNullspace`). Its next hierarchy is then
+        smoothed aggregation with a tentative prolongation built from them instead of AMGCL's identity blocks
+        (``amgcl-block-translations.hpp``), so the parameters must ask for smoothed aggregation. Anything else
+        -- the rotations, an entry off the diagonal blocks, a weight that is not positive -- raises
+        ``RuntimeError``; the rotations are carried by the scalar backend.
         """
         cdef np.ndarray[np.float64_t, ndim=2, mode="c"] B_arr = np.ascontiguousarray(B, dtype=np.float64)
         cdef int rows = B_arr.shape[0]
@@ -311,9 +318,9 @@ cdef class PyAMGCLEquilibratedSystem:
                           _constDoubleData(scalingArray), bounds.shape[0] // 2, _intData(bounds), unscaled)
         self.n = n
 
-    def diagonalBlock(self, int field, bint unscaled=False):
-        """``As[field, field]`` -- or with ``unscaled`` ``A[field, field]``, exactly A's entries if :meth:`build`
-        stored A -- as a new scipy.sparse csr_matrix (sorted columns if ``A``'s were)."""
+    def diagonalBlock(self, int field):
+        """``As[field, field]`` as a new scipy.sparse csr_matrix (sorted columns if ``A``'s were), whichever
+        operator :meth:`build` stored."""
         cdef int size = self.system.diagonalBlockSize(field)
         cdef int nnz = self.system.diagonalBlockNnz(field)
         cdef np.ndarray[np.int32_t, ndim=1, mode="c"] indptr = np.empty(size + 1, dtype=np.int32)
@@ -322,7 +329,7 @@ cdef class PyAMGCLEquilibratedSystem:
         cdef int[::1] indptr_ = indptr
         cdef int[::1] indices_ = indices
         cdef double[::1] data_ = data
-        self.system.fillDiagonalBlock(field, &indptr_[0], &indices_[0], &data_[0], unscaled)
+        self.system.fillDiagonalBlock(field, &indptr_[0], &indices_[0], &data_[0])
         return scipy.sparse.csr_matrix((data[:nnz], indices[:nnz], indptr), shape=(size, size), copy=False)
 
     def matvec(self, object x, bint unscaled=False):
