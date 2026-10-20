@@ -134,21 +134,17 @@ class NISTSchema:
         default=None,
         documentedDefault="auto",
     )
-    useAmgclMPCCondensation: bool | None = schemaField(
+    useThreadedMPCCondensation: bool | None = schemaField(
         description=(
-            "Condense the multi-point-constraint system matrix via the direct T^T K T + C "
-            "expression, but through AMGCL's own OpenMP-threaded product()/sum() "
-            "instead of SciPy's single-threaded CSR sparse routines. Offline-measured on a "
-            "reference model as faster than the direct SciPy expression, "
-            "correctness-verified to floating-point precision. Leaves more raw nnz than the "
-            "plain expression (AMGCL's product()/sum() do not prune exact-cancellation zeros the "
-            "way SciPy's do) -- not eliminated at the MPC-transform step itself, since "
-            "applyDirichletToStiffness already prunes immediately after, gated by the existing "
-            "pruneCondensedMatrixZeros option (default auto, pruned with PARDISO), uniformly for "
-            "both condensation strategies; that gate exists precisely because PARDISO's reordering on these path-"
-            "dependent condensed systems is known to drift with unpruned explicit-zero structural "
-            "entries, and blockamg's hierarchy-reuse gates on raw nnz. Off by default pending a "
-            "live gate (offline-validated only so far)."
+            "Condense the multi-point-constraint system matrix, T^T K T + C, with an OpenMP-threaded "
+            "kernel instead of SciPy's single-threaded CSR routines: every row of the result is computed "
+            "directly from the rows of K it combines, with no intermediate matrix, and rows of K that no "
+            "constraint touches are copied unchanged. The result does not depend on the number of "
+            "threads. Leaves more raw nnz than the "
+            "plain expression (explicit zeros are kept, SciPy's products drop exact-cancellation "
+            "zeros); applyDirichletToStiffness prunes them right after, gated by "
+            "pruneCondensedMatrixZeros (default auto: pruned for PARDISO, kept for blockamg, whose "
+            "hierarchy reuse needs a stable pattern). Off by default."
         ),
         dtype=bool,
         default=False,
@@ -240,7 +236,7 @@ class NIST(NonlinearSolverBase):
         "linsolver": "",
         "linsolverConfigFile": "",
         "pruneCondensedMatrixZeros": None,
-        "useAmgclMPCCondensation": False,
+        "useThreadedMPCCondensation": False,
         "report-performance-frequency": 0,
         "convergenceCriterion": "legacy",
         "abaqusResidualTolerance": 5e-3,
