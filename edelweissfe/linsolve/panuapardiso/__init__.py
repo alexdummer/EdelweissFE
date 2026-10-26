@@ -26,65 +26,30 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
-"""Registry-facing factory for the Panua PARDISO solver.
+"""The Panua PARDISO solver as a direct solver backend.
 
-The implementation lives in the Cython extension
-:mod:`edelweissfe.linsolve.panuapardiso.panuapardiso`, which is optional -- it needs the Panua
-PARDISO library at build time. The factory below therefore imports it lazily; see
-:func:`createSolver`.
+The binding is the optional Cython extension :mod:`edelweissfe.linsolve.panuapardiso.panuapardiso` (it needs the Panua
+PARDISO library at build time), imported when a backend is created: an install without it raises :class:`ImportError`
+there.
 """
 
-from collections.abc import Callable
-
-from edelweissfe.linsolve.base import LinearSolver
+from edelweissfe.linsolve.base import DirectSolverBackend
 
 
-class PanuaPardisoSolver(LinearSolver):
-    """The Panua PARDISO direct solver. Callable as ``(A, b) -> x``.
+class PanuaPardisoBackend(DirectSolverBackend):
+    """Panua PARDISO through :class:`~edelweissfe.linsolve.panuapardiso.panuapardiso.PanuaPardisoFactorization`:
+    reordering and factorization (phases 11 and 22) in :meth:`factorize`, back substitution (phase 33) in
+    :meth:`solveFactorized`. Takes no options."""
 
-    A plain Python wrapper around the bare Cython function
-    :func:`~edelweissfe.linsolve.panuapardiso.panuapardiso.panuaPardisoSolve` -- not touching the
-    ``.pyx`` itself keeps this trivially testable without a rebuild.
-    """
+    def __init__(self):
+        from edelweissfe.linsolve.panuapardiso.panuapardiso import (
+            PanuaPardisoFactorization,
+        )
 
-    def __init__(self, solveFunction):
-        self._solveFunction = solveFunction
+        self._factorization = PanuaPardisoFactorization()
 
-    def __call__(self, A, b):
-        return self._solveFunction(A, b)
+    def factorize(self, A) -> None:
+        self._factorization.factorize(A)
 
-
-def createSolver(opts) -> Callable:
-    """Create a Panua-PARDISO-backed linear solver.
-
-    The factory the ``linsolver`` registry category resolves for the name ``panuapardiso``: every ``linsolve``
-    subpackage exposes this one signature, so that a third party can contribute a linear solver through an entry
-    point.
-
-    Parameters
-    ----------
-    opts
-        The linear-solver options parsed from the solver's ``linsolverConfigFile``. Not consulted:
-        this backend takes no options. It is still accepted so that every ``createSolver`` presents
-        the identical signature.
-
-    Returns
-    -------
-    Callable
-        A :class:`PanuaPardisoSolver` wrapping
-        :func:`~edelweissfe.linsolve.panuapardiso.panuapardiso.panuaPardisoSolve`, callable as
-        ``(A, b) -> x``.
-
-    Raises
-    ------
-    ImportError
-        If the optional ``panuapardiso`` extension was not built -- raised here, at construction
-        time (matching the pre-refactor behaviour), not deferred to the first solve.
-    """
-
-    # Imported inside the function body, not at module scope: this extension is optional and
-    # genuinely absent in most installs, so at module scope its absence would break anyone who
-    # merely resolves a `linsolver` registry name rather than this one.
-    from edelweissfe.linsolve.panuapardiso.panuapardiso import panuaPardisoSolve
-
-    return PanuaPardisoSolver(panuaPardisoSolve)
+    def solveFactorized(self, b):
+        return self._factorization.solve(b)

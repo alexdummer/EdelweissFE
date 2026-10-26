@@ -32,7 +32,7 @@ one face and a single constrained component on another (partially constrained no
 
 import numpy as np
 import scipy.sparse as sp
-from _blockamgsystems import NODAL_COUPLING
+from _linsolvesystems import NODAL_COUPLING, equilibrated
 from scipy.spatial import cKDTree
 
 
@@ -62,26 +62,24 @@ def lattice(nCornersPerAxis: int, seed: int = 0):
     return coords[order], isCorner[order], edgeEndpoints
 
 
-def latticeSystem(coords, dirichletDofs, seed: int = 1):
-    """The equilibrated, Dirichlet-eliminated block and its equilibration vector."""
+def latticeSystem(coords, dirichletDofs, seed: int = 1, components: int = 3):
+    """The equilibrated, Dirichlet-eliminated block of ``components`` dofs per node and its equilibration vector."""
     nNodes = len(coords)
     pairs = cKDTree(coords).query_pairs(1.0 + 1e-9, output_type="ndarray")
     W = sp.coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(nNodes, nNodes))
     W = (W + W.T).tocsr()
     laplacian = sp.diags(np.asarray(W.sum(axis=1)).ravel() + 0.05) - W
-    skew = np.random.default_rng(seed).uniform(-1.0, 1.0, (3, 3))
-    A = sp.kron(laplacian, NODAL_COUPLING) + 0.02 * sp.kron(sp.triu(W, 1) - sp.tril(W, -1), skew)
+    skew = np.random.default_rng(seed).uniform(-1.0, 1.0, (3, 3))[:components, :components]
+    A = sp.kron(laplacian, NODAL_COUPLING[:components, :components]) + 0.02 * sp.kron(
+        sp.triu(W, 1) - sp.tril(W, -1), skew
+    )
     A = A.tolil()
     A[dirichletDofs, :] = 0.0
     A[:, dirichletDofs] = 0.0
     A[dirichletDofs, dirichletDofs] = 1.0
     A = A.tocsr()
     A.eliminate_zeros()
-    dinv = 1.0 / np.sqrt(np.abs(A.diagonal()))
-    As = sp.diags(dinv) @ A @ sp.diags(dinv)
-    As = As.tocsr()
-    As.sort_indices()
-    return As, dinv
+    return equilibrated(A)
 
 
 def dirichletDofs(coords):
@@ -89,3 +87,14 @@ def dirichletDofs(coords):
     clamped = np.nonzero(coords[:, 0] == 0.0)[0]
     sliding = np.nonzero((coords[:, 1] == 0.0) & (coords[:, 0] > 0.0))[0]
     return np.sort(np.r_[(3 * clamped[:, None] + np.arange(3)).ravel(), 3 * sliding + 2])
+
+
+def fineChebyshevTree(npre: int = 1, npost: int = 1, degree: int = 5, powerIters: int = 300) -> dict:
+    """The AMGCL tree of a p-two-grid's fine smoother: ``npre`` and ``npost`` Chebyshev sweeps of ``degree`` on
+    [0.01, 1.1] times the spectral radius, estimated by ``powerIters`` power iterations. The defaults are the smoother
+    the p-two-grid's recorded numbers were made with (BlockAMGSolver's p-two-grid defaults)."""
+    return {
+        "relax": {"type": "chebyshev", "degree": degree, "lower": 0.01, "higher": 1.1, "power_iters": powerIters},
+        "npre": npre,
+        "npost": npost,
+    }

@@ -24,7 +24,10 @@
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
 
+from libc.stddef cimport ptrdiff_t
+from libcpp.pair cimport pair
 from libcpp.string cimport string
+from libcpp.vector cimport vector
 
 
 cdef extern from "amgcl-wrapper.hpp":
@@ -33,14 +36,6 @@ cdef extern from "amgcl-wrapper.hpp":
     # internally -- see AMGCLSolverInterface. On a block backend set_nullspace() takes the translations
     # only, one diagonal block per node (see amgcl-block-translations.hpp).
     cdef cppclass AMGCLSolverInterface:
-        void solve(int n,
-                   const int* ptr,
-                   const int* col,
-                   const double* val,
-                   const double* rhs,
-                   double* x,
-                   int& iters,
-                   double& error) except +
         void set_nullspace(const double* B, int rows, int cols) except +
         void build(int n, const int* ptr, const int* col, const double* val) except +
         void applyPreconditioner(int n, const double* rhs, double* x) except +
@@ -50,7 +45,7 @@ cdef extern from "amgcl-wrapper.hpp":
     # 3x3 blocks set up in double and stored in float), owned by the caller.
     AMGCLSolverInterface* makeAMGCLSolver(const char* json_params, int blockSize, bint isFloat) except +
 
-    # blockamg's equilibrated, field-split system As = D A D: the outer Krylov operator, the
+    # The diagonally scaled, field-split system As = D A D of a composed solve: the outer Krylov operator, the
     # coupling blocks between fields and, on demand, the diagonal blocks -- built in one threaded
     # pass, see EquilibratedSystemT's own comment.
     cdef cppclass EquilibratedSystem:
@@ -60,6 +55,7 @@ cdef extern from "amgcl-wrapper.hpp":
         void absoluteDiagonal(int n, const int* ptr, const int* col, const double* val, double* out) except +
         void build(int n, const int* ptr, const int* col, const double* val, const double* scaling,
                    int nFields, const int* fieldBounds, bint unscaled) except +
+        void buildOperator(int n, const int* ptr, const int* col, const double* val) except +
         int diagonalBlockSize(int f) except +
         int diagonalBlockNnz(int f) except +
         void fillDiagonalBlock(int f, int* ptr, int* col, double* val) except +
@@ -70,14 +66,13 @@ cdef extern from "amgcl-wrapper.hpp":
 
     # Callback signature bridging AMGCL's native lgmres Krylov loop back into a Python-level
     # preconditioner -- see amgcl-wrapper.hpp's own comment on PyPrecondApplyFn/
-    # PyLGMRESPrecondT for why this is a bare function pointer + opaque context rather than a
+    # PyKrylovPrecondT for why this is a bare function pointer + opaque context rather than a
     # Cython-overridden C++ virtual method.
     ctypedef int (*PyPrecondApplyFn)(void* ctx, int n, const double* rhs, double* x)
 
-    # AMGCL's own native outer Krylov solve, in place of scipy.sparse.linalg.gmres; one instance per
-    # system size, no augmentation vectors carried across calls -- see LGMRESOuterSolverT.
-    cdef cppclass LGMRESOuterSolver:
-        LGMRESOuterSolver(int n, const char* json_params) except +
+    # AMGCL's own native outer Krylov solve (lgmres or fgmres), in place of scipy.sparse.linalg.gmres; one instance
+    # per system size, no subspace carried across calls -- see OuterKrylovSolverT.
+    cdef cppclass OuterKrylovSolver:
         void solve(const EquilibratedSystem& system,
                    const double* rhs,
                    double* x,
@@ -89,9 +84,33 @@ cdef extern from "amgcl-wrapper.hpp":
                    double& error,
                    bint onUnscaledOperator) except +
 
-    # The p-two-grid (P1) preconditioner of edelweissfe/linsolve/blockamg/ptwogrid.py, built and
+    OuterKrylovSolver* makeOuterKrylovSolver(const string& method, int n, const char* json_params) except +
+
+    # The arrays of a scalar CSR matrix, an operator of a two-level cycle as Python inspects it.
+    cdef cppclass ScalarCsr:
+        vector[int] ptr
+        vector[int] col
+        vector[double] val
+
+    # The two-level cycle the p-two-grid and the rigid-body coarse level share: the cycle itself, the fine spectral
+    # radius, P and the coarse operator, the timings and the report -- see TwoLevelPreconditioner's own comment. Arrays
+    # come back as C++ vectors, which Cython copies (_copied in amgcl.pyx).
+    cdef cppclass TwoLevelPreconditioner:
+        void apply(int n, const double* r, double* x) except +
+        double fineSpectralRadius()
+        string fineSpectralRadiusSource()
+        const vector[double]& fineDominantVector()
+        int nCoarse()
+        ScalarCsr prolongationCsr() except +
+        ScalarCsr coarseOperatorCsr() except +
+        string report() except +
+        vector[pair[string, double]] setupSeconds_
+        double applyFineSeconds_
+        double applyCoarseSeconds_
+
+    # The p-two-grid (P1) preconditioner of edelweissfe/linsolve/composition/ptwogrid.py, built and
     # applied entirely in C++ (OpenMP) -- see PTwoGridPreconditionerT's own comment.
-    cdef cppclass PTwoGridPreconditioner:
+    cdef cppclass PTwoGridPreconditioner(TwoLevelPreconditioner):
         PTwoGridPreconditioner(const char* json_params) except +
 
         @staticmethod
@@ -100,17 +119,22 @@ cdef extern from "amgcl-wrapper.hpp":
                    int nNodes, const signed char* isCorner, const int* edgeEndpoints,
                    const double* nullspace, int nullspaceRows, int nullspaceCols,
                    double spectralRadius, const double* dominantVector, int dominantVectorSize) except +
-        void apply(int n, const double* r, double* x) except +
-        double fineSpectralRadius()
-        int fineSpectralRadiusSource()
-        int fineDominantVectorSize()
-        void copyFineDominantVector(double* out)
-        int nCoarseFree()
-        string report() except +
-        double setupDirichletAndPSeconds_
-        double setupGalerkinSeconds_
-        double setupCoarseSeconds_
-        double setupFineOperatorSeconds_
-        double setupSpectralRadiusSeconds_
-        double applyFineSeconds_
-        double applyCoarseSeconds_
+
+    # The rigid-body coarse level preconditioner of edelweissfe/linsolve/composition/rigidbodycoarselevel.py, built and
+    # applied entirely in C++ (OpenMP) on the near null-space Python hands it -- see
+    # RigidBodyCoarseLevelPreconditioner's own comment, and amgcl-rigid-body-coarse-level.hpp for its steps.
+    cdef cppclass RigidBodyCoarseLevelPreconditioner(TwoLevelPreconditioner):
+        void build(int n, const int* ptr, const int* col, const double* val,
+                   const double* nullspace, int nullspaceRows, int nullspaceCols,
+                   double spectralRadius, const double* dominantVector, int dominantVectorSize) except +
+        int blockSize()
+        int modesPerAggregate()
+        int nAggregates()
+        int droppedModes()
+        double prolongationSmoothingWeight()
+        int coarseNullspaceColumns()
+        const vector[ptrdiff_t]& aggregateOfNode()
+        const vector[double]& coarseNullspace()
+
+    # The rigid-body coarse level preconditioner for the field's backendBlockSize (2 or 3), owned by the caller.
+    RigidBodyCoarseLevelPreconditioner* makeRigidBodyCoarseLevelPreconditioner(const char* json_params) except +

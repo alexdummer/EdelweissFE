@@ -25,7 +25,7 @@
 #  ---------------------------------------------------------------------
 """Corner/midside node topology for building a P1 (linear) restriction operator over a quadratic
 serendipity displacement mesh -- the enabler for p-multigrid
-(:class:`~edelweissfe.linsolve.blockamg.ptwogrid.PTwoGridPreconditioner`).
+(:class:`~edelweissfe.linsolve.composition.ptwogrid.PTwoGridPreconditioner`).
 
 The projection :math:`P` is purely topological: identity on corner nodes, ½/½ on each exclusive
 midside node from its two edge-endpoint corners (the P1 function expressed in the serendipity
@@ -114,8 +114,9 @@ def buildP1Map(model, fieldName: str):
     or an exclusive midside, in the same order as ``model.nodeFields[fieldName].nodes`` (the
     field's own DOF-vector row order, see ``DofManager._reserveSpaceForNodeFields``).
 
-    A node is a corner iff it is a corner node of *at least one* element it belongs to, **or** if
-    two elements disagree about its edge endpoints (see below) -- both cases are load-bearing
+    A node is a corner iff it is a corner node of *at least one* element it belongs to, if it belongs to
+    no element at all (e.g. the reference point of a rigid body, which carries the field through a
+    constraint), **or** if two elements disagree about its edge endpoints (see below) -- both cases are load-bearing
     under AMR, and every element's own contribution only ever sets ``isCorner`` to ``True``, never
     clears it.
 
@@ -163,6 +164,7 @@ def buildP1Map(model, fieldName: str):
     # `edgeEndpoints` array during this loop would leave a stale entry for exactly that case.
     provisionalEdges: dict[int, frozenset] = {}
     conflictingRows: set[int] = set()
+    inSomeElement = np.zeros(nNodes, dtype=bool)
 
     for element in model.elements.values():
         if not any(fieldName in nodeFields for nodeFields in element.fields):
@@ -175,6 +177,7 @@ def buildP1Map(model, fieldName: str):
         elNodes = element.nodes
         cornersLocal, edgesLocal = classifyElementTopology(dim, len(elNodes))
         elRows = [nodeRows.get(node) for node in elNodes]
+        inSomeElement[[row for row in elRows if row is not None]] = True
 
         for c in cornersLocal:
             row = elRows[c]
@@ -201,6 +204,8 @@ def buildP1Map(model, fieldName: str):
             "not the exclusive midside a conforming mesh would make it.".format(row, fieldName)
         )
 
+    # a node of no element (e.g. the reference point of a rigid body) is a corner: identity in P1
+    isCorner[~inSomeElement] = True
     edgeEndpoints = -np.ones((nNodes, 2), dtype=int)
     for row in range(nNodes):
         if isCorner[row]:
@@ -215,3 +220,35 @@ def buildP1Map(model, fieldName: str):
         edgeEndpoints[row] = tuple(candidate)
 
     return isCorner, edgeEndpoints, warnings
+
+
+def restrictP1Map(isCorner: np.ndarray, edgeEndpoints: np.ndarray, remains: np.ndarray) -> tuple:
+    """A field's P1 map (see :func:`buildP1Map`) restricted to some of its nodes, ``remains`` (e.g. those a Schur
+    complement does not condense): the rows are renumbered, and a midside node whose edge endpoint is not among them
+    becomes a corner.
+    That is always safe: the P1 restriction takes a corner as it is, so a promoted node only enlarges the coarse space
+    of the p-two-grid preconditioner, it never makes it wrong.
+
+    Parameters
+    ----------
+    isCorner, edgeEndpoints
+        The field's P1 map, see :func:`buildP1Map`.
+    remains
+        Per node of the field, whether it remains.
+
+    Returns
+    -------
+    tuple
+        ``(isCorner, edgeEndpoints)`` of the remaining nodes.
+    """
+    newRow = np.cumsum(remains) - 1
+    isCorner, edgeEndpoints = isCorner[remains].copy(), edgeEndpoints[remains].copy()
+    isMidside = ~isCorner
+    endpointRemains = np.ones_like(isMidside)
+    endpointRemains[isMidside] = remains[edgeEndpoints[isMidside]].all(axis=1)
+    becomesCorner = isMidside & ~endpointRemains
+    isCorner[becomesCorner] = True
+    edgeEndpoints[becomesCorner] = -1
+    stillMidside = ~isCorner
+    edgeEndpoints[stillMidside] = newRow[edgeEndpoints[stillMidside]]
+    return isCorner, edgeEndpoints
