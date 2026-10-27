@@ -141,15 +141,12 @@ class NISTSchema:
     )
     useThreadedMPCCondensation: bool | None = schemaField(
         description=(
-            "Condense the multi-point-constraint system matrix, T^T K T + C, with an OpenMP-threaded "
-            "kernel instead of SciPy's single-threaded CSR routines: every row of the result is computed "
-            "directly from the rows of K it combines, with no intermediate matrix, and rows of K that no "
-            "constraint touches are copied unchanged. The result does not depend on the number of "
-            "threads. Leaves more raw nnz than the "
-            "plain expression (explicit zeros are kept, SciPy's products drop exact-cancellation "
-            "zeros); applyDirichletToStiffness prunes them right after, gated by "
-            "pruneCondensedMatrixZeros (default auto: pruned for PARDISO, kept for blockamg, whose "
-            "hierarchy reuse needs a stable pattern). Off by default."
+            "Condense the multi-point-constraint system matrix, T^T K T + C, in place, with an "
+            "OpenMP-threaded kernel, instead of with SciPy's single-threaded CSR routines, which build a "
+            "second matrix. The CSR pattern of K gains, once per equation system, the entries where a "
+            "master collects the couplings of its slaves; the result does not depend on the number of "
+            "threads. Explicit zeros (the slave columns among them) are pruned from a copy according to "
+            "pruneCondensedMatrixZeros. Off by default."
         ),
         dtype=bool,
         default=False,
@@ -508,6 +505,12 @@ class NIST(NonlinearSolverBase):
                     self.mpcTransformation = self.buildMPCTransformation(model, step.actions)
                 with performancetiming.timeit("mpc dirichlet conflict check"):
                     self.checkMPCDirichletConflicts(self.mpcTransformation, step.actions)
+                if self.mpcTransformation is not None:
+                    # Room in the CSR pattern for the entries the condensation adds, so that it can be done in place
+                    with performancetiming.timeit("mpc condensed pattern"):
+                        self.csrGenerator.addToPattern(
+                            self.mpcTransformation.condensedPatternFillIn(self.csrGenerator.csrMatrix)
+                        )
 
                 # After a change of the mesh or of the constraint connectivity, the last accepted
                 # dU belongs to a different DOF layout, so this one increment is not extrapolated
@@ -976,38 +979,16 @@ class NIST(NonlinearSolverBase):
         :func:`edelweissfe.solvers.base.dirichlet.applyDirichletToStiffness`."""
         K = applyDirichletToStiffness(K, dirichlets, rhs)
 
-        # Compacting the just-zeroed entries out of K is a storage/performance concern,
-        # not part of applying the boundary condition -- and whether it's even safe
-        # depends on K's identity, which only the assembler/solver side knows:
+        # Compacting the explicit zeros out of a condensed K (see _shouldPruneCondensedMatrixZeros): PARDISO's
+        # reordering of these poorly conditioned, path-dependent (contact/friction) systems is sensitive enough to
+        # the extra structural entries to drift from the reference path; but the pattern then changes from one
+        # Newton iteration to the next, so a solver like blockamg, which reuses its hierarchy, keeps them.
         #
-        # - No MPC transformation: K is self.csrGenerator's own persistent CSR matrix,
-        #   returned by reference (assembleStiffnessCSR/updateInPlace) and reused, in
-        #   place, every Newton iteration. eliminate_zeros() would shrink/compact its
-        #   data/indices arrays -- but the generator's C++ core scatters fresh values
-        #   into the ORIGINAL, full-length buffer on every subsequent update via a fixed
-        #   assembly map computed once at construction. After a shrink, that buffer and
-        #   the (now compacted) K.indices/K.indptr disagree about which stored slot
-        #   belongs to which (row, col) -- silently misaligned values from the next
-        #   iteration on. Must NOT eliminate.
-        # - MPC transformation active (hanging nodes / ties): K is the freshly computed,
-        #   disposable T^T @ K @ T + I_s from mpcTransformation.transformSystemMatrix,
-        #   independent of the generator's buffer and discarded after this solve.
-        #   Eliminating here is always safe, and PARDISO's reordering on these more
-        #   poorly conditioned, path-dependent (contact/friction) condensed systems is
-        #   sensitive enough to the extra explicit-zero structural entries to visibly
-        #   drift from the converged reference path if they are kept.
-        #
-        # The pruning has a measured cost, though, which is why it is now switchable: it removes
-        # whichever entries happen to be exactly zero on *this* iteration, so the pattern differs from
-        # one Newton iteration to the next (observed large swings in nnz within a single increment)
-        # and a linear solver can never reuse its symbolic factorization -- a non-trivial share of each
-        # iteration's cost on a large model. Turning it off is only half the story: it pays off solely in
-        # combination with a solver that then actually freezes its reordering, and the drift the
-        # comment above describes has to be re-checked against a reference load path before it is
-        # adopted. Left unset in the input file, this is decided automatically per self.linSolver
-        # (see _shouldPruneCondensedMatrixZeros): pruned for a solver like PARDISO that needs it,
-        # skipped for one like blockamg that needs the pattern stable instead.
+        # The CSR generator's own matrix (the threaded condensation works in place on it) must never be compacted:
+        # the generator scatters every update into its full-length buffer via a fixed map. A copy is pruned instead.
         if self.mpcTransformation is not None and self._shouldPruneCondensedMatrixZeros():
+            if K is self.csrGenerator.csrMatrix:
+                K = K.copy()
             K.eliminate_zeros()
 
         return K
