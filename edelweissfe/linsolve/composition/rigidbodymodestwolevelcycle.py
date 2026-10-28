@@ -111,10 +111,6 @@ class RigidBodyModesTwoLevelCycle(TwoLevelCycle):
     prolongation
         ``"smoothed"`` (default) or ``"tentative"``: the tentative prolongation alone, a cheaper setup and a sparser
         coarse operator at the price of more outer iterations.
-    fineSpectralRadius, fineDominantVector
-        A previous build's fine spectral radius and dominant vector to start from (``fineSpectralRadiusReuse``), or
-        ``None`` to estimate the radius in full, see
-        :class:`~edelweissfe.linsolve.composition.twolevelcycle.TwoLevelCycle`.
 
     Raises
     ------
@@ -129,8 +125,6 @@ class RigidBodyModesTwoLevelCycle(TwoLevelCycle):
         backendPrecision: str = "double",
         coarseHierarchyPrecision: str = "double",
         prolongation: str = "smoothed",
-        fineSpectralRadius: float = None,
-        fineDominantVector=None,
     ):
         from edelweissfe.linsolve.amgcl.amgcl import PyAMGCLRigidBodyModesTwoLevelCycle
 
@@ -142,8 +136,6 @@ class RigidBodyModesTwoLevelCycle(TwoLevelCycle):
                 "coarseHierarchyPrecision": coarseHierarchyPrecision,
                 "prolongation": prolongation,
             },
-            fineSpectralRadius,
-            fineDominantVector,
         )
 
     @staticmethod
@@ -177,8 +169,6 @@ class RigidBodyModesTwoLevelCycle(TwoLevelCycle):
         self._preconditioner.build(
             A,
             self.nearNullspace(block, coordinates, scaling),
-            self._suppliedFineSpectralRadius(),
-            self._fineDominantVector,
         )
 
     @property

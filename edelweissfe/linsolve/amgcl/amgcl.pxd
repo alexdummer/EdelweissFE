@@ -98,8 +98,6 @@ cdef extern from "amgcl-wrapper.hpp":
     cdef cppclass TwoLevelCycle:
         void apply(int n, const double* r, double* x) except +
         double fineSpectralRadius()
-        string fineSpectralRadiusSource()
-        const vector[double]& fineDominantVector()
         int nCoarse()
         ScalarCsr prolongationCsr() except +
         ScalarCsr coarseOperatorCsr() except +
@@ -119,8 +117,7 @@ cdef extern from "amgcl-wrapper.hpp":
         void setCoarseSolve(PyPrecondApplyFn applyFn, void* ctx)
         const vector[signed char]& coarseNodes()
         ScalarCsr build(int n, const int* ptr, const int* col, const double* val, const double* scaling,
-                        int nNodes, const signed char* isCorner, const int* edgeEndpoints,
-                        double spectralRadius, const double* dominantVector, int dominantVectorSize) except +
+                        int nNodes, const signed char* isCorner, const int* edgeEndpoints) except +
 
     # The two-level cycle on the rigid-body modes per aggregate of
     # edelweissfe/linsolve/composition/rigidbodymodestwolevelcycle.py, built and applied entirely in C++ (OpenMP) on the
@@ -128,8 +125,7 @@ cdef extern from "amgcl-wrapper.hpp":
     # amgcl-rigid-body-coarse-level.hpp for its steps.
     cdef cppclass RigidBodyModesTwoLevelCycle(TwoLevelCycle):
         void build(int n, const int* ptr, const int* col, const double* val,
-                   const double* nullspace, int nullspaceRows, int nullspaceCols,
-                   double spectralRadius, const double* dominantVector, int dominantVectorSize) except +
+                   const double* nullspace, int nullspaceRows, int nullspaceCols) except +
         int blockSize()
         int modesPerAggregate()
         int nAggregates()

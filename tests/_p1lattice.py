@@ -89,17 +89,14 @@ def dirichletDofs(coords):
     return np.sort(np.r_[(3 * clamped[:, None] + np.arange(3)).ravel(), 3 * sliding + 2])
 
 
-def fineChebyshevTree(npre: int = 1, npost: int = 1, degree: int = 5, powerIters: int = 300) -> dict:
+def fineChebyshevTree(npre: int = 1, npost: int = 1, degree: int = 5, spectralRadiusSteps: int = None) -> dict:
     """The AMGCL tree of a corner-node two-level cycle's fine smoother: ``npre`` and ``npost`` Chebyshev sweeps of
-    ``degree`` on [0.01, 1.1] times the spectral radius, estimated by ``powerIters`` power iterations. The defaults are
-    the smoother the corner-node two-level cycle's recorded numbers were made with (BlockAMGSolver's corner-node
-    two-level cycle defaults).
-    """
-    return {
-        "relax": {"type": "chebyshev", "degree": degree, "lower": 0.01, "higher": 1.1, "power_iters": powerIters},
-        "npre": npre,
-        "npost": npost,
-    }
+    ``degree`` on [0.01, 1.1] times the spectral radius, estimated by ``spectralRadiusSteps`` Arnoldi steps, or by the
+    default estimate (10 steps) for ``None``."""
+    relax = {"type": "chebyshev", "degree": degree, "lower": 0.01, "higher": 1.1}
+    if spectralRadiusSteps is not None:
+        relax["spectralRadiusSteps"] = spectralRadiusSteps
+    return {"relax": relax, "npre": npre, "npost": npost}
 
 
 def orphanSystem():

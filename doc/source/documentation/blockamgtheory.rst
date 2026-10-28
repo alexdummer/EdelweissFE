@@ -308,7 +308,7 @@ revisits all fields but the last) and reused across Newton iterations while it s
 (see the reuse rules below). The defaults differ by nodal dimension (:func:`~edelweissfe.linsolve.composition.amg.defaultFieldTree` in
 the code): a **3D vector** field (e.g. displacement) is stored in :math:`3\times3` nodal blocks in
 float, coarsened by smoothed aggregation with a strong-connection threshold of 0.01 and
-``estimate_spectral_radius`` (20 power iterations) from the translations of its equilibrated block (see
+``estimate_spectral_radius`` (see :ref:`blockamg-chebyshev`) from the translations of its equilibrated block (see
 :ref:`below <blockamg-block-nullspace>`), and smoothed by a degree-16 Chebyshev polynomial
 (one post-smoothing sweep, no pre-smoothing) -- and its hierarchy starts with the rigid-body coarse level, a first
 coarse level of all its rigid-body modes, rotations included (see :ref:`below <blockamg-rigid-body-coarse-level>`);
@@ -320,7 +320,9 @@ shape the block backend was never tuned for; a **scalar** field takes the plain 
 aggregation, Chebyshev at AMGCL's own defaults). Any field can be given another tree in a ``custom`` solver
 script, ``OnField(name, AMG(tree=...))``; the default trees are listed in :ref:`composed-default-field-trees`.
 
-The tree holds AMGCL parameters only. Three keyword arguments of ``AMG`` (the first two also of ``TwoLevel``) select
+The tree is AMGCL's parameter tree, plus one key of EdelweissFE's own, ``spectralRadiusSteps``, which its Chebyshev
+smoother and its smoothed aggregation read (:ref:`blockamg-chebyshev`); a Chebyshev ``relax`` rejects keys it does
+not know. Three keyword arguments of ``AMG`` (the first two also of ``TwoLevel``) select
 the backend the hierarchy is built on; left unset, :func:`~edelweissfe.linsolve.composition.amg.backendOf` chooses
 them from the field:
 
@@ -428,23 +430,51 @@ error class either, so it has nowhere efficient to go.
 The full basis was measured to need fewer outer iterations than translations alone, and to be robust to the thread
 count (:ref:`measured-rigid-body-nullspace`).
 
-That power-iteration setting is the smoother's second, independent subtlety. The smoother needs
-:math:`\rho`. AMGCL's own default (``power_iters = 0``) bounds it by Gershgorin's theorem: safe and
-deterministic, but pessimistic, which shifts the window upward; the scalar default tree (the damage
-field's) keeps that. With ``power_iters > 0`` AMGCL estimates :math:`\rho` by that many steps of the power
-iteration instead -- tighter, but from a start vector drawn from random streams seeded per OpenMP thread.
-That estimate is deterministic for a given thread count but *different* at a different thread count,
-because the number of independent random streams changes with it even though the operator does not. At a
-short iteration budget it can be badly under-converged on a hard operator, which cripples the smoother.
-Running the power iteration close to convergence -- the vector-field default does 300 steps -- removes the
-practical thread-count sensitivity (:ref:`measured-power-iterations`), for a one-time cost per hierarchy build that is small against the
-build itself. It does not make the hierarchy bitwise independent of the thread count: the estimate still
-starts from per-thread random streams and agrees across thread counts only to its convergence (and its
-reductions are summed in thread order, so even two runs at the same thread count can differ in the last
-bits). Smoothed aggregation's ``estimate_spectral_radius`` (part of the vector-field default, with
-only 20 power iterations) uses the same per-thread seeded estimate for the prolongation smoother's
-weight, so a hierarchy built with it depends measurably on the thread count; results are reproducible at
-a fixed thread count, up to that last-bit summation order.
+The spectral radius is the smoother's second, independent subtlety. The Chebyshev polynomial damps the eigenvalues in
+``[lower, higher]`` times an estimate of :math:`\rho`; an estimate too far below :math:`\rho` leaves the largest
+eigenvalues outside that interval, where the polynomial *amplifies* them. Every spectral radius of EdelweissFE -- of
+the Chebyshev smoother of every AMG level, of the fine level of ``TwoLevel``, and of :math:`D^{-1} A` for the weight of
+the prolongation smoothing -- is estimated one way (``edelweissfe/linsolve/amgcl/amgcl-spectral-radius.hpp``):
+
+* **Arnoldi steps**, not the power iteration. The power iteration converges with the ratio of the two largest
+  eigenvalues, close to one for finite element operators, so a short power iteration can stop far below
+  :math:`\rho`. The largest Ritz value :math:`\theta` of the Arnoldi process from the same number of products
+  converges much faster: a few steps reach what takes the power iteration many. Our operators are not symmetric
+  (contact, softening, non-associated plasticity, the condensation of multi-point constraints), so the symmetric
+  Lanczos process has no theory for them; Arnoldi holds for any matrix, and its orthogonalization costs :math:`k^2/2`
+  vector operations for :math:`k` steps, little against the :math:`k` sparse products. On the captured systems,
+  markedly nonsymmetric ones among them, the two give the same estimates (:ref:`measured-power-iterations`).
+* **A start vector seeded per row.** AMGCL seeds its start vector per OpenMP thread, so its estimate -- and with it the
+  outer iterations, on a hard system by far -- depends on the thread count (:ref:`measured-power-iterations`). The
+  start vector is computed from the row index alone, zero on the Dirichlet rows of a two-level cycle, and the inner
+  products sum over a fixed partition of the rows in order: the estimate is the same, bit for bit, at any thread
+  count.
+* **The Ritz value of largest modulus plus its residual norm**, :math:`|\theta| + r` with :math:`r = |h_{k+1,k} y_k|`
+  for the unit eigenvector :math:`y` of the small :math:`k \times k` Arnoldi matrix, which Eigen's dense eigensolver
+  computes. The modulus, because the spectral radius is the largest
+  modulus of the eigenvalues: a dominant eigenvalue that is negative or complex, as an indefinite or strongly
+  nonsymmetric level (contact, softening) may have, is not missed, as the largest real part would miss it. For a
+  symmetric matrix there is an eigenvalue within :math:`r` of :math:`\theta`, so :math:`|\theta| + r \geq \rho` once
+  :math:`\theta` is the Ritz value of the dominant eigenvalue. For a
+  nonsymmetric matrix :math:`(\theta, x)` is an exact eigenpair of a matrix within :math:`r` of :math:`A`, which bounds
+  the error only together with the conditioning of the eigenvectors: :math:`r` is an indicator there, not a bound, and
+  the smoother keeps its own margin, ``higher`` 1.1 -- the default of every Chebyshev smoother in EdelweissFE, a tree
+  that leaves it out included. AMGCL's own default is 1.0, which sits on its Gershgorin bound, never below
+  :math:`\rho`; the Arnoldi estimate can be, slightly, and an eigenvalue above the interval is amplified, not
+  damped.
+* **A fixed number of steps**, ``spectralRadiusSteps``, 10 by default: on the captured systems the estimate then lies
+  slightly above :math:`\rho`, well within the smoother's margin (:ref:`measured-power-iterations`).
+* **Its memory.** Arnoldi keeps its :math:`k` basis vectors while it runs, :math:`k` doubles per DOF (80 bytes per DOF
+  for the 10 default steps); the power iteration needed two. Against the
+  operator itself (about 80 stored entries per DOF of a 3D field) that is small, and it is freed before the next level
+  of a hierarchy is built.
+
+The key ``spectralRadiusSteps`` is EdelweissFE's own, not AMGCL's: it sits in a tree's ``relax`` for the smoother and
+in its ``coarsening`` for the prolongation smoothing (with ``estimate_spectral_radius``). AMGCL's ``power_iters``, which
+it replaces, is refused, also ``power_iters`` 0, AMGCL's Gershgorin bound: there is one estimate. The Chebyshev
+relaxation and the smoothed aggregation that use it are EdelweissFE's own (``amgcl-chebyshev.hpp``), step for step
+AMGCL's otherwise, with one Chebyshev polynomial for every Chebyshev smoother; every other relaxation and coarsening is
+AMGCL's.
 
 .. _blockamg-block-nullspace:
 
@@ -828,6 +858,20 @@ free submatrix, and it allows ``TwoLevel(..., backendBlockSize=3)``: the fine op
 :math:`3\times 3` blocks even where a node is only partially constrained, which roughly halves the
 memory traffic of the fine smoother and residual -- the dominant cost of the apply.
 
+``backendPrecision="float"`` (the default on :math:`3\times 3` blocks) halves the bytes per stored entry once more.
+Only the stored entries
+are rounded: vectors and every sum stay double (a float matrix times a double vector), and the
+spectral radius is estimated on the double operator before it is rounded -- unlike
+``AMG(backendPrecision="float")`` on the scalar backend, whose whole setup, the estimate included, runs in single
+precision.
+
+The fine Chebyshev smoother is the tree's ``relax`` (``degree``, ``lower``, ``higher`` and the spectral radius estimate,
+:ref:`blockamg-chebyshev`), applied ``npre`` times before and ``npost`` times after the coarse-grid correction -- the
+same spelling as for the rigid-body coarse level. It is the Chebyshev polynomial of every Chebyshev smoother, with the
+bounds of the vector-field default tree (``lower`` 0.01, ``higher`` 1.1 times the spectral radius; the defaults are
+1/30 and 1.1, AMGCL's 1/30 and 1 but the margin, :ref:`blockamg-chebyshev`); its estimate runs on the free rows (the
+start vector is zero on the Dirichlet rows) and is built anew with the cycle.
+
 The same cycle on the free submatrix, written out in Python: the free submatrix, the scaled :math:`P`, an exact coarse
 solve and the Chebyshev polynomial. A test checks the C++ cycle against it, to rounding, for several numbers of sweeps
 and degrees:
@@ -835,26 +879,6 @@ and degrees:
 .. literalinclude:: ../../../tests/test_corner_node_two_level_cycle.py
    :start-after: # The reference cycle of the theory page.
    :end-before: # End of the reference cycle of the theory page.
-
-``backendPrecision="float"`` (the default on :math:`3\times 3` blocks) halves the bytes per stored entry once more.
-Only the stored entries
-are rounded: vectors and every sum stay double (a float matrix times a double vector), and the
-spectral radius is estimated and re-checked on the double operator before it is rounded -- unlike
-``AMG(backendPrecision="float")`` on the scalar backend, where AMGCL's own power iteration runs in single precision.
-
-The fine Chebyshev smoother is the tree's ``relax`` (``degree``, ``lower``, ``higher``, ``power_iters``), applied
-``npre`` times before and ``npost`` times after the coarse-grid correction -- the same spelling as for the rigid-body
-coarse level. It uses AMGCL's polynomial, with the bounds of the vector-field default tree
-(``lower`` 0.01, ``higher`` 1.1 times the spectral radius; AMGCL's own defaults are 1/30 and 1), but its
-spectral-radius estimate -- 300 power iterations in the default tree, the most
-expensive stage of the build -- starts from a deterministic, thread-count-independent vector, and can
-be reduced to a re-check: with ``TwoLevel(..., fineSpectralRadiusReuse=True)`` a field's first build estimates it in
-full, and every later rebuild continues the power iteration for 15 steps from the previous build's
-dominant vector. A re-check estimate up to 1% above the previous radius keeps it (the full estimate is
-itself converged only to about 1e-5); one further above replaces it; and one above it by more than the
-10% margin of ``higher`` -- an operator that stiffened more than the smoother's bounds cover -- triggers
-the full estimate again. The cache is dropped when the model
-changes (e.g. after adaptive refinement).
 
 
 .. _blockamg-rigid-body-coarse-level:
@@ -952,7 +976,7 @@ of the modes, and hands to C++ -- in C++, ``amgcl-rigid-body-coarse-level.hpp``,
    AMGCL's own, shared with the translations of the block backend: :math:`\hat A_F` holds the strong connections, the
    weak ones lumped onto the diagonal blocks, :math:`\mathrm{diag}_B` takes its node-wise :math:`B \times B` diagonal
    blocks, and :math:`\omega` follows the tree's ``coarsening`` (``relax``, ``estimate_spectral_radius``,
-   ``power_iters``). One damped block-Jacobi step widens every column by a layer of nodes and smooths away its jump at
+   and the spectral radius estimate, :ref:`blockamg-chebyshev`). One damped block-Jacobi step widens every column by a layer of nodes and smooths away its jump at
    the aggregate's boundary. With the option ``"prolongation": "tentative"``, :math:`P = P^{\mathrm{tent}}`.
 #. **Galerkin coarse operator.** :math:`A_c = P^\mathsf{T} \hat A P`, with :math:`M = B (B + 1) / 2` coarse dofs per
    aggregate, 6 in 3D and 3 in 2D, formed block by block, in :math:`M \times M` blocks, and handed to AMGCL unblocked
@@ -981,9 +1005,7 @@ coarse-grid correction: 0 and 1, degree 16, in the default trees), with the Diri
 double. With the translations alone in place of all modes, the construction *is* AMGCL's first level on the block
 backend -- the same aggregates, tentative prolongation, smoothing and Galerkin product, :math:`M = B` -- except on the
 Dirichlet rows, where AMGCL's translations are not zero. A test of the suite checks that, on a system without Dirichlet rows,
-the two preconditioners then agree up to the spectral-radius estimate of the fine smoother (AMGCL's power iteration
-starts from random vectors, the cycle's from a deterministic one): what the rigid-body coarse level adds is the
-rotations.
+the two preconditioners then agree to rounding: what the rigid-body coarse level adds is the rotations.
 
 When it pays, and when to switch it off
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

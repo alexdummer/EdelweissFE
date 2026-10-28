@@ -109,11 +109,12 @@ Components
         apply it several times
     * - ``AMG(tree, backendBlockSize, backendPrecision, blockTranslationNullspace, rigidBodyNullspace, dropTolerance,
         lumpDroppedEntries)``
-      - one AMGCL hierarchy on a field, one cycle per application. ``tree`` holds AMGCL's parameters only, forwarded
-        verbatim; the backend (scalar entries or node-wise blocks, double or float, the block translations) is chosen
+      - one AMGCL hierarchy on a field, one cycle per application. ``tree`` is AMGCL's parameter tree, plus
+        EdelweissFE's own key ``spectralRadiusSteps`` (:ref:`blockamg-chebyshev`); the backend (scalar entries or
+        node-wise blocks, double or float, the block translations) is chosen
         by the keywords, the field's default for those not given (:ref:`composed-amg-backend`); with
         ``dropTolerance`` built on the filtered block (:ref:`composed-drop-tolerance`)
-    * - ``TwoLevel(coarseSpace, tree, backendBlockSize, backendPrecision, fineSpectralRadiusReuse, dropTolerance,
+    * - ``TwoLevel(coarseSpace, tree, backendBlockSize, backendPrecision, dropTolerance,
         lumpDroppedEntries)``
       - a two-level cycle with a coarse space of its own (a ``CoarseSpace``): all rigid-body modes per aggregate,
         ``RigidBodyModesPerAggregate(prolongation, coarseHierarchyPrecision)``, or the interpolant from the corner

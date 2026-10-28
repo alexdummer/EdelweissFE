@@ -32,9 +32,9 @@ Galerkin coarse operator -- that differ in their coarse level and coarse solve: 
 an AMGCL hierarchy of its own, the corner-node two-level cycle with a component of the composed solver. Both are built
 and applied in C++: the shared cycle is ``TwoLevelCycle`` in ``amgcl-wrapper.hpp``, wrapped as ``_PyAMGCLTwoLevelCycle``
 in ``amgcl.pyx``. :class:`TwoLevelCycle` mirrors those bases here: it creates the C++ object, which validates
-every parameter, keeps the fine spectral radius a build may start from, and passes the cycle, the fine spectral radius a
-build ends with, the timings and the report through. A derived class chooses the parameters and builds its coarse level,
-in its ``build``, from what that coarse level needs.
+every parameter, and passes the cycle, the fine spectral radius a build estimates, the timings and the report through.
+A derived class chooses the parameters and builds its coarse level, in its ``build``, from what that coarse level
+needs.
 """
 
 import numpy as np
@@ -51,14 +51,6 @@ class TwoLevelCycle:
         The Cython class of the C++ preconditioner, created here from ``parameters``.
     parameters
         Its parameters, which its constructor checks -- the one place they are checked.
-    fineSpectralRadius, fineDominantVector
-        The fine operator's spectral radius for the Chebyshev bounds, and the dominant vector to re-check it from, or
-        ``None`` to estimate it in full by power iteration from a deterministic start vector -- the most expensive stage
-        of a build. A caller rebuilding on a slowly changing operator can hand back a previous build's
-        :attr:`fineSpectralRadius` and :attr:`fineDominantVector`. The radius is then not reused blindly but re-checked
-        by a few power iterations continued from that vector: a re-check estimate more than 1% above the supplied radius
-        replaces it, and one beyond the margin of the smoother's upper bound -- the operator stiffened more than its
-        bounds cover -- triggers the full estimate. A radius without a vector is used as supplied.
 
     Raises
     ------
@@ -66,9 +58,7 @@ class TwoLevelCycle:
         For parameters the C++ class cannot use, before anything is built.
     """
 
-    def __init__(self, cppClass, parameters: dict, fineSpectralRadius: float = None, fineDominantVector=None):
-        self._fineSpectralRadius = fineSpectralRadius
-        self._fineDominantVector = fineDominantVector
+    def __init__(self, cppClass, parameters: dict):
         try:
             self._preconditioner = cppClass(parameters)
         except RuntimeError as error:
@@ -99,28 +89,11 @@ class TwoLevelCycle:
             "backendPrecision": backendPrecision,
         }
 
-    def _suppliedFineSpectralRadius(self) -> float:
-        """The fine spectral radius to hand to the C++ build: the supplied one, or 0 for none, which the C++ build takes
-        as "estimate it in full"."""
-        return self._fineSpectralRadius if self._fineSpectralRadius is not None else 0.0
-
     @property
     def fineSpectralRadius(self) -> float:
-        """The fine spectral radius the smoother was built with (estimated, or the one supplied), to hand back to the
-        next build of the field instead of paying for the estimate again."""
+        """The estimate of the fine spectral radius the smoother was built with: ``relax.spectralRadiusSteps`` Arnoldi
+        steps from a start vector seeded per row, zero on the Dirichlet rows (``amgcl-spectral-radius.hpp``)."""
         return self._preconditioner.fineSpectralRadius
-
-    @property
-    def fineDominantVector(self) -> np.ndarray:
-        """The estimate of the fine operator's dominant eigenvector, to hand back together with
-        :attr:`fineSpectralRadius` for the re-check of a reused radius."""
-        return self._preconditioner.fineDominantVector
-
-    @property
-    def fineSpectralRadiusSource(self) -> str:
-        """How the last build arrived at its fine spectral radius: ``"estimated"`` in full, ``"supplied"`` and kept,
-        ``"raised"`` by the re-check, or ``"re-estimated"`` in full -- see the ``fineSpectralRadius`` parameter."""
-        return self._preconditioner.fineSpectralRadiusSource
 
     def applyPreconditioner(self, r: np.ndarray) -> np.ndarray:
         """One two-level cycle: fine Chebyshev sweeps and the coarse correction on the free dofs; the Dirichlet rows

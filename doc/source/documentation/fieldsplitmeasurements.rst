@@ -25,17 +25,32 @@ backend's hierarchy takes the translations only (see ``backendBlockSize``).
 
 .. _measured-power-iterations:
 
-Power iterations of the Chebyshev smoother
-------------------------------------------
+The spectral radius estimate of the Chebyshev smoother
+------------------------------------------------------
 
 See :ref:`blockamg-chebyshev`.
 
-With the former setting of 50 power iterations, one captured solve needed far more outer
-iterations than the identical matrix solved again with nothing differing but ``OMP_NUM_THREADS``
-(the true spectral radius, checked independently, barely moves between Newton iterations there) --
-a sign of under-convergence at some thread counts. 300 iterations removed that sensitivity and were
-faster in aggregate over a set of captured degraded systems, with no observed downside on systems
-that were already fine.
+**Why it changed.** AMGCL estimated the spectral radius by power iteration from a start vector seeded per OpenMP
+thread. With a short power iteration, one captured solve needed far more outer iterations at one thread count than at
+another, nothing else differing, while the true spectral radius barely moved between the solves of that run. A long
+power iteration removed that sensitivity, but made the estimate the most expensive stage of the setup.
+
+**The estimate against a reference eigensolver.** On the scaled displacement blocks and the coarse operators of the
+corner-node interpolation of captured systems, markedly nonsymmetric ones among them, Arnoldi and Lanczos from the same
+row-seeded start vector agree to about three digits; Arnoldi is kept, since it holds for nonsymmetric matrices. With
+the default number of steps, its estimate :math:`|\theta| + r` lay slightly above the spectral radius on every
+operator, well within the smoother's margin; more steps bring it closer, and too few can leave it well below, where
+the rigid-body coarse level of a small 2D beam of the test suite diverged.
+
+**Outer iterations, setup and wall time**, on the displacement block alone of the captured systems of
+:ref:`measured-scaled-corner-node-interpolation` and of the damage cylinder after its onset, for ``AMG()``, the
+rigid-body coarse level and the scaled corner-node interpolation, at several thread counts: the default Arnoldi steps
+needed about the outer iterations of the former long power iteration, for a fraction of its setup and clearly less wall
+time, and their outer iterations no longer depend on the thread count at all. A start vector seeded per row alone
+already removes the thread-count dependence of a power iteration. An adaptive number of steps, stopping once the
+residual norm of the dominant Ritz pair is small against its Ritz value, needed the same outer iterations with more
+setup on the small coarse AMG levels, so the estimate takes a fixed number of steps. The contact anchor systems the
+former long power iteration was chosen on were not measured again.
 
 .. _measured-block-translations:
 
@@ -188,16 +203,16 @@ Offline, outer iterations and solve time (setup included) to a relative residual
 alone, one cycle per outer iteration, on the captured systems of :ref:`measured-rigid-body-coarse-level`: the tunnel
 segment, elastic and damaged, and sequences of the damage cylinder and of the edge breakout.
 
-Against the former corner-node two-level cycle -- the plain weights :math:`\tfrac12, \tfrac12` and an AMG coarse
-solve inside its C++ cycle -- the scaled weights with the coarse solve
-``DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate()))`` needed many times fewer outer iterations on
-the tunnel segment, several times fewer on the damage cylinder and fewer on the edge breakout, and less time on every
+Against the former corner-node two-level cycle -- the plain weights :math:`\tfrac12, \tfrac12` and an AMG coarse solve
+inside its C++ cycle -- the scaled weights with the coarse solve
+``DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate()))`` needed many times fewer outer iterations on the
+tunnel segment, several times fewer on the damage cylinder and fewer on the edge breakout, and less time on every
 system. They also needed fewer outer iterations than the rigid-body coarse level on the whole field on every system;
-with the fine spectral radius estimated by fewer power iterations than the default trees' 300, they were also faster
-on almost every system, while the power iterations of the default trees, on the fine level of the cycle above all,
-take back much of that gain in setup. The iterations agree with those of the offline prototype the method was
-developed in. Calling the coarse component back from the C++ cycle, with the restriction and the prolongation, is a
-small part of an application next to the fine Chebyshev sweep.
+with the fine spectral radius estimated by fewer power iterations than the default trees of the time, they were also
+faster on almost every system, while those long power iterations, on the fine level of the cycle above all, took back
+much of that gain in setup (the estimate that replaced them: :ref:`measured-power-iterations`). The iterations agree
+with those of the offline prototype the method was developed in. Calling the coarse component back from the C++ cycle,
+with the restriction and the prolongation, is a small part of an application next to the fine Chebyshev sweep.
 
 Other coarse solves on the corner-node field: ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` without the
 second scaling needed the same iterations where the scaling varies little along the edges (the tunnel, the cylinder),

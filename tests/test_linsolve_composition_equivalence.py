@@ -29,14 +29,15 @@
 
 ``BlockAMGSolver`` was deleted once the composition matched it (outer iterations, rebuild decisions, solutions and
 degradation dumps, on these systems and on the workbench dumps). Its numbers on the systems below were recorded before
-the deletion (xeon, branch ``feat/linsolve-composition`` at ``ffe4b681``, ``OMP_NUM_THREADS`` 16 and 1) and are frozen
-here: the outer iterations of every solve, whether the preconditioner was rebuilt, the true-residual continuations,
-whether the tolerance was met, and ``||x||``.
+the deletion (xeon, branch ``feat/linsolve-composition`` at ``ffe4b681``) and frozen here. When the spectral radius
+estimate changed from AMGCL's power iteration to Arnoldi steps (``amgcl-spectral-radius.hpp``), the numbers were
+recorded again, with the composed solver (xeon, ``OMP_NUM_THREADS`` 16 and 1: the same iterations, which no longer
+depend on the thread count); the rebuild decisions stayed BlockAMGSolver's. Per solve: the outer iterations, whether
+the preconditioner was rebuilt, the true-residual continuations, whether the tolerance was met, and ``||x||``.
 
 ``||x||`` is compared to 1e-8 for a solve to ``1e-8``; a solve to the forcing tolerance (eta about 1e-3) leaves an
-error that depends on AMGCL's threaded reductions, so its ``||x||`` is compared to 1e-4, and its true residual is
-checked against the tolerance instead. One outer iteration count (marked) depends on the thread count: 63 with 16
-threads, 64 with one."""
+error that depends on the order of threaded reductions, so its ``||x||`` is compared to 1e-4, and its true residual is
+checked against the tolerance instead."""
 
 import json
 
@@ -63,46 +64,46 @@ from edelweissfe.linsolve.composition import (  # noqa: E402
 )
 from edelweissfe.linsolve.composition.amg import droppedSmallEntries  # noqa: E402
 
-#: The numbers of BlockAMGSolver, per solve: (outer iterations, continuations, tolerance met, ||x||).
+#: The numbers of the composed solver, per solve: (outer iterations, continuations, tolerance met, ||x||).
 _TIGHT = {
-    "rigidBodyModesPerAggregate": [(13, 0, True, 418.5446467044291)],
-    "translations": [(39, 0, True, 418.5446466721881)],
-    "sweeps2": [(26, 0, True, 418.5446466695883)],
-    "symmetric": [(29, 0, True, 418.5446465899491)],
-    "sweeps2symmetric": [(19, 0, True, 418.5446466862166)],
-    "drop rigidBodyModesPerAggregate": [(25, 0, True, 418.54464674509273)],
-    "drop rigidBodyModesPerAggregate lumped": [(25, 0, True, 418.5446467835993)],
-    "drop translations": [(42, 0, True, 418.54464669479614)],
-    "drop translations lumped": [(41, 0, True, 418.54464665267045)],
+    "rigidBodyModesPerAggregate": [(13, 0, True, 418.5446467174296)],
+    "translations": [(40, 0, True, 418.54464670055614)],
+    "sweeps2": [(26, 0, True, 418.54464656671)],
+    "symmetric": [(29, 0, True, 418.54464666115393)],
+    "sweeps2symmetric": [(20, 0, True, 418.54464669228247)],
+    "drop rigidBodyModesPerAggregate": [(25, 0, True, 418.54464673746827)],
+    "drop rigidBodyModesPerAggregate lumped": [(25, 0, True, 418.54464678508566)],
+    "drop translations": [(42, 0, True, 418.5446466908262)],
+    "drop translations lumped": [(42, 0, True, 418.5446467190722)],
 }
 _SEQUENCE = {
     "rigidBodyModesPerAggregate": [
-        (8, 0, True, 418.5460793742515),
-        (50, 0, True, 41.3224365881195),
-        (16, 0, True, 5.624813634654173),
-        (8, 0, True, 4185.460793746807),
-        (8, 0, True, 418.5460795175808),
+        (8, 0, True, 418.54618977034244),
+        (50, 0, True, 41.32241300015936),
+        (16, 0, True, 5.624814130343251),
+        (8, 0, True, 4185.461897520253),
+        (8, 0, True, 418.54618990569605),
     ],
     "translations": [
-        (26, 0, True, 418.5395109747016),
-        (53, 0, True, 41.322848129873705),
-        (64, 0, True, 5.625257367997439),
-        (26, 0, True, 4185.395109746933),
-        (26, 0, True, 418.53951112875166),
+        (27, 0, True, 418.53900395601215),
+        (59, 0, True, 41.32246698054644),
+        (63, 0, True, 5.625213216680407),
+        (27, 0, True, 4185.3900395600285),
+        (27, 0, True, 418.5390041105333),
     ],
     "scaled": [
-        (36, 1, True, 418.5374924207296),
-        (83, 1, True, 41.321731206753476),
-        (83, 1, True, 5.624729652555343),
-        (36, 1, True, 4185.374924207208),
-        (36, 1, True, 418.5374925770052),
+        (37, 1, True, 418.5379846987327),
+        (84, 1, True, 41.32191911886246),
+        (84, 1, True, 5.624716436920195),
+        (37, 1, True, 4185.379846987914),
+        (37, 1, True, 418.53798485533997),
     ],
     "scaled gapCompensated": [
-        (31, 1, True, 418.53677415477324),
-        ((63, 64), 0, True, 41.322413324377614),  # 63 with 16 threads, 64 with one
-        (68, 0, True, 5.625298919575432),
-        (29, 0, True, 4185.4561870793505),
-        (29, 0, True, 418.545618863419),
+        (32, 1, True, 418.5349612388638),
+        (64, 0, True, 41.32222237338024),
+        (68, 0, True, 5.625266798471703),
+        (30, 0, True, 4185.440114330617),
+        (30, 0, True, 418.5440115888844),
     ],
 }
 #: Whether BlockAMGSolver rebuilt its preconditioner, per solve of the sequence (its dumps' ``mustRefresh``).
@@ -110,8 +111,8 @@ _REBUILT = {
     "rigidBodyModesPerAggregate": [True, False, True, True, True],
     "translations": [True, False, False, True, True],
 }
-#: BlockAMGSolver's learnt gap between the scaled and the true residual after the sequence.
-_GAP = {"scaled": 19.24, "scaled gapCompensated": 19.58}
+#: The learnt gap between the scaled and the true residual after the sequence.
+_GAP = {"scaled": 19.24, "scaled gapCompensated": 18.75}
 
 
 def _beamWithDamage(seed: int = 0, couplingStrength: float = 1e-2):
@@ -297,7 +298,7 @@ def test_no_continuations_on_the_scaled_system_has_blockamgs_numbers():
     composed = _composed(
         coordinates, fields, krylovOnScaledSystem=True, continuations=0, rigidBodyModesPerAggregate=False
     )
-    _assertSolve(composed, A, b, (19, 0, False, 418.3551421303781), tight=False)
+    _assertSolve(composed, A, b, (19, 0, False, 418.3153141552291), tight=False)
 
 
 # ----- the degradation dumps -----

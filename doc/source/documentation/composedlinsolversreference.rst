@@ -164,8 +164,8 @@ all of it before any part is built again, a ``SchurComplement`` drops :math:`\ti
 the next :math:`\tilde S`, the blocks of the last matrix before it cuts out those of this one, and a direct solve its
 factorization before it factorizes again; the adapter forgets the whole tree when the model changes (a new step, a
 change of the mesh). So the old and the new hierarchies, factorizations and matrices are never held at once. What is
-reused on purpose survives: the hierarchies while no rebuild is asked for, the selection of the condensed dofs, the
-fine spectral radius of ``fineSpectralRadiusReuse``, a symbolic factorization (PARDISO's
+reused on purpose survives: the hierarchies while no rebuild is asked for, the selection of the condensed dofs, a
+symbolic factorization (PARDISO's
 ``reuseSymbolicFactorization``), and what the Krylov solver has learnt (its reference iterations, the gap of a
 ``GapCompensation``, its scratch vectors).
 
@@ -244,8 +244,8 @@ micropolar model gets its translations.
 Default field trees
 -------------------
 
-``AMG(tree=...)`` and ``TwoLevel(..., tree=...)`` take a field's AMGCL parameter tree, forwarded to AMGCL verbatim. A
-tree given replaces the default outright, so start from the one that applies
+``AMG(tree=...)`` and ``TwoLevel(..., tree=...)`` take a field's AMGCL parameter tree, plus EdelweissFE's own key
+``spectralRadiusSteps`` (below). A tree given replaces the default outright, so start from the one that applies
 and change only what is intended. The defaults are, by the field's nodal dimension
 (:func:`~edelweissfe.linsolve.composition.amg.defaultFieldTree` in the code):
 
@@ -256,10 +256,9 @@ and change only what is intended. The defaults are, by the field's nodal dimensi
             "coarsening": {
                 "type": "smoothed_aggregation",
                 "aggr": {"eps_strong": 0.01},
-                "estimate_spectral_radius": true,
-                "power_iters": 20
+                "estimate_spectral_radius": true
             },
-            "relax": {"type": "chebyshev", "degree": 16, "power_iters": 300, "lower": 0.01, "higher": 1.1},
+            "relax": {"type": "chebyshev", "degree": 16, "lower": 0.01, "higher": 1.1},
             "npre": 0,
             "npost": 1
         },
@@ -267,10 +266,9 @@ and change only what is intended. The defaults are, by the field's nodal dimensi
             "coarsening": {
                 "type": "smoothed_aggregation",
                 "aggr": {"eps_strong": 0.01},
-                "estimate_spectral_radius": true,
-                "power_iters": 20
+                "estimate_spectral_radius": true
             },
-            "relax": {"type": "chebyshev", "degree": 16, "power_iters": 300, "lower": 0.01, "higher": 1.1},
+            "relax": {"type": "chebyshev", "degree": 16, "lower": 0.01, "higher": 1.1},
             "npre": 0,
             "npost": 1
         },
@@ -278,10 +276,9 @@ and change only what is intended. The defaults are, by the field's nodal dimensi
             "coarsening": {
                 "type": "smoothed_aggregation",
                 "aggr": {"eps_strong": 0.01},
-                "estimate_spectral_radius": true,
-                "power_iters": 20
+                "estimate_spectral_radius": true
             },
-            "relax": {"type": "chebyshev", "degree": 16, "power_iters": 300, "lower": 0.01, "higher": 1.1},
+            "relax": {"type": "chebyshev", "degree": 16, "lower": 0.01, "higher": 1.1},
             "npre": 0,
             "npost": 1
         },
@@ -306,10 +303,16 @@ The 3D displacement field of the ``blockAMG()`` preset gets the rigid-body coars
 fine smoother of the rigid-body coarse level, its ``coarsening`` the aggregation of that level, and the whole tree the
 AMGCL hierarchy below it. ``TwoLevel(coarseSpace=CornerNodeInterpolation())`` reads its fine smoother from the tree in the same
 spelling; its coarse solve is a component of its own, ``CornerNodeInterpolation(coarseSolve=...)`` (by default
-``DiagonalScaling(AMG())``), with its own tree. Only a genuinely scalar field (nodal dimension 1) gets the plain
-scalar tree, which predates the vector
-recipe and was never re-tuned against it. Note that AMGCL silently ignores parameter keys it does not recognise
-(warning only on stderr), so check its stderr if an override appears to do nothing.
+``DiagonalScaling(AMG())``), with its own tree. Only a genuinely scalar field (nodal dimension 1) gets the plain scalar
+tree, which predates the vector recipe and was never re-tuned against it. AMGCL warns on stderr about a parameter key
+it does not recognise and otherwise ignores it, so check its stderr if an override appears to do nothing; a Chebyshev
+``relax``, EdelweissFE's own, rejects such a key instead.
+
+Every spectral radius in these trees -- of the Chebyshev smoother (``relax``) and of the prolongation smoothing
+(``coarsening`` with ``estimate_spectral_radius``) -- is estimated by ``spectralRadiusSteps`` Arnoldi steps (default
+10) from a start vector seeded per row, the same at any thread count (:ref:`blockamg-chebyshev`). The key is
+EdelweissFE's own, read by its Chebyshev smoother and its smoothed aggregation; the trees leave the default. A tree
+that sets AMGCL's ``power_iters``, which the Arnoldi steps replace, is refused.
 
 .. _blockamg-rigid-body-coarse-level-configuration:
 
@@ -320,7 +323,7 @@ The ``blockAMG()`` preset (``type=blockamg``) gives the 3D displacement field th
 switches it off. A 2D displacement field, or a 3D one with other options, gets it in a ``custom`` solver script,
 ``OnField(name, TwoLevel(coarseSpace=RigidBodyModesPerAggregate(...), ...))``. The field must be on a block backend
 (``backendBlockSize`` 2 or 3, the default of a 2D or 3D field), and its tree must smooth with a Chebyshev polynomial
-(``relax.type`` ``chebyshev``, without ``relax.scale``, ``relax.power_iters`` at least 1) and coarsen by smoothed
+(``relax.type`` ``chebyshev``, without ``relax.scale``, ``relax.spectralRadiusSteps`` at least 1) and coarsen by smoothed
 aggregation, as the default trees do; ``TwoLevel`` checks this when it meets its field, and the parameters of
 ``RigidBodyModesPerAggregate`` at construction. The options of ``RigidBodyModesPerAggregate``:
 
@@ -332,21 +335,6 @@ aggregation, as the default trees do; ``TwoLevel`` checks this when it meets its
 ``coarseHierarchyPrecision`` (``"double"``)
     The value type of the AMGCL hierarchy below: ``"double"``, or ``"float"`` (AMGCL's single-precision backend, its
     setup included) for half its memory, at the price of more outer iterations.
-
-and that of ``TwoLevel`` (the same for the corner-node two-level cycle):
-
-``fineSpectralRadiusReuse`` (``false``)
-    Estimate the fine smoother's spectral radius in full only on a field's first build, and on every later rebuild
-    only re-check it, as for the corner-node two-level cycle: 15 power iterations continued from the
-    previous build's dominant vector, instead of the tree's ``relax.power_iters`` (300 in the default trees) from a
-    fixed start vector. The full estimate is the largest part of the setup, 7.6 of 10.7 s on the elastic tunnel
-    system. It is safe where the operator changes gradually between rebuilds, as over Newton iterations and
-    increments: a re-check estimate more than 1% above the previous radius replaces it, and one beyond the smoother's
-    10% margin (``relax.higher``) -- an operator that stiffened more than the margin covers -- triggers the full
-    estimate again, because a radius too small for the operator would make the smoother amplify its highest modes. An
-    operator that softened keeps the previous, larger radius, which costs the smoother some efficiency at the low end
-    of its window. The cache is dropped when the model changes (e.g. after adaptive refinement) and when a hot reload
-    replaces the tree.
 
 .. _composed-schur-complement-arguments:
 

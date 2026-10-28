@@ -59,21 +59,23 @@ from edelweissfe.linsolve.nullspace import (
 #: and the measurements behind them: "Why the defaults are what they are" in
 #: ``doc/source/documentation/fieldsplitmeasurements.rst``):
 #:
-#: - ``estimate_spectral_radius`` with 20 power iterations: a sharper weight of the prolongation smoother of smoothed
-#:   aggregation than the Gershgorin bound;
+#: - ``estimate_spectral_radius``: a sharper weight of the prolongation smoother of smoothed aggregation than the
+#:   Gershgorin bound;
 #: - Chebyshev of degree 16 after the coarse correction only (``npre`` 0, ``npost`` 1): for the same number of
-#:   preconditioner applications, one high-degree post-smoothing sweep beat a symmetric V(1,1) cycle of low degree;
-#: - its spectral radius from 300 power iterations: AMGCL's default (0) is the pessimistic Gershgorin bound, and a
-#:   power iteration starts from a vector seeded per OpenMP thread, so a short one leaves the bound dependent on the
-#:   thread count.
+#:   preconditioner applications, one high-degree post-smoothing sweep beat a symmetric V(1,1) cycle of low degree.
+#:
+#: Both spectral radii -- of the smoother and of the prolongation smoothing -- are estimated by ``spectralRadiusSteps``
+#: Arnoldi steps (default 10) from a start vector seeded per row, the same at any thread count
+#: (``edelweissfe/linsolve/amgcl/amgcl-spectral-radius.hpp``; "The spectral radius estimate of the Chebyshev smoother"
+#: in ``fieldsplitmeasurements.rst``); the trees leave the default. ``spectralRadiusSteps`` is EdelweissFE's own key,
+#: not AMGCL's.
 _VECTOR_FIELD_TREE = {
     "coarsening": {
         "type": "smoothed_aggregation",
         "aggr": {"eps_strong": 0.01},
         "estimate_spectral_radius": True,
-        "power_iters": 20,
     },
-    "relax": {"type": "chebyshev", "degree": 16, "power_iters": 300, "lower": 0.01, "higher": 1.1},
+    "relax": {"type": "chebyshev", "degree": 16, "lower": 0.01, "higher": 1.1},
     "npre": 0,
     "npost": 1,
 }
@@ -86,8 +88,10 @@ _SCALAR_FIELD_TREE = {
 def defaultFieldTree(dimension: int) -> dict:
     """The default AMGCL preconditioner tree of a field, from its nodal dimension: :data:`_VECTOR_FIELD_TREE` for a
     vector field, a Chebyshev-smoothed smoothed aggregation with AMGCL's defaults for a scalar field (e.g.
-    ``nonlocal damage``). A copy: the trees are nested, and a caller may adapt the one it gets. The backend the tree is
-    built on (block size, precision) is chosen apart from it, see :func:`backendOf`."""
+    ``nonlocal damage``), but the smoother's margin ``higher`` 1.1 above the estimated spectral radius, the default of
+    EdelweissFE's Chebyshev smoother (see ``amgcl-chebyshev.hpp``). A copy: the trees are nested, and a caller may adapt
+    the one it gets. The backend the tree is built on (block size, precision) is chosen apart from it, see
+    :func:`backendOf`."""
     return copy.deepcopy(_VECTOR_FIELD_TREE if dimension > 1 else _SCALAR_FIELD_TREE)
 
 
@@ -256,7 +260,7 @@ def buildFieldHierarchy(block, tree: dict, backend: tuple, scaling, coords, diag
     block
         The field's :class:`~edelweissfe.linsolve.base.FieldBlock`.
     tree
-        The field's AMGCL tree, forwarded verbatim.
+        The field's AMGCL tree, with EdelweissFE's own key ``spectralRadiusSteps`` (see :data:`_VECTOR_FIELD_TREE`).
     backend
         ``(backendBlockSize, backendPrecision, blockTranslationNullspace)``, see :func:`backendOf`.
     scaling
@@ -303,8 +307,8 @@ class AMG(Preconditioner):
     Parameters
     ----------
     tree
-        The AMGCL parameter tree, forwarded verbatim; ``None``: the default tree of the field's dimension
-        (:func:`defaultFieldTree`).
+        The AMGCL parameter tree, with EdelweissFE's own key ``spectralRadiusSteps`` (see
+        :data:`_VECTOR_FIELD_TREE`); ``None``: the default tree of the field's dimension (:func:`defaultFieldTree`).
     backendBlockSize, backendPrecision, blockTranslationNullspace
         The AMGCL backend: scalar entries (1) or node-wise blocks (2, 3), stored in ``"double"`` or ``"float"``, and
         on blocks whether smoothed aggregation starts from the field's translations; ``None``: the field's default,
