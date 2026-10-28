@@ -42,7 +42,7 @@ from edelweissfe.constraints.base.frozencontactsearch import (
     unpackPerPointArrays,
 )
 from edelweissfe.constraints.base.penaltylaw import (
-    normalPenaltyForce,
+    closedNormalPenaltyForce,
     validatedContactType,
 )
 from edelweissfe.journal.journal import Journal
@@ -159,6 +159,17 @@ class NodeToDeformableSurfacePenaltySchema:
         "tangent continuous for slave nodes lifting off/touching down -- with type=linear, the "
         "activation stiffness jump scaled by mu makes Newton prone to limit-cycling at such "
         "events.",
+        dtype=float,
+        default=0.0,
+    )
+    closureTolerance: float = schemaField(
+        description="Slave nodes whose gap is below this value are treated as closed: the contact starts at this gap"
+        " instead of at 0, so that surfaces which start out touching (gap 0) are closed from the first "
+        "iteration, as in Abaqus. The linear law is smoothed over the band (quadratic transition, force "
+        "and stiffness continuous, see closedNormalPenaltyForce), so a band wider than the gap changes "
+        "within an iteration also stops points at the border of the contact zone from switching the "
+        "tangent abruptly. Separated surfaces settle at gaps up to this value. The default 0 closes a "
+        "point only once it penetrates.",
         dtype=float,
         default=0.0,
     )
@@ -395,6 +406,7 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
                 "corrector operates in the frozen tangent frame of the small-sliding formulation."
             )
         self.tangentPenalty = configuration.tangentPenalty if configuration.tangentPenalty is not None else self.penalty
+        self.closureTolerance = configuration.closureTolerance
         if self.mu > 0.0 and self.tangentPenalty <= 0.0:
             raise ValueError(
                 "The tangential penalty must be positive when mu > 0: a non-positive tangentPenalty "
@@ -816,13 +828,13 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
 
             lambdaForce = self._lambdaN[s] if self.augmentedLagrange else 0.0
 
-            if g >= 0.0 and lambdaForce == 0.0:
+            if g >= self.closureTolerance and lambdaForce == 0.0:
                 activeIdx += 1
                 continue
 
             penaltyTimesArea = self.penalty * self.tributaryAreas[s]
 
-            if g >= 0.0:
+            if g >= self.closureTolerance:
                 # Open gap, but a not-yet-released multiplier from the last Uzawa update: apply
                 # its constant force only (no penalty part, no tangent contribution). The
                 # multiplier decays to zero within a few increments after separation.
@@ -831,7 +843,10 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
             else:
                 # f_n carries the sign of g (negative in contact), so that PExt -= f_n * w pushes
                 # the slave outward; see edelweissfe.constraints.base.penaltylaw.
-                penaltyForce, stiffness = normalPenaltyForce(self.type, penaltyTimesArea, g)
+                # a touching point (0 <= g < closureTolerance) is closed, see closedNormalPenaltyForce
+                penaltyForce, stiffness = closedNormalPenaltyForce(
+                    self.type, penaltyTimesArea, g, self.closureTolerance
+                )
                 f_n = lambdaForce + penaltyForce
 
             PLocal = -f_n * w
@@ -984,7 +999,9 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
                 if g >= 0.0:
                     penaltyForcePart = penaltyTimesArea * g
                 else:
-                    penaltyForcePart, _ = normalPenaltyForce(self.type, penaltyTimesArea, g)
+                    penaltyForcePart, _ = closedNormalPenaltyForce(
+                        self.type, penaltyTimesArea, g, self.closureTolerance
+                    )
 
                 self._lambdaN[s] = min(0.0, self._lambdaN[s] + penaltyForcePart)
 

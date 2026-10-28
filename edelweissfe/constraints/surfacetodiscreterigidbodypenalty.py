@@ -39,7 +39,7 @@ from edelweissfe.constraints.base.forcesonlyexplicitevaluation import (
 )
 from edelweissfe.constraints.base.frozencontactsearch import FrozenContactSearch
 from edelweissfe.constraints.base.penaltylaw import (
-    normalPenaltyForce,
+    closedNormalPenaltyForce,
     validatedContactType,
 )
 from edelweissfe.constraints.base.rigidbodycontactstiffness import (
@@ -229,6 +229,8 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         self.rpDofCount = 6
 
         self.penalty = configuration.penalty
+        if self.penalty is None:
+            raise ValueError("The penalty is required.")
         if self.penalty <= 0.0:
             raise ValueError("The penalty must be positive: a non-positive penalty silently disables contact.")
         self.type = validatedContactType(configuration.contactType)
@@ -239,6 +241,7 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
             )
         self.nQuadraturePoints = configuration.nQuadraturePoints
         self.searchDistance = configuration.searchDistance
+        self.closureTolerance = configuration.closureTolerance
 
         # Validates the rigid surface (closed, triangles only, no zero-area triangles) right away,
         # rather than at the first contact search.
@@ -503,12 +506,13 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         gaps = np.einsum("pj,pj->p", normals, leverArms) - self._frozenPlaneOffsets
         self._gapCurrent[:] = gaps
 
-        closed = gaps < 0.0
+        closed = gaps < self.closureTolerance
         if not closed.any():
             return
 
-        normalForces, dNormalForce_dGap = normalPenaltyForce(
-            self.type, self.penalty * self._integrationWeights[closed], gaps[closed]
+        # a touching point (0 <= g < closureTolerance) is closed, see closedNormalPenaltyForce
+        normalForces, dNormalForce_dGap = closedNormalPenaltyForce(
+            self.type, self.penalty * self._integrationWeights[closed], gaps[closed], self.closureTolerance
         )
         self._normalForceCurrent[closed] = normalForces
         self.totalNormalForce = float(normalForces.sum())

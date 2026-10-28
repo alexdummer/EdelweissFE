@@ -55,14 +55,15 @@ class SurfaceContactPenaltySchema:
         required=True,
     )
     penalty: float | None = schemaField(
-        description="The numerical penalty value, an interface stiffness modulus per unit slave " "surface area.",
+        description="The numerical penalty value, an interface stiffness modulus per unit slave surface area. "
+        "Required, except for type=tabular, where the table gives the pressures.",
         dtype=float,
         default=None,
-        required=True,
     )
     contactType: str = schemaField(
-        description="The formulation type: 'linear' (linear force, constant stiffness with jump) "
-        "or 'quadratic' (quadratic force, linear stiffness).",
+        description="The formulation type: 'linear' (linear force, constant stiffness with jump), "
+        "'quadratic' (quadratic force, linear stiffness) or, where supported, 'tabular' (a pressure-overclosure "
+        "table, see pressureOverclosureTable).",
         dtype=str,
         default="linear",
         optionName="type",
@@ -81,6 +82,17 @@ class SurfaceContactPenaltySchema:
         "without a distance gate.",
         dtype=float,
         default=None,
+    )
+    closureTolerance: float = schemaField(
+        description="Contact points whose gap is below this value are treated as closed: the contact starts at this "
+        "gap instead of at 0, so that surfaces which start out touching (gap 0) are closed from the "
+        "first iteration, as in Abaqus. The linear law is smoothed over the band (quadratic transition, "
+        "force and stiffness continuous, see closedNormalPenaltyForce), so a band wider than the gap "
+        "changes within an iteration also stops points at the border of the contact zone from switching "
+        "the tangent abruptly. Separated surfaces settle at gaps up to this value. The default 0 closes "
+        "a point only once it penetrates.",
+        dtype=float,
+        default=0.0,
     )
     sliding: str = schemaField(
         description="The kinematic treatment of the contact geometry. Only 'small' (Abaqus-style "

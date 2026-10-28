@@ -46,7 +46,8 @@ from edelweissfe.constraints.base.frozencontactsearch import (
     unpackPerPointArrays,
 )
 from edelweissfe.constraints.base.penaltylaw import (
-    normalPenaltyForce,
+    TabularPressureOverclosure,
+    closedNormalPenaltyForce,
     validatedContactType,
 )
 from edelweissfe.constraints.base.surfacecontactpenaltyschema import (
@@ -93,10 +94,9 @@ alone would achieve nothing: the flat facets' own linear shape functions are non
 distributing with those would leave the corners lifting off exactly as before. The parent-face
 basis (:mod:`~edelweissfe.utils.parentfacegeometry`) is the load-bearing half of the formulation.
 
-Scope of this implementation: normal penalty contact under ``sliding=small``, for both the implicit
-and the explicit solver path. Coulomb friction and augmented Lagrange are *not* implemented (the
-node-based constraint has both); the per-quadrature-point state they need is carried here so they
-can be added without restructuring. ``sliding=finite`` is rejected rather than approximated, see
+Scope of this implementation: normal penalty contact with optional Coulomb friction under
+``sliding=small``, for both the implicit and the explicit solver path. Augmented Lagrange is *not*
+implemented (the node-based constraint has it). ``sliding=finite`` is rejected rather than approximated, see
 :class:`Constraint`.
 
 What this formulation does *not* fix: pointwise enforcement at quadrature points still
@@ -160,6 +160,39 @@ class SurfaceToDeformableSurfacePenaltySchema(SurfaceContactPenaltySchema):
         default=None,
         required=True,
     )
+    pressureOverclosureTable: str | None = schemaField(
+        description="For type=tabular: a text file with the pressure-overclosure table, one 'pressure, overclosure' "
+        "pair per line (the order of Abaqus' *Surface Behavior, pressure-overclosure=TABULAR), starting at (0, 0). "
+        "The pressure is interpolated linearly and extrapolated with the last slope; see "
+        "edelweissfe.constraints.base.penaltylaw.TabularPressureOverclosure.",
+        dtype=str,
+        default=None,
+    )
+    mu: float = schemaField(
+        description="The Coulomb friction coefficient; mu=0 disables friction. The frictional history is "
+        "carried per contact (quadrature) point, so it is discarded if either surface is refined by AMR.",
+        dtype=float,
+        default=0.0,
+    )
+    tangentPenalty: float | None = schemaField(
+        description="The tangential penalty stiffness per unit slave surface area for frictional stick. "
+        "Defaults to the normal penalty.",
+        dtype=float,
+        default=None,
+    )
+    elasticSlip: float | None = schemaField(
+        description="The elastic slip at the onset of slip, as Abaqus' penalty friction: the tangential stick "
+        "stiffness of a contact point is mu * |f_n| / elasticSlip, i.e. proportional to its normal force, instead of "
+        "tangentPenalty times its area. Keeps the stick/slip transition proportionate where the contact pressure is "
+        "small. Abaqus' default is 0.5 % of the characteristic contact facet length.",
+        dtype=float,
+        default=None,
+    )
+
+
+# The largest change of a contact point's frozen normal between two increments over which its frictional
+# history is still rotated into the new tangent plane, as in the node-based constraint.
+_cosOfSmoothNormalChangeLimit = np.cos(np.deg2rad(30.0))
 
 
 class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBase, MeshDependent):
@@ -209,10 +242,20 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
     Like the node-based constraint, this is a
     :class:`~edelweissfe.models.meshdependent.MeshDependent`: if either surface's source solid
     elements are refined mid-run, it rebuilds that side from the regenerated facets at its own next
-    :meth:`updateConnectivity` tick. Since no frictional or multiplier history exists yet, the
-    rebuild is unconditional and carries nothing across -- the point at which friction is added is
-    the point at which that becomes a real problem, because quadrature points, unlike nodes, have no
-    identity that survives a retiling.
+    :meth:`updateConnectivity` tick. The rebuild is unconditional and carries nothing
+    across; with friction, the frictional history is lost in it, because quadrature points, unlike
+    nodes, have no identity that survives a retiling.
+
+    Coulomb friction (``mu > 0``) is the node-based constraint's elastic-predictor/radial-return
+    scheme, evaluated per quadrature point: with the incremental relative displacement
+    :math:`\\Delta u_{\\text{rel}} = N^s \\cdot \\Delta u^s - N^m \\cdot \\Delta u^m` and the tangent
+    projector :math:`P = I - \\bar{n} \\otimes \\bar{n}`, the stick predictor is
+    :math:`f_T^{\\text{tr}} = f_T^{\\text{conv}} - k_T J_q P \\Delta u_{\\text{rel}}`, capped at
+    :math:`\\mu |f_n|` on the friction cone. The tangential force is distributed with the same
+    parent-face shape functions as the normal force, ``kron(c, f_T)``, so a corner node can take a
+    frictional force of either sign as well. The tangent is symmetric in stick and nonsymmetric on
+    slip (normal-tangential coupling). The history is promoted on increment acceptance and rotated
+    into the new tangent plane at each contact search (or discarded beyond a 30 degree normal change).
 
     Parameters
     ----------
@@ -260,11 +303,25 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         self._slaveSurfaceSetName = slaveSurface.name
         self._masterSurfaceSetName = masterSurface.name
 
-        self.penalty = configuration.penalty
-        if self.penalty <= 0.0:
-            raise ValueError("The penalty must be positive: a non-positive penalty silently disables contact.")
+        self.type = validatedContactType(configuration.contactType, allowTabular=True)
 
-        self.type = validatedContactType(configuration.contactType)
+        self.table = None
+        if self.type == "tabular":
+            if configuration.pressureOverclosureTable is None:
+                raise ValueError("type=tabular requires a pressureOverclosureTable.")
+            if configuration.penalty is not None:
+                raise ValueError("type=tabular takes its pressures from the table; do not give a penalty.")
+            self.table = TabularPressureOverclosure.fromFile(configuration.pressureOverclosureTable)
+            # the force laws multiply the pressure of the table by the area alone
+            self.penalty = 1.0
+        else:
+            if configuration.pressureOverclosureTable is not None:
+                raise ValueError("A pressureOverclosureTable requires type=tabular.")
+            self.penalty = configuration.penalty
+            if self.penalty is None:
+                raise ValueError("The penalty is required unless type=tabular.")
+            if self.penalty <= 0.0:
+                raise ValueError("The penalty must be positive: a non-positive penalty silently disables contact.")
 
         self.sliding = configuration.sliding.lower()
         if self.sliding != "small":
@@ -277,6 +334,30 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
 
         self.nQuadraturePoints = configuration.nQuadraturePoints
         self.searchDistance = configuration.searchDistance
+        self.closureTolerance = configuration.closureTolerance
+        if self.table is not None and 0.5 * self.closureTolerance > self.table.firstSegmentLength:
+            raise ValueError(
+                "closureTolerance / 2 must not exceed the first segment of the pressure-overclosure table "
+                f"({self.table.firstSegmentLength:g}), or the closure band is discontinuous."
+            )
+
+        self.mu = configuration.mu
+        if self.mu < 0.0:
+            raise ValueError("The friction coefficient mu must be non-negative.")
+        if self.mu > 0.0 and self.table is not None and configuration.tangentPenalty is None:
+            if configuration.elasticSlip is None:
+                raise ValueError("Friction with type=tabular needs a tangentPenalty or an elasticSlip.")
+        self.tangentPenalty = configuration.tangentPenalty if configuration.tangentPenalty is not None else self.penalty
+        self.elasticSlip = configuration.elasticSlip
+        if self.elasticSlip is not None and configuration.tangentPenalty is not None:
+            raise ValueError("Give either tangentPenalty or elasticSlip, not both.")
+        if self.elasticSlip is not None and self.elasticSlip <= 0.0:
+            raise ValueError("elasticSlip must be positive.")
+        if self.mu > 0.0 and self.tangentPenalty <= 0.0:
+            raise ValueError(
+                "The tangential penalty must be positive when mu > 0: a non-positive tangentPenalty "
+                "silently disables the frictional stick response."
+            )
 
         self._buildFromSurfaces(slaveSurface, masterSurface)
 
@@ -285,7 +366,8 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         self.journal.message(
             f"contact '{self.name}': {self.nPoints} points ({len(self.slave.facets)} slave facets x "
             f"{self.nQuadraturePoints} quadrature points), {len(self.facetElements)} master facets, "
-            f"sliding={self.sliding}, type={self.type}",
+            f"sliding={self.sliding}, type={self.type}, "
+            f"friction={'mu=' + str(self.mu) if self.mu > 0.0 else 'off'}",
             self.identification,
         )
 
@@ -334,6 +416,11 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         # scratch value an augmented-Lagrange update would consume once implemented.
         self._normalForceCurrent = np.zeros(self.nPoints)
         self._gapCurrent = np.zeros(self.nPoints)
+
+        # Frictional history: the tangential force exerted on each contact point's slave side, at the
+        # last converged increment (Current is the last Newton iterate, promoted by acceptLastState).
+        self._tangentialForceConverged = np.zeros((self.nPoints, self.nDim))
+        self._tangentialForceCurrent = np.zeros((self.nPoints, self.nDim))
 
         self._nodes = []
         self._fieldsOnNodes = []
@@ -425,10 +512,19 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
                 if normal is None:
                     normal, _ = facetNormalAndMeasure(facetCoords[bestFacet])
                     facetNormals[bestFacet] = normal
+                previousNormal = self._frozenNormals[p]
                 self._frozenNormals[p] = normal
+                # Rotate the frictional history into the new frozen tangent plane, or discard it when
+                # the point slid over a crease (see the node-based constraint for the reasoning).
+                if previousNormal is None or previousNormal.dot(normal) >= _cosOfSmoothNormalChangeLimit:
+                    t = self._tangentialForceConverged[p]
+                    self._tangentialForceConverged[p] = t - normal * normal.dot(t)
+                else:
+                    self._tangentialForceConverged[p] = 0.0
             else:
                 self._frozenMasterShapeFunctions[p] = None
                 self._frozenNormals[p] = None
+                self._tangentialForceConverged[p] = 0.0
 
         return self._assignMasterFacets(newAssignment)
 
@@ -464,8 +560,8 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         # A point that lost its facet has no gap any more, so its last value must not survive: it
         # backs the public getGaps(), whose consumers cannot mask it because they do not know the
         # assignment, and it would otherwise keep counting as 'closed' below forever. Zero is the
-        # neutral value this array is initialized with. Resetting here is what makes the closed
-        # count correct by construction, so it deliberately needs no mask of its own.
+        # neutral value this array is initialized with. With a positive closureTolerance zero counts
+        # as closed, so the closed count below is masked by the assignment as well.
         for p in range(self.nPoints):
             if newAssignment[p] is None:
                 self._gapCurrent[p] = 0.0
@@ -477,7 +573,8 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         # assignment on the same line. Emitted only when it changes -- an explicit run updates
         # connectivity thousands of times and an unchanging pair of numbers is pure log noise.
         nAssigned = sum(1 for facetIdx in newAssignment if facetIdx is not None)
-        activity = (nAssigned, int((self._gapCurrent < 0.0).sum()))
+        assigned = np.array([facetIdx is not None for facetIdx in newAssignment], dtype=bool)
+        activity = (nAssigned, int((assigned & (self._gapCurrent < self.closureTolerance)).sum()))
         if activity != self._lastReportedActivity:
             self._lastReportedActivity = activity
             self.journal.message(
@@ -608,7 +705,7 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
             "blockDof": blockDof,
         }
 
-    def _applyConstraintBatched(self, U_np: np.ndarray, PExt: np.ndarray, K) -> None:
+    def _applyConstraintBatched(self, U_np: np.ndarray, dU: np.ndarray, PExt: np.ndarray, K) -> None:
         """The batched force evaluation. Physics identical to the per-point loop, expressed over all
         active points at once; see :meth:`_prepareActiveArrays`."""
 
@@ -627,14 +724,15 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
 
         self._gapCurrent[active] = gaps
 
-        closed = gaps < 0.0
+        closed = gaps < self.closureTolerance
         if not closed.any():
             return
 
+        # a touching point (0 <= g < closureTolerance) is closed, see closedNormalPenaltyForce
         g = gaps[closed]
         penaltyTimesArea = self.penalty * b["weights"][closed]
 
-        f_n, stiffness = normalPenaltyForce(self.type, penaltyTimesArea, g)
+        f_n, stiffness = closedNormalPenaltyForce(self.type, penaltyTimesArea, g, self.closureTolerance, self.table)
 
         # w = kron([Ns, -Nm], nBar), per point
         c = np.concatenate((b["Ns"][closed], -b["Nm"][closed]), axis=1)
@@ -646,12 +744,149 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         self._normalForceCurrent[active[closed]] = f_n
         self.totalNormalForce = float(f_n.sum())
 
+        KFriction = None
+        if self.mu > 0.0:
+            dBlocks = dU.reshape((-1, b["blockDof"]))[rows]
+            dS = dBlocks[:, : b["nSlaveDof"]].reshape((-1, b["nSlaveNodes"], nDim))
+            dM = dBlocks[:, b["nSlaveDof"] :].reshape((-1, b["nMasterNodes"], nDim))
+            dURelative = np.einsum("ai,aij->aj", b["Ns"][closed], dS) - np.einsum("ai,aij->aj", b["Nm"][closed], dM)
+            PFriction, KFriction = self._coulombFriction(
+                active[closed], c, b["nBar"][closed], w, f_n, stiffness, dURelative, b["weights"][closed], K is not None
+            )
+            PExt.reshape((-1, b["blockDof"]))[rows] += PFriction
+
         if K is not None:
             # The tangent is only ever requested by the implicit path, so it stays a loop: one
             # (nSlave+nMaster)*nDim square block per point, written into the view's own per-active
             # -point slots, which the batched form has no way to address in bulk.
             for i, activeIdx in enumerate(rows):
                 K.blocks[activeIdx] += stiffness[i] * np.outer(w[i], w[i])
+                if KFriction is not None:
+                    K.blocks[activeIdx] += KFriction[i]
+
+    def _coulombFriction(
+        self,
+        points: np.ndarray,
+        c: np.ndarray,
+        nBar: np.ndarray,
+        w: np.ndarray,
+        f_n: np.ndarray,
+        stiffness: np.ndarray,
+        dURelative: np.ndarray,
+        weights: np.ndarray,
+        computeTangent: bool,
+    ) -> tuple[np.ndarray, list | None]:
+        """Coulomb friction of closed contact points in the frozen small-sliding frame: elastic (stick)
+        predictor from the converged tangential force and the incremental tangential relative
+        displacement, radial return onto the friction cone ``|f_T| <= mu * |f_n|`` on slip. The
+        algebra is the node-based constraint's, with its slave coefficient ``1`` replaced by the slave
+        face's shape functions (``c = [N^s, -N^m]``).
+
+        Parameters
+        ----------
+        points
+            The indices of the closed contact points.
+        c
+            Per point, the shape function vector ``[N^s, -N^m]``.
+        nBar
+            Per point, the frozen unit normal.
+        w
+            Per point, the gap gradient ``kron(c, nBar)``.
+        f_n
+            Per point, the normal force (negative in contact).
+        stiffness
+            Per point, ``df_n/dg``.
+        dURelative
+            Per point, the incremental relative displacement of slave and master point.
+        weights
+            Per point, the integration weight.
+        computeTangent
+            Whether to return the tangent contributions.
+
+        Returns
+        -------
+        tuple[numpy.ndarray, list | None]
+            The external force contributions (one row per point, local block layout) and, if
+            requested, the stiffness contributions ``K = -dPExt_dU`` per point (nonsymmetric on slip).
+        """
+
+        nDim = self.nDim
+        if self.elasticSlip is None:
+            kTangent = self.tangentPenalty * weights
+        else:
+            # pressure dependent stick stiffness, dkTangent_dU = -(mu / elasticSlip) * stiffness * w
+            kTangent = -self.mu * f_n / self.elasticSlip
+
+        dUTangential = dURelative - nBar * np.einsum("aj,aj->a", nBar, dURelative)[:, None]
+        stickForce = self._tangentialForceConverged[points] - kTangent[:, None] * dUTangential
+        stickForceMagnitude = np.linalg.norm(stickForce, axis=1)
+        slipLimit = -self.mu * f_n
+        stick = stickForceMagnitude <= slipLimit
+
+        slipDirection = np.divide(
+            stickForce, stickForceMagnitude[:, None], out=np.zeros_like(stickForce), where=~stick[:, None]
+        )
+        tangentialForce = np.where(stick[:, None], stickForce, slipLimit[:, None] * slipDirection)
+        self._tangentialForceCurrent[points] = tangentialForce
+
+        PFriction = (c[:, :, None] * tangentialForce[:, None, :]).reshape((len(points), -1))
+
+        if not computeTangent:
+            return PFriction, None
+
+        KFriction = []
+        identity = np.eye(nDim)
+        for i in range(len(points)):
+            projectorOntoTangentPlane = identity - np.outer(nBar[i], nBar[i])
+            cc = np.outer(c[i], c[i])
+            if self.elasticSlip is None:
+                # d(stickForce)_dU = -kTangent * P G
+                dStickForce_dU_extra = None
+            else:
+                # ... plus -dUTangential x dkTangent_dU
+                dStickForce_dU_extra = (self.mu / self.elasticSlip * stiffness[i]) * np.outer(dUTangential[i], w[i])
+            if stick[i]:
+                KF = np.kron(cc, kTangent[i] * projectorOntoTangentPlane)
+                if dStickForce_dU_extra is not None:
+                    KF -= np.kron(c[i][:, None], dStickForce_dU_extra)
+                KFriction.append(KF)
+            else:
+                # dfT_dU = slipDirection * mu * dN_dU + slipLimit * dSlipDirection_dU with dN_dU = -stiffness * w;
+                # the first term makes the tangent nonsymmetric (normal-tangential coupling).
+                d = slipDirection[i]
+                KF = self.mu * stiffness[i] * np.outer(np.kron(c[i], d), w[i])
+                KF += np.kron(
+                    cc,
+                    (slipLimit[i] * kTangent[i] / stickForceMagnitude[i])
+                    * ((identity - np.outer(d, d)) @ projectorOntoTangentPlane),
+                )
+                if dStickForce_dU_extra is not None:
+                    KF -= np.kron(
+                        c[i][:, None],
+                        (slipLimit[i] / stickForceMagnitude[i]) * (identity - np.outer(d, d)) @ dStickForce_dU_extra,
+                    )
+                KFriction.append(KF)
+
+        return PFriction, KFriction
+
+    def acceptLastState(self):
+        """Promote the tangential forces of the last (converged) Newton iterate to the frictional
+        history. Called by :meth:`~edelweissfe.models.femodel.FEModel.advanceToTime` upon increment
+        acceptance."""
+
+        self._tangentialForceConverged[:] = self._tangentialForceCurrent
+
+    def getRestartData(self) -> dict[str, np.ndarray]:
+        """Return the frozen projection and the frictional history. Overridden rather than declared:
+        the frozen projection is packed by :class:`FrozenContactSearch`."""
+
+        return super().getRestartData() | {"tangentialForceConverged": self._tangentialForceConverged}
+
+    def setRestartData(self, data: dict[str, np.ndarray]):
+        """Restore the frozen projection and the frictional history."""
+
+        super().setRestartData(data)
+        self._tangentialForceConverged[:] = data["tangentialForceConverged"]
 
     def _activeBlockSizes(self) -> list[int]:
         """The DOF count of each assigned contact point's dense block, in assembly order.
@@ -711,9 +946,10 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
 
         self.totalNormalForce = 0.0
         self._normalForceCurrent[:] = 0.0
+        self._tangentialForceCurrent[:] = 0.0
 
         if self._batched is not None:
-            self._applyConstraintBatched(U_np, PExt, K)
+            self._applyConstraintBatched(U_np, dU, PExt, K)
             return
 
         localOffset = 0
@@ -745,7 +981,7 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
             g = nBar.dot(slaveShapeFunctions @ slaveCoords - masterShapeFunctions @ masterCoords)
             self._gapCurrent[p] = g
 
-            if g >= 0.0:
+            if g >= self.closureTolerance:
                 activeIdx += 1
                 continue
 
@@ -763,14 +999,34 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
             # pushes the surfaces apart, and stiffness = df_n/dg is positive for g < 0.
             penaltyTimesArea = self.penalty * self.slave.integrationWeights[f][self.slave.pointQuadraturePoint[p]]
 
-            f_n, stiffness = normalPenaltyForce(self.type, penaltyTimesArea, g)
+            f_n, stiffness = closedNormalPenaltyForce(self.type, penaltyTimesArea, g, self.closureTolerance, self.table)
 
             globalIdcs = slaveIdcs + masterIdcs
             PExt[globalIdcs] += -f_n * w
 
+            KFriction = None
+            if self.mu > 0.0:
+                dURelative = slaveShapeFunctions @ dU[slaveIdcs].reshape((-1, self.nDim)) - masterShapeFunctions @ dU[
+                    masterIdcs
+                ].reshape((-1, self.nDim))
+                PFriction, KFriction = self._coulombFriction(
+                    np.array([p]),
+                    c[None, :],
+                    nBar[None, :],
+                    w[None, :],
+                    np.array([f_n]),
+                    np.array([stiffness]),
+                    dURelative[None, :],
+                    np.array([penaltyTimesArea / self.penalty]),
+                    K is not None,
+                )
+                PExt[globalIdcs] += PFriction[0]
+
             # K is None in explicit runs -- see ForcesOnlyExplicitEvaluation.
             if K is not None:
                 K.blocks[activeIdx] += stiffness * np.outer(w, w)
+                if KFriction is not None:
+                    K.blocks[activeIdx] += KFriction[0]
 
             self._normalForceCurrent[p] = f_n
             self.totalNormalForce += f_n
@@ -786,6 +1042,12 @@ class Constraint(FrozenContactSearch, ForcesOnlyExplicitEvaluation, ConstraintBa
         """
 
         return self.slave.normalPressures(self._normalForceCurrent)
+
+    def getTangentialTractions(self) -> np.ndarray:
+        """The current tangential (frictional) traction magnitude at each contact point, ordered like
+        :meth:`getNormalPressures`."""
+
+        return self.slave.normalPressures(-np.linalg.norm(self._tangentialForceCurrent, axis=1))
 
     def getGaps(self) -> np.ndarray:
         """The current gap at each contact point (negative when penetrating), ordered like
