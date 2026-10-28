@@ -64,7 +64,7 @@ Displacement block alone, on captured systems of the damage cylinder: AMGCL's co
 :math:`D^{-1} t`.
 
 Full system, offline, on the captured sequences and on isolated systems of both reference models, the
-configuration with and without ``blockTranslationNullspace``, outer iterations only: clearly
+configuration with and without the translations as near-null-space (``nearNullspace``), outer iterations only: clearly
 fewer on the damage cylinder, both in its onset sequence and on its isolated systems; on the contact
 model about the same in its sequence, whose hierarchies were rebuilt more often, and fewer on its
 isolated systems. A control with unit weights needed exactly the iterations of AMGCL's identity blocks,
@@ -107,7 +107,7 @@ See :ref:`blockamg-gap-compensation`.
 
 Gap compensation is a live option only on the scaled system. Per increment it
 is a clear win there: on a live window of a reference model it substantially cut both the number of
-continuations and the outer iterations needed, with no cutbacks or material return-mapping
+true-residual restarts and the outer iterations needed, with no cutbacks or material return-mapping
 failures. But the scaled system, left uncompensated, happens
 to over-solve every system by a large factor, and the Newton iteration quietly relies on that:
 converging merely inside the requested tolerance costs Newton extra iterations per
@@ -231,8 +231,8 @@ Rebuilding the preconditioner for every solve
 See :ref:`blockamg-per-field-amg` and the reuse rules on :doc:`blockamgtheory`.
 
 Live, on the contact anchor model with many multi-point-constraint slaves, over a window of increments: two runs
-from the same checkpoint, the reuse rules of ``RebuildPolicy`` against ``reuse=False``, a new preconditioner for every
-solve. The two runs took slightly different paths (other hierarchies, other linear solutions
+from the same checkpoint, the reuse rules of ``RebuildPolicy`` against ``reusePreconditioner=False``, a new
+preconditioner for every solve. The two runs took slightly different paths (other hierarchies, other linear solutions
 within the tolerance), with about the same Newton iterations and simulated time reached.
 
 A new preconditioner for every solve was faster over the window. A reused preconditioner needed several times the
@@ -272,11 +272,11 @@ fine level and the rigid-body coarse level of its coarse solve), the others on e
 On all systems, the default ``TwoLevel(coarseSpace=CornerNodeInterpolation())`` (degree 8 on 0.03 to 1.1) against the
 former default written out,
 ``TwoLevel(coarseSpace=CornerNodeInterpolation(DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate(),
-tree=t))), tree=t)`` with ``t = defaultFieldTree(3)``, needed more outer iterations on every system, but fewer than
-twice as many, at half the matrix products per smoothing sweep: it was faster or as fast on every system, most on the
-tunnel lining and the damage cylinder; the edge breakout, whose time is mostly the setup, ties. The iterations of
-``AMG()`` and of ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` with their defaults are unchanged by this
-default.
+amgclTree=t))), amgclTree=t)`` with ``t = defaultFieldTree(3)``, needed more outer iterations on every system, but
+fewer than twice as many, at half the matrix products per smoothing sweep: it was faster or as fast on every system,
+most on the tunnel lining and the damage cylinder; the edge breakout, whose time is mostly the setup, ties. The
+iterations of ``AMG()`` and of ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` with their defaults are unchanged
+by this default.
 
 Not yet measured live: with Newton in the loop, and with the hierarchies reused over several solves.
 
@@ -298,7 +298,7 @@ contact anchor model with many multi-point-constraint slaves):
   for its prolongation smoother (``estimate_spectral_radius``, 20 power iterations) cut outer
   iterations for the same number of preconditioner applications.
 * **The translations of the equilibrated block** as a block hierarchy's near-null-space
-  (``blockTranslationNullspace``), instead of AMGCL's identity blocks, which are :math:`D`-weighted
+  (``nearNullspace``, the default on a block backend), instead of AMGCL's identity blocks, which are :math:`D`-weighted
   translations (see :ref:`the near-null-space of a block backend <blockamg-block-nullspace>`). Measured
   later than the rest, live on more models than these two, with and without them: fewer outer iterations
   and fewer solves stopping at the iteration cap on most models, with the same physical results. The
@@ -314,22 +314,23 @@ contact anchor model with many multi-point-constraint slaves):
 * ``LGMRES(restart=50)`` matches the outer-iteration cap (``maxIterations = 100``), so
   LGMRES restarts at most once within it; ``augmentationVectors`` only allocates its augmentation vectors without
   ever exhausting them before the cap.
-* ``RebuildPolicy(stalenessFactor=3)``, where hierarchies are reused (``reuse=True``; since
+* ``RebuildPolicy(stalenessFactor=3)``, where hierarchies are reused (``reusePreconditioner=True``; since
   :ref:`measured-rebuild-every-solve` not the default), reuses them longer than the former factor of 1.5, which fired on
   noise at small iteration counts; with the cap of 100 it can fire only while the solve the
   hierarchies were built for took fewer than about 34 iterations -- beyond that, only a cap hit (or a
   new increment, a pattern change) rebuilds them.
-* ``ForcingTolerance(maximum=1e-3)`` is not about the linear solver at all: through a damage onset, Newton needs
+* ``EisenstatWalkerTolerance(maximum=1e-3)`` is not about the linear solver at all: through a damage onset, Newton needs
   linear solves about ten times tighter than the Eisenstat--Walker forcing allowed at a maximum of 1e-2.
   ``minimum = 1e-4`` was measured against ``1e-3``: the looser value cost Newton extra
   iterations already before the damage onset, and more wall-clock to match.
 * ``krylovOnScaledSystem = false`` converges the true residual directly, so the gap compensation and
-  the continuations of the scaled system have nothing to do and are left at their own, otherwise
+  the true-residual restarts of the scaled system have nothing to do and are left at their own, otherwise
   inert, defaults.
 * ``pruneCondensedMatrixZeros`` (a nonlinear-solver option, not a component's) now defaults to
   "off for a solver that needs the pattern stable", and a solver whose Krylov solve reuses its preconditioner reports
-  exactly that -- so on a model with multi-point constraints the hierarchies can be reused (``reuse=True``) without
-  more settings; the former setup needed this set by hand (see the reuse rules on :doc:`blockamgtheory`).
+  exactly that -- so on a model with multi-point constraints the hierarchies can be reused
+  (``reusePreconditioner=True``) without more settings; the former setup needed this set by hand (see the reuse rules
+  on :doc:`blockamgtheory`).
 
 Measured live, from the same checkpoints, the defaults against the former defaults (no per-model settings in
 either run): the contact model's increments finished markedly faster; on the damage cylinder, the

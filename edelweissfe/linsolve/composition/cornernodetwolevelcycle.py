@@ -164,8 +164,8 @@ class CornerNodeTwoLevelCycle(TwoLevelCycle):
         -------
         sp.csr_matrix
             :math:`A_c = P^T \\hat A P` on all dofs of the :attr:`coarseNodes`, in node order and then by component,
-            with an identity row for each Dirichlet coarse dof; 0 x 0 for a field without a free dof (the cycle is then the
-            exact diagonal inverse and needs no coarse solve).
+            with an identity row for each Dirichlet coarse dof; 0 x 0 for a field without a free dof (the cycle is then
+            the exact diagonal inverse and needs no coarse solve).
         """
         A = A.tocsr()
         n = A.shape[0]

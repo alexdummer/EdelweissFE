@@ -41,8 +41,8 @@ from edelweissfe.linsolve.composition.combinators import (
 from edelweissfe.linsolve.composition.diagonalscaling import DiagonalScaling
 from edelweissfe.linsolve.composition.krylov import (
     LGMRES,
-    GapCompensation,
     RebuildPolicy,
+    ResidualGapCompensation,
 )
 from edelweissfe.linsolve.composition.twolevel import (
     CornerNodeInterpolation,
@@ -59,7 +59,7 @@ def blockAMGFieldPreconditioner(
     cornerNodeInterpolation: bool = True,
     dropTolerance: float = 0.0,
     lumpDroppedEntries: bool = False,
-    tree: dict = None,
+    amgclTree: dict = None,
 ):
     """The preconditioner of a field in the ``blockamg`` preset:
 
@@ -71,50 +71,51 @@ def blockAMGFieldPreconditioner(
       ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` (:func:`linearDisplacementFieldPreconditioner`);
     - any other field: one AMG hierarchy, ``AMG()``.
 
-    ``tree`` is the field's AMGCL tree (``None``: the component's default); ``dropTolerance`` and ``lumpDroppedEntries``
-    reach every level. A field is quadratic if it has midside nodes
+    ``amgclTree`` is the field's AMGCL tree (``None``: the component's default); ``dropTolerance`` and
+    ``lumpDroppedEntries`` reach every level. A field is quadratic if it has midside nodes
     (:meth:`~edelweissfe.linsolve.composition.base.SetUpContext.midsideCorners`); a field on elements whose topology the
     corner-node interpolation does not know (e.g. Tet10) has none, and gets the rigid-body cycle."""
     isDisplacement3D = field.dimension == 3 and carriesRigidBodyModes(field)
     filtering = dict(dropTolerance=dropTolerance, lumpDroppedEntries=lumpDroppedEntries)
     if not isDisplacement3D or not (rigidBodyModesPerAggregate or cornerNodeInterpolation):
-        return AMG(tree=tree, **filtering)
+        return AMG(amgclTree=amgclTree, **filtering)
     if context.coordinates(field.name) is None:
         context.message(
             "info",
-            "blockAMG: the field '{:}' has no node coordinates (no model, and no nodeCoordinates given): it gets AMG() on "
-            "the translations instead of a two-level cycle".format(field.name),
+            "blockAMG: the field '{:}' has no node coordinates (no model, and no nodeCoordinates given): it gets "
+            "AMG() on the translations instead of a two-level cycle".format(field.name),
         )
-        return AMG(tree=tree, **filtering)
+        return AMG(amgclTree=amgclTree, **filtering)
     midsideCorners = context.midsideCorners(field.name)
     isQuadratic = midsideCorners is not None and not midsideCorners[0].all()
     if cornerNodeInterpolation and isQuadratic:
         coarseSolve = DiagonalScaling(
             linearDisplacementFieldPreconditioner(
-                rigidBodyModesPerAggregate, twoLevelTree=defaultCornerNodeTwoLevelTree(), **filtering
+                rigidBodyModesPerAggregate, amgclTreeOfTwoLevel=defaultCornerNodeTwoLevelTree(), **filtering
             )
         )
-        return TwoLevel(coarseSpace=CornerNodeInterpolation(coarseSolve=coarseSolve), tree=tree, **filtering)
+        return TwoLevel(coarseSpace=CornerNodeInterpolation(coarseSolve=coarseSolve), amgclTree=amgclTree, **filtering)
     return linearDisplacementFieldPreconditioner(
-        rigidBodyModesPerAggregate, twoLevelTree=tree, amgTree=tree, **filtering
+        rigidBodyModesPerAggregate, amgclTreeOfTwoLevel=amgclTree, amgclTreeOfAMG=amgclTree, **filtering
     )
 
 
 def linearDisplacementFieldPreconditioner(
     rigidBodyModesPerAggregate: bool,
-    twoLevelTree: dict = None,
-    amgTree: dict = None,
+    amgclTreeOfTwoLevel: dict = None,
+    amgclTreeOfAMG: dict = None,
     dropTolerance: float = 0.0,
     lumpDroppedEntries: bool = False,
 ):
     """The preconditioner of a linear 3D displacement field in the ``blockamg`` preset, a field of its own or the coarse
     field of the corner-node interpolation: the two-level cycle on its rigid-body modes,
-    ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate(), tree=twoLevelTree)``, or with ``rigidBodyModesPerAggregate``
-    false one AMG hierarchy on the translations, ``AMG(tree=amgTree)``. Each tree ``None``: the component's default."""
+    ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate(), amgclTree=amgclTreeOfTwoLevel)``, or with
+    ``rigidBodyModesPerAggregate`` false one AMG hierarchy on the translations, ``AMG(amgclTree=amgclTreeOfAMG)``. Each
+    tree ``None``: the component's default."""
     filtering = dict(dropTolerance=dropTolerance, lumpDroppedEntries=lumpDroppedEntries)
     if rigidBodyModesPerAggregate:
-        return TwoLevel(coarseSpace=RigidBodyModesPerAggregate(), tree=twoLevelTree, **filtering)
-    return AMG(tree=amgTree, **filtering)
+        return TwoLevel(coarseSpace=RigidBodyModesPerAggregate(), amgclTree=amgclTreeOfTwoLevel, **filtering)
+    return AMG(amgclTree=amgclTreeOfAMG, **filtering)
 
 
 def blockAMG(
@@ -126,8 +127,8 @@ def blockAMG(
     symmetric: bool = False,
     rebuild: RebuildPolicy = None,
     krylovOnScaledSystem: bool = False,
-    continuations: int = 2,
-    gapCompensation: GapCompensation = None,
+    trueResidualRestarts: int = 2,
+    residualGapCompensation: ResidualGapCompensation = None,
     dropTolerance: float = 0.0,
     lumpDroppedEntries: bool = False,
 ) -> Preconditioner:
@@ -166,8 +167,9 @@ def blockAMG(
         When the preconditioner is rebuilt.
     krylovOnScaledSystem
         Run LGMRES on the scaled matrix, ``DiagonalScaling(LGMRES(Multiplicative(...)))``, with its true-residual
-        ``continuations`` and ``gapCompensation`` (see :class:`~edelweissfe.linsolve.composition.krylov.KrylovSolver`).
-    continuations, gapCompensation
+        ``trueResidualRestarts`` and ``residualGapCompensation`` (see
+        :class:`~edelweissfe.linsolve.composition.krylov.KrylovSolver`).
+    trueResidualRestarts, residualGapCompensation
         See :class:`~edelweissfe.linsolve.composition.krylov.KrylovSolver`; only with ``krylovOnScaledSystem``.
     dropTolerance, lumpDroppedEntries
         Build every field's preconditioner on its filtered block, see
@@ -199,8 +201,8 @@ def blockAMG(
             tolerance=tolerance,
             maxIterations=maxIterations,
             rebuild=rebuild,
-            continuations=continuations,
-            gapCompensation=gapCompensation,
+            trueResidualRestarts=trueResidualRestarts,
+            residualGapCompensation=residualGapCompensation,
         )
 
     if krylovOnScaledSystem:

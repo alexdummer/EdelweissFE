@@ -44,11 +44,11 @@ from edelweissfe.linsolve.composition import (  # noqa: E402
     ComposedLinearSolver,
     CornerNodeInterpolation,
     DiagonalScaling,
+    EisenstatWalkerTolerance,
     FixedTolerance,
-    ForcingTolerance,
-    GapCompensation,
     OnField,
     RebuildPolicy,
+    ResidualGapCompensation,
     RigidBodyModesPerAggregate,
     SetUpContext,
     SolveDumps,
@@ -94,12 +94,12 @@ def _driven(root, fields, **options):
     return solver, journal
 
 
-# ----- warnings and the journal (verbosity, warnOuterIterationsThreshold) -----
+# ----- warnings and the journal (verbosity, warningOuterIterations) -----
 
 
 def test_a_slow_solve_is_warned_about():
     A, b, fields = displacementDamageSystem(n=8, coupling="symmetric")
-    solver, journal = _driven(blockAMG(tolerance=FixedTolerance(1e-8)), fields, warnOuterIterations=1)
+    solver, journal = _driven(blockAMG(tolerance=FixedTolerance(1e-8)), fields, warningOuterIterations=1)
     solver(A, b)
     assert "⚠ solve #1 needed" in journal.take()
 
@@ -115,7 +115,7 @@ def test_a_solve_stopped_at_the_cap_is_warned_about_and_rebuilds_the_preconditio
 
 
 def test_the_default_rebuild_policy_builds_every_preconditioner_anew():
-    assert RebuildPolicy().reuse is False
+    assert RebuildPolicy().reusePreconditioner is False
 
 
 @pytest.mark.parametrize(
@@ -165,9 +165,9 @@ def test_the_blockamg_preset_gives_the_corner_node_coarse_level_its_options(rigi
     assert isinstance(coarse, DiagonalScaling)
     if rigidBodyModesPerAggregate:
         assert isinstance(coarse.inner, TwoLevel) and isinstance(coarse.inner.coarseSpace, RigidBodyModesPerAggregate)
-        assert coarse.inner.tree == defaultCornerNodeTwoLevelTree()
+        assert coarse.inner.amgclTree == defaultCornerNodeTwoLevelTree()
     else:
-        assert isinstance(coarse.inner, AMG) and coarse.inner.tree is None
+        assert isinstance(coarse.inner, AMG) and coarse.inner.amgclTree is None
     for level in (preconditioner, coarse.inner):
         assert (level.dropTolerance, level.lumpDroppedEntries) == (1e-3, True)
 
@@ -209,7 +209,7 @@ def test_the_corner_node_smoother_is_the_vector_default_with_degree_8():
 
 def test_the_debug_column_says_why_the_preconditioner_was_rebuilt():
     A, b, fields = displacementDamageSystem(n=8, coupling="symmetric")
-    solver, journal = _driven(blockAMG(rebuild=RebuildPolicy(reuse=True)), fields, verbosity="debug")
+    solver, journal = _driven(blockAMG(rebuild=RebuildPolicy(reusePreconditioner=True)), fields, verbosity="debug")
     solver(A, b)
     assert solver.reportsSolveSummary
     assert solver.lastSolveSummary.detailLines[0] == "rebuilt(first)"
@@ -226,13 +226,13 @@ def test_the_tree_is_shown_in_a_frame_once_and_a_solve_is_not_narrated():
     assert "solve #" not in journal.take()
 
 
-def test_the_continuations_on_the_scaled_system_are_logged_at_debug():
+def test_the_true_residual_restarts_on_the_scaled_system_are_logged_at_debug():
     A, b, fields = displacementDamageSystem(n=8, coupling="symmetric", rowScaling=True)
     solver, journal = _driven(blockAMG(krylovOnScaledSystem=True, tolerance=FixedTolerance(1e-6)), fields)
     solver.verbosity = "debug"
     solver(A, b)
     if solver.lastSolveSummary.retries:
-        assert "continuation 1/2" in journal.take()
+        assert "true-residual restart 1/2" in journal.take()
     assert np.linalg.norm(b - A @ solver(A, b)) <= 1e-6 * np.linalg.norm(b) * (1 + 1e-9)
 
 
@@ -243,15 +243,16 @@ def test_the_continuations_on_the_scaled_system_are_logged_at_debug():
     "construct",
     [
         lambda: FixedTolerance(1.0),
-        lambda: ForcingTolerance(minimum=1e-2, maximum=1e-3),
-        lambda: ForcingTolerance(gamma=1.5),
-        lambda: ForcingTolerance(alpha=1.0),
+        lambda: EisenstatWalkerTolerance(minimum=1e-2, maximum=1e-3),
+        lambda: EisenstatWalkerTolerance(gamma=1.5),
+        lambda: EisenstatWalkerTolerance(alpha=1.0),
         lambda: RebuildPolicy(stalenessFactor=0.5),
-        lambda: GapCompensation(safetyFactor=0.0),
-        lambda: GapCompensation(maxFactor=0.5),
+        lambda: ResidualGapCompensation(safetyFactor=0.0),
+        lambda: ResidualGapCompensation(maxFactor=0.5),
         lambda: LGMRES(AMG(), restart=0),
-        lambda: LGMRES(AMG(), continuations=-1),
+        lambda: LGMRES(AMG(), trueResidualRestarts=-1),
         lambda: AMG(dropTolerance=-1.0),
+        lambda: AMG(nearNullspace=np.zeros((6, 1))),
         lambda: AMG(backendPrecision="half"),
         lambda: AMG(backendBlockSize=2, backendPrecision="float"),
         lambda: RigidBodyModesPerAggregate(coarseHierarchyPrecision="half"),
@@ -269,9 +270,12 @@ def test_a_setting_out_of_range_is_refused_at_construction(construct):
     "component, message",
     [
         (AMG(backendBlockSize=2), "does not match the field's dimension 3"),
-        (AMG(tree={"coarsening": {"type": "ruge_stuben"}}), "blockTranslationNullspace=False"),
+        (AMG(amgclTree={"coarsening": {"type": "ruge_stuben"}}), "nearNullspace=None"),
         (TwoLevel(RigidBodyModesPerAggregate(), backendBlockSize=1), "is on the scalar backend"),
-        (TwoLevel(RigidBodyModesPerAggregate(), tree={"relax": {"type": "spai0"}}), "relax.type must be chebyshev"),
+        (
+            TwoLevel(RigidBodyModesPerAggregate(), amgclTree={"relax": {"type": "spai0"}}),
+            "relax.type must be chebyshev",
+        ),
         (TwoLevel(CornerNodeInterpolation(), backendBlockSize=3), "needs its midside corners"),
     ],
 )
@@ -312,7 +316,8 @@ def _scriptSolver(tmp_path, eta: float, **settings):
     script = tmp_path / "solver.py"
     _script(
         script,
-        "linearSolver = blockAMG(tolerance=FixedTolerance({:g}), rebuild=RebuildPolicy(reuse=True))\n".format(eta),
+        "linearSolver = blockAMG(tolerance=FixedTolerance({:g}), "
+        "rebuild=RebuildPolicy(reusePreconditioner=True))\n".format(eta),
     )
     A, b, fields = displacementDamageSystem(n=8, coupling="symmetric")
     solver = ComposedLinearSolver.fromScript(str(script), hotReload=True, **settings)
@@ -327,7 +332,10 @@ def test_a_changed_script_replaces_the_tree_and_says_so(tmp_path):
     solver(A, b)
     assert "hot reload" not in journal.take()
 
-    _script(script, "linearSolver = blockAMG(tolerance=FixedTolerance(1e-9), rebuild=RebuildPolicy(reuse=True))\n")
+    _script(
+        script,
+        "linearSolver = blockAMG(tolerance=FixedTolerance(1e-9), rebuild=RebuildPolicy(reusePreconditioner=True))\n",
+    )
     x = solver(A, b)
     text = journal.take()
     assert "hot reload of {:} (sha256 ".format(script) in text and "the tree is replaced" in text

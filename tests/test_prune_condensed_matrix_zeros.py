@@ -66,14 +66,14 @@ def test_a_linear_solver_needs_a_stable_pattern_if_a_krylov_solver_of_its_tree_r
     )
 
     def reusing():
-        return LGMRES(AMG(), rebuild=RebuildPolicy(reuse=True))
+        return LGMRES(AMG(), rebuild=RebuildPolicy(reusePreconditioner=True))
 
     cases = (
         (DirectSolver("superlu"), True),
         (LGMRES(AMG()), True),
         (reusing(), False),
         (DiagonalScaling(reusing()), False),
-        (FGMRES(LGMRES(AMG(), tolerance=FixedTolerance(1e-2), rebuild=RebuildPolicy(reuse=True))), False),
+        (FGMRES(LGMRES(AMG(), tolerance=FixedTolerance(1e-2), rebuild=RebuildPolicy(reusePreconditioner=True))), False),
     )
     for root, expected in cases:
         stub = _NISTStub(None, ComposedLinearSolver(root).needsStableSparsityPattern)

@@ -52,9 +52,9 @@ Why "two-level": the component is the fine level and one coarse correction, and 
 The coarse space need not be a coarser mesh. With :class:`RigidBodyModesPerAggregate` it is
 spanned by aggregates of nodes, and the whole cycle is smoothed aggregation with all rigid-body modes on every level,
 the method Trilinos ML and MueLu use for elasticity (Vaněk, Mandel and Brezina, Computing 56, 1996). The first coarse
-level is built here, on the node-wise blocks of the fine level, with the modes scaled by the diagonal scaling and zero on
-the Dirichlet rows. The levels below are built by AMGCL, which takes the coefficients of the modes in the coarse space
-as its near null-space. ``prolongation="tentative"`` makes the first level plain aggregation. With
+level is built here, on the node-wise blocks of the fine level, with the modes scaled by the diagonal scaling and zero
+on the Dirichlet rows. The levels below are built by AMGCL, which takes the coefficients of the modes in the coarse
+space as its near null-space. ``prolongation="tentative"`` makes the first level plain aggregation. With
 :class:`CornerNodeInterpolation` the coarse level is a coarser grid, the corner nodes (p-multigrid): a field of its own,
 which its coarse component solves like any field (:mod:`~edelweissfe.linsolve.composition.cornernodetwolevelcycle`).
 
@@ -333,7 +333,7 @@ class TwoLevel(Preconditioner):
     ----------
     coarseSpace
         A :class:`CoarseSpace`: :class:`RigidBodyModesPerAggregate` or :class:`CornerNodeInterpolation`.
-    tree
+    amgclTree
         The field's AMGCL tree: its ``relax`` (a Chebyshev polynomial), ``npre`` and ``npost`` are the fine smoother;
         with :class:`RigidBodyModesPerAggregate` its coarsening also builds the coarse level, and the whole tree the AMG
         hierarchy below. ``None``: the coarse space's default (:meth:`CoarseSpace.defaultTree`), the default tree of the
@@ -354,7 +354,7 @@ class TwoLevel(Preconditioner):
     def __init__(
         self,
         coarseSpace: CoarseSpace,
-        tree: dict = None,
+        amgclTree: dict = None,
         backendBlockSize: int = None,
         backendPrecision: str = None,
         dropTolerance: float = 0.0,
@@ -370,7 +370,7 @@ class TwoLevel(Preconditioner):
         checkBackend("TwoLevel", backendBlockSize, backendPrecision)
         super().__init__()
         self.coarseSpace = coarseSpace
-        self.tree = tree
+        self.amgclTree = amgclTree
         self.backendBlockSize = backendBlockSize
         self.backendPrecision = backendPrecision
         self.dropTolerance = dropTolerance
@@ -383,13 +383,13 @@ class TwoLevel(Preconditioner):
     def _cycleParameters(self, field) -> dict:
         """The cycle's parameters for the field: the tree and the backend, the defaults for what is not given
         (see :meth:`~edelweissfe.linsolve.composition.twolevelcycle.TwoLevelCycle.cycleParameters`)."""
-        tree = fieldTreeOf("TwoLevel", self.tree, field, self.coarseSpace.defaultTree)
-        # the block translations belong to AMG's hierarchy on the block backend; a coarse space is its own
+        amgclTree = fieldTreeOf("TwoLevel", self.amgclTree, field, self.coarseSpace.defaultTree)
+        # the near null-space belongs to AMG's hierarchy; a coarse space is its own
         backendBlockSize, backendPrecision, _ = backendOf(
-            "TwoLevel", field, tree, self.backendBlockSize, self.backendPrecision, blockTranslationNullspace=False
+            "TwoLevel", field, amgclTree, self.backendBlockSize, self.backendPrecision, nearNullspace=None
         )
         return {
-            "amgclTree": tree,
+            "amgclTree": amgclTree,
             "backendBlockSize": backendBlockSize,
             "backendPrecision": backendPrecision,
         }

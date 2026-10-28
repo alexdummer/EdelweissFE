@@ -85,7 +85,7 @@ def test_a_krylov_rebuild_forgets_every_hierarchy_before_it_builds_one(monkeypat
     root = LGMRES(
         Multiplicative([OnField(f.name, amg) for f, amg in zip(fields, amgs)]),
         FixedTolerance(1e-8),
-        rebuild=RebuildPolicy(reuse=True),
+        rebuild=RebuildPolicy(reusePreconditioner=True),
     )
     solver = _composed(root, fields)
     solver(A, b)
@@ -116,8 +116,8 @@ def test_the_schur_complement_drops_its_old_complement_and_child_before_it_forms
     A, b, barDofs = barOnFoundation(n=8)
     fields = [FieldBlock("u", 0, A.shape[0], 1)]
     child = AMG()
-    schur = condensingGivenDofs(SchurComplement(["bars"], preconditionS=child), barDofs)
-    root = LGMRES(schur, FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True))
+    schur = condensingGivenDofs(SchurComplement(["bars"], schurComplementSolve=child), barDofs)
+    root = LGMRES(schur, FixedTolerance(1e-8), rebuild=RebuildPolicy(reusePreconditioner=True))
     solver = _composed(root, fields)
     solver(A, b)
     assert schur.S_tilde is not None and child.hierarchy is not None

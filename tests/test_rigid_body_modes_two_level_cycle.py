@@ -84,8 +84,8 @@ def _equilibratedBeam(dimension: int):
 def _preconditioner(
     dimension: int, backendPrecision: str = "double", kind=RigidBodyModesTwoLevelCycle, **options
 ) -> RigidBodyModesTwoLevelCycle:
-    """The rigid-body coarse level (or its control, ``kind``) of the default tree of a field of this dimension, stored in
-    backendPrecision."""
+    """The rigid-body coarse level (or its control, ``kind``) of the default tree of a field of this dimension, stored
+    in backendPrecision."""
     return kind(defaultFieldTree(dimension), dimension, backendPrecision, **options)
 
 
@@ -266,7 +266,7 @@ def test_modes_whose_components_are_all_constrained_are_dropped():
 
 def test_the_translations_alone_are_amgcls_own_first_coarse_level():
     # The control of the construction: on the translations alone, the coarse space of every aggregate is spanned by its
-    # translations D^-1 t, as in AMGCL's hierarchy on the block backend with blockTranslationNullspace -- the same
+    # translations D^-1 t, as in AMGCL's hierarchy on the block backend with nearNullspace="translations" -- the same
     # aggregates, the same tentative prolongation (per component, normalized), the same smoothing and the same
     # Galerkin product, and the same spectral radius estimate of the fine Chebyshev smoother (amgcl-spectral-radius.hpp,
     # from the same start vector: there are no Dirichlet rows, where the two-level cycle's start vector is zero).

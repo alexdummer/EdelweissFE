@@ -64,7 +64,10 @@ from edelweissfe.linsolve.composition import (  # noqa: E402
     TwoLevel,
     gaussSeidelOrder,
 )
-from edelweissfe.linsolve.composition.amg import defaultFieldTree  # noqa: E402
+from edelweissfe.linsolve.composition.amg import (  # noqa: E402
+    backendOf,
+    defaultFieldTree,
+)
 from edelweissfe.linsolve.composition.rigidbodymodestwolevelcycle import (  # noqa: E402
     RigidBodyModesTwoLevelCycle,
 )
@@ -85,6 +88,17 @@ def _solved(A, b, root, fields, **options):
 
 
 # ----- the components -----
+
+
+def test_amg_shows_the_near_null_space_it_was_built_with():
+    """A block backend takes the translations at most: AMG() asks for the rigid-body modes, and after the set-up its
+    description says what it got."""
+    K, coordinates, _ = cantilever((8, 2, 2), (4.0, 1.0, 1.0))
+    fields = [FieldBlock("displacement", 0, K.shape[0], 3)]
+    amg = AMG()
+    assert "nearNullspace" not in amg.describe().parameters
+    amg.setUp(SystemMatrix(K), _context(fields, {"displacement": coordinates}))
+    assert amg.describe().parameters["nearNullspace"] == "translations"
 
 
 def test_diagonal_scaling_around_an_exact_solve_is_the_exact_inverse():
@@ -289,7 +303,7 @@ def test_a_reused_coarse_correction_keeps_its_prolongation_and_its_coarse_hierar
         DiagonalScaling(Multiplicative([Jacobi(), CoarseCorrection(prolongation, coarse), Jacobi()])),
         tolerance=FixedTolerance(1e-8),
         maxIterations=2000,
-        rebuild=RebuildPolicy(reuse=True),
+        rebuild=RebuildPolicy(reusePreconditioner=True),
     )
     _, composed = _solved(K, b, root, fields)
     x = composed((1.0001 * K).tocsr(), b)
@@ -542,7 +556,7 @@ def test_the_corner_node_two_level_cycle_reuses_its_coarse_solve_while_only_the_
         DiagonalScaling(cornerNodeTwoLevel),
         tolerance=FixedTolerance(1e-8),
         maxIterations=300,
-        rebuild=RebuildPolicy(reuse=True),
+        rebuild=RebuildPolicy(reusePreconditioner=True),
     )
     _, composed = _solved(
         A,
@@ -598,10 +612,10 @@ def test_the_corner_node_two_level_cycle_smooths_its_fine_level_with_its_own_smo
         key: value for key, value in defaultFieldTree(3).items() if key != "relax"
     }
     coarse = cornerNodeTwoLevel.coarseSpace.coarseSolve
-    assert isinstance(coarse, DiagonalScaling) and isinstance(coarse.inner, AMG) and coarse.inner.tree is None
+    assert isinstance(coarse, DiagonalScaling) and isinstance(coarse.inner, AMG) and coarse.inner.amgclTree is None
     assert TwoLevel(RigidBodyModesPerAggregate())._cycleParameters(field)["amgclTree"] == defaultFieldTree(3)
     given = defaultFieldTree(3)
-    assert TwoLevel(CornerNodeInterpolation(), tree=given)._cycleParameters(field)["amgclTree"] is given
+    assert TwoLevel(CornerNodeInterpolation(), amgclTree=given)._cycleParameters(field)["amgclTree"] is given
 
 
 @pytest.mark.parametrize(
@@ -621,7 +635,7 @@ def test_the_corner_node_two_level_cycle_keeps_the_default_tree_of_a_scalar_fiel
     field = FieldBlock("nonlocal damage", 0, 10, 1)
     assert TwoLevel(CornerNodeInterpolation())._cycleParameters(field)["amgclTree"] == defaultFieldTree(1)
     given = defaultFieldTree(3)
-    assert TwoLevel(CornerNodeInterpolation(), tree=given)._cycleParameters(field)["amgclTree"] is given
+    assert TwoLevel(CornerNodeInterpolation(), amgclTree=given)._cycleParameters(field)["amgclTree"] is given
 
 
 # ----- the Schur complement -----
@@ -630,7 +644,7 @@ def test_the_corner_node_two_level_cycle_keeps_the_default_tree_of_a_scalar_fiel
 def test_block_lu_with_the_exact_schur_complement_and_exact_solves_is_the_inverse():
     A, b, barDofs = barOnFoundation(n=6)
     schur = condensingGivenDofs(
-        SchurComplement(["bars"], preconditionS=DirectSolver(), blockFactors="LU"),
+        SchurComplement(["bars"], schurComplementSolve=DirectSolver(), blockFactors="both"),
         barDofs,
         dropTolerance=0.0,
         windowNodes=10_000,
@@ -649,7 +663,7 @@ def test_the_schur_complement_tree_has_blockamgs_numbers_with_condensation():
         condensingGivenDofs(
             SchurComplement(
                 ["bars"],
-                preconditionS=DiagonalScaling(Multiplicative(gaussSeidelOrder([OnField("u", AMG())], sweeps=2))),
+                schurComplementSolve=DiagonalScaling(Multiplicative(gaussSeidelOrder([OnField("u", AMG())], sweeps=2))),
             ),
             barDofs,
         ),
@@ -667,9 +681,9 @@ def test_the_schur_complement_keeps_nothing_formed_from_its_matrices_between_sol
     A, b, barDofs = barOnFoundation(n=8)
     fields = [FieldBlock("u", 0, A.shape[0], 1)]
     schur = condensingGivenDofs(
-        SchurComplement(["bars"], preconditionS=DiagonalScaling(Multiplicative([OnField("u", AMG())]))), barDofs
+        SchurComplement(["bars"], schurComplementSolve=DiagonalScaling(Multiplicative([OnField("u", AMG())]))), barDofs
     )
-    root = LGMRES(schur, tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True))
+    root = LGMRES(schur, tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reusePreconditioner=True))
     _, composed = _solved(A, b, root, fields)
     assert schur.S_tilde._fieldSplit is None and schur.S_tilde._krylovOperator is None
     x = composed((1.0001 * A).tocsr(), b)
@@ -680,10 +694,11 @@ def test_the_schur_complement_notes_what_it_condensed_for_the_debug_column_of_a_
     A, b, barDofs = barOnFoundation(n=8)
     fields = [FieldBlock("u", 0, A.shape[0], 1)]
     schur = condensingGivenDofs(
-        SchurComplement(["bars"], preconditionS=DiagonalScaling(Multiplicative([OnField("u", AMG())]))), barDofs
+        SchurComplement(["bars"], schurComplementSolve=DiagonalScaling(Multiplicative([OnField("u", AMG())]))), barDofs
     )
     solver = ComposedLinearSolver(
-        LGMRES(schur, tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True)), verbosity="debug"
+        LGMRES(schur, tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reusePreconditioner=True)),
+        verbosity="debug",
     )
     solver.setFieldStructure(fields)
     solver(A, b)
@@ -735,7 +750,11 @@ def test_one_call_is_counted_once_also_through_a_hook_of_the_same_component():
 
     # driven by the adapter, which only updates the root: two solves are two updates of every combination
     blockGaussSeidel = Multiplicative(lambda context: [OnField(field.name, AMG()) for field in context.fields])
-    root = LGMRES(DiagonalScaling(blockGaussSeidel), tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True))
+    root = LGMRES(
+        DiagonalScaling(blockGaussSeidel),
+        tolerance=FixedTolerance(1e-8),
+        rebuild=RebuildPolicy(reusePreconditioner=True),
+    )
     _, composed = _solved(A, b, root, fields)
     composed(A, b)
     assert (root.statistics.setUps, root.statistics.updates, root.statistics.applications) == (0, 2, 2)
@@ -796,13 +815,13 @@ def test_a_child_must_be_a_component():
     with pytest.raises(ValueError, match="at least one correction"):
         Additive([])
     with pytest.raises(ValueError, match="nothing to condense"):
-        SchurComplement(preconditionS=AMG())
+        SchurComplement(schurComplementSolve=AMG())
     with pytest.raises(ValueError, match="blockFactors"):
-        SchurComplement(["a marker"], preconditionS=AMG(), blockFactors="L")
-    with pytest.raises(TypeError, match="solveA_bb must be a DirectSolver"):
-        SchurComplement(["a marker"], preconditionS=AMG(), solveA_bb=AMG())
+        SchurComplement(["a marker"], schurComplementSolve=AMG(), blockFactors="L")
+    with pytest.raises(TypeError, match="condensedBlockSolve must be a DirectSolver"):
+        SchurComplement(["a marker"], schurComplementSolve=AMG(), condensedBlockSolve=AMG())
     with pytest.raises(ValueError, match="approximation"):
-        SchurComplement(["a marker"], preconditionS=AMG(), approximation="exact")
+        SchurComplement(["a marker"], schurComplementSolve=AMG(), approximation="exact")
 
 
 def test_a_missing_field_fails_at_the_set_up_and_names_the_fields():
@@ -854,3 +873,22 @@ def test_the_default_trees_on_the_reference_page_are_the_code_defaults():
     }
     p1Block = page.split("The corner-node two-level cycle's default tree", 1)[1].split(".. code-block:: json", 1)[1]
     assert json.JSONDecoder().raw_decode(p1Block.strip())[0] == defaultCornerNodeTwoLevelTree()
+
+
+def test_the_near_null_space_of_amg_resolves_per_backend_and_field():
+    # the default, "rigidBodyModes": as far as the backend and the field hold them
+    displacement = FieldBlock("displacement", 0, 30, 3)
+    microRotation = FieldBlock("micro rotation", 0, 30, 3)
+    damage = FieldBlock("nonlocal damage", 0, 10, 1)
+    vectorTree, scalarTree = defaultFieldTree(3), defaultFieldTree(1)
+    assert backendOf("AMG", displacement, vectorTree)[2] == "translations"
+    assert backendOf("AMG", displacement, vectorTree, backendBlockSize=1)[2] == "rigidBodyModes"
+    assert backendOf("AMG", microRotation, vectorTree, backendBlockSize=1)[2] == "translations"
+    assert backendOf("AMG", damage, scalarTree)[2] is None
+    # given
+    assert backendOf("AMG", displacement, vectorTree, 1, None, "translations")[2] == "translations"
+    assert backendOf("AMG", displacement, vectorTree, nearNullspace=None)[2] is None
+    rugeStuben = {"coarsening": {"type": "ruge_stuben"}}
+    assert backendOf("AMG", displacement, rugeStuben, nearNullspace=None)[2] is None
+    with pytest.raises(ValueError, match="nearNullspace must be"):
+        AMG(nearNullspace="rotations")
