@@ -94,6 +94,16 @@ class StepIncrementationSchema:
         dtype=int,
         default=3,
     )
+    zeroIncrement: bool = schemaField(
+        description=(
+            "Whether the step starts with a zero increment, an equilibrium iteration at the step start before time "
+            "advances (adaptive steps only). Abaqus/Standard has none; switch it off for models that are not in "
+            "equilibrium at the step start to within the convergence tolerance, e.g. with small initial contact "
+            "overlaps."
+        ),
+        dtype=bool,
+        default=True,
+    )
 
 
 class StepBase(ABC):
@@ -158,6 +168,7 @@ class StepBase(ABC):
         self.cutbackFactor = options.cutbackFactor
         self.increaseFactor = options.increaseFactor
         self.goodIncrementsBeforeIncrease = options.goodIncrementsBeforeIncrease
+        self.zeroIncrement = options.zeroIncrement
 
         self.timeStepper = self._createTimeStepper()
 

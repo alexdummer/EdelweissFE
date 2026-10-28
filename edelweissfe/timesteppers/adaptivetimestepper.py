@@ -162,7 +162,7 @@ class AdaptiveTimeStepper(TimeStepperBase):
         self.nPassedGoodIncrements += 1
 
     def rejectTimeStep(self, cutbackFactor: float):
-        if self.incrementCounter == 0:
+        if self.makeZeroIncrementFirst and self.incrementCounter == 0:
             self.journal.errorMessage("Failed zero increment", self.identification)
             raise ReachedMinIncrementSize()
 
