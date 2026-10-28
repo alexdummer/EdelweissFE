@@ -65,10 +65,11 @@ The coarse solve is a component of the composed solver, set up on :math:`A_c` wi
 coordinates, the scaling :math:`D_c`), so that every component works on it unchanged. Its default,
 ``DiagonalScaling(AMG())``, works on any field; for a 3D displacement field
 ``DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate()))`` is faster
-(:ref:`measured-scaled-corner-node-interpolation`). Both scale :math:`A_c` to a unit diagonal once more: where a
-midside diagonal is tiny against its corners', the weights :math:`s_a / s_m` are large, :math:`A_c` inherits entries
-of their square, and a Chebyshev smoother on the unscaled :math:`A_c` would work with a spectral radius far above that
-of a unit-diagonal operator.
+(:ref:`measured-scaled-corner-node-interpolation`), and the ``blockamg`` preset passes it, with the smoother of the
+corner-node two-level cycle (:func:`~edelweissfe.linsolve.composition.amg.defaultCornerNodeTwoLevelTree`). Both scale
+:math:`A_c` to a unit diagonal once more: where a midside diagonal is tiny against its corners', the weights
+:math:`s_a / s_m` are large, :math:`A_c` inherits entries of their square, and a Chebyshev smoother on the unscaled
+:math:`A_c` would work with a spectral radius far above that of a unit-diagonal operator.
 
 The cycle runs in C++ (``CornerNodeTwoLevelCycleT`` in ``edelweissfe/linsolve/amgcl/amgcl-wrapper.hpp``, wrapped as
 :class:`~edelweissfe.linsolve.amgcl.amgcl.PyAMGCLCornerNodeTwoLevelCycle`), OpenMP-threaded throughout, and calls the

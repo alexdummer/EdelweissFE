@@ -10,11 +10,12 @@ from edelweissfe.linsolve.composition import (
     RigidBodyModesPerAggregate,
     TwoLevel,
 )
+from edelweissfe.linsolve.composition.amg import defaultCornerNodeTwoLevelTree
 
 # the coarse problem is the displacement field on the corner nodes: scaled to a unit diagonal once more, and solved by
-# the rigid-body coarse level, the faster coarse solve for a 3D displacement field (the default is
-# DiagonalScaling(AMG()))
-coarse = DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate()))
+# the rigid-body coarse level with the smoother of the corner-node two-level cycle (the coarse solve the blockamg preset
+# gives a 3D displacement field, written out; CornerNodeInterpolation's own default is DiagonalScaling(AMG()))
+coarse = DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate(), tree=defaultCornerNodeTwoLevelTree()))
 displacement = OnField("displacement", TwoLevel(coarseSpace=CornerNodeInterpolation(coarseSolve=coarse)))
 
 linearSolver = LGMRES(DiagonalScaling(displacement), tolerance=FixedTolerance(1e-8))

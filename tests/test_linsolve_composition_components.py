@@ -56,6 +56,7 @@ from edelweissfe.linsolve.composition import (  # noqa: E402
     Jacobi,
     Multiplicative,
     OnField,
+    RebuildPolicy,
     RigidBodyModesPerAggregate,
     SchurComplement,
     SetUpContext,
@@ -288,6 +289,7 @@ def test_a_reused_coarse_correction_keeps_its_prolongation_and_its_coarse_hierar
         DiagonalScaling(Multiplicative([Jacobi(), CoarseCorrection(prolongation, coarse), Jacobi()])),
         tolerance=FixedTolerance(1e-8),
         maxIterations=2000,
+        rebuild=RebuildPolicy(reuse=True),
     )
     _, composed = _solved(K, b, root, fields)
     x = composed((1.0001 * K).tocsr(), b)
@@ -536,7 +538,12 @@ def test_the_p1_coarse_solve_with_an_exact_solve_beats_the_default_in_iterations
 def test_the_corner_node_two_level_cycle_reuses_its_coarse_solve_while_only_the_values_change():
     A, b, fields, coords, isCorner, edgeEndpoints, constrained = _p1System()
     cornerNodeTwoLevel = TwoLevel(CornerNodeInterpolation())
-    root = LGMRES(DiagonalScaling(cornerNodeTwoLevel), tolerance=FixedTolerance(1e-8), maxIterations=300)
+    root = LGMRES(
+        DiagonalScaling(cornerNodeTwoLevel),
+        tolerance=FixedTolerance(1e-8),
+        maxIterations=300,
+        rebuild=RebuildPolicy(reuse=True),
+    )
     _, composed = _solved(
         A,
         b,
@@ -575,6 +582,46 @@ def test_the_p1_coarse_solve_takes_any_component_and_shows_in_the_views():
 def test_the_p1_coarse_solve_must_be_a_component():
     with pytest.raises(TypeError, match="CornerNodeInterpolation"):
         CornerNodeInterpolation(coarseSolve=AMG)
+
+
+def test_the_corner_node_two_level_cycle_smooths_its_fine_level_with_its_own_smoother():
+    """TwoLevel(CornerNodeInterpolation()) takes the tree of the corner-node two-level cycle (Chebyshev of degree 8);
+    TwoLevel(RigidBodyModesPerAggregate()) alone keeps the default tree of its field, and a tree given wins over both.
+    Each level has its own tree: the default coarse solve, DiagonalScaling(AMG()), keeps AMG's default."""
+    from edelweissfe.linsolve.composition.amg import defaultCornerNodeTwoLevelTree
+
+    field = FieldBlock("displacement", 0, 30, 3)
+    cornerNodeTwoLevel = TwoLevel(CornerNodeInterpolation())
+    assert cornerNodeTwoLevel._cycleParameters(field)["amgclTree"] == defaultCornerNodeTwoLevelTree()
+    assert defaultCornerNodeTwoLevelTree()["relax"] == {"type": "chebyshev", "degree": 8, "lower": 0.03, "higher": 1.1}
+    assert {key: value for key, value in defaultCornerNodeTwoLevelTree().items() if key != "relax"} == {
+        key: value for key, value in defaultFieldTree(3).items() if key != "relax"
+    }
+    coarse = cornerNodeTwoLevel.coarseSpace.coarseSolve
+    assert isinstance(coarse, DiagonalScaling) and isinstance(coarse.inner, AMG) and coarse.inner.tree is None
+    assert TwoLevel(RigidBodyModesPerAggregate())._cycleParameters(field)["amgclTree"] == defaultFieldTree(3)
+    given = defaultFieldTree(3)
+    assert TwoLevel(CornerNodeInterpolation(), tree=given)._cycleParameters(field)["amgclTree"] is given
+
+
+@pytest.mark.parametrize(
+    "name, dimension", [("displacement", 2), ("rotation", 3), ("vector", 4)], ids=["2D displacement", "rotation", "4D"]
+)
+def test_the_corner_node_smoother_is_for_3d_displacement_fields_only(name, dimension):
+    """The smoother of degree 8 was measured on 3D displacement fields: any other vector field under the corner-node
+    interpolation keeps the default tree of its dimension."""
+    field = FieldBlock(name, 0, 10 * dimension, dimension)
+    tree = TwoLevel(CornerNodeInterpolation())._cycleParameters(field)["amgclTree"]
+    assert tree == defaultFieldTree(dimension) and tree["relax"]["degree"] == 16
+
+
+def test_the_corner_node_two_level_cycle_keeps_the_default_tree_of_a_scalar_field():
+    """The smoother of degree 8 was measured on displacement fields: a scalar field (e.g. a quadratic nonlocal damage
+    field) under the corner-node interpolation keeps the default tree of its dimension, as under any coarse space."""
+    field = FieldBlock("nonlocal damage", 0, 10, 1)
+    assert TwoLevel(CornerNodeInterpolation())._cycleParameters(field)["amgclTree"] == defaultFieldTree(1)
+    given = defaultFieldTree(3)
+    assert TwoLevel(CornerNodeInterpolation(), tree=given)._cycleParameters(field)["amgclTree"] is given
 
 
 # ----- the Schur complement -----
@@ -622,7 +669,7 @@ def test_the_schur_complement_keeps_nothing_formed_from_its_matrices_between_sol
     schur = condensingGivenDofs(
         SchurComplement(["bars"], preconditionS=DiagonalScaling(Multiplicative([OnField("u", AMG())]))), barDofs
     )
-    root = LGMRES(schur, tolerance=FixedTolerance(1e-8))
+    root = LGMRES(schur, tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True))
     _, composed = _solved(A, b, root, fields)
     assert schur.S_tilde._fieldSplit is None and schur.S_tilde._krylovOperator is None
     x = composed((1.0001 * A).tocsr(), b)
@@ -635,7 +682,9 @@ def test_the_schur_complement_notes_what_it_condensed_for_the_debug_column_of_a_
     schur = condensingGivenDofs(
         SchurComplement(["bars"], preconditionS=DiagonalScaling(Multiplicative([OnField("u", AMG())]))), barDofs
     )
-    solver = ComposedLinearSolver(LGMRES(schur, tolerance=FixedTolerance(1e-8)), verbosity="debug")
+    solver = ComposedLinearSolver(
+        LGMRES(schur, tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True)), verbosity="debug"
+    )
     solver.setFieldStructure(fields)
     solver(A, b)
     first = solver.lastSolveSummary.detailLines
@@ -686,7 +735,7 @@ def test_one_call_is_counted_once_also_through_a_hook_of_the_same_component():
 
     # driven by the adapter, which only updates the root: two solves are two updates of every combination
     blockGaussSeidel = Multiplicative(lambda context: [OnField(field.name, AMG()) for field in context.fields])
-    root = LGMRES(DiagonalScaling(blockGaussSeidel), tolerance=FixedTolerance(1e-8))
+    root = LGMRES(DiagonalScaling(blockGaussSeidel), tolerance=FixedTolerance(1e-8), rebuild=RebuildPolicy(reuse=True))
     _, composed = _solved(A, b, root, fields)
     composed(A, b)
     assert (root.statistics.setUps, root.statistics.updates, root.statistics.applications) == (0, 2, 2)
@@ -792,7 +841,7 @@ def test_the_default_trees_on_the_reference_page_are_the_code_defaults():
     import json
     import pathlib
 
-    from edelweissfe.linsolve.composition.amg import defaultFieldTree
+    from edelweissfe.linsolve.composition.amg import defaultCornerNodeTwoLevelTree
 
     page = (pathlib.Path(__file__).parents[1] / "doc/source/documentation/composedlinsolversreference.rst").read_text()
     block = page.split("and change only what is intended. The defaults are", 1)[1].split(".. code-block:: json", 1)[1]
@@ -803,3 +852,5 @@ def test_the_default_trees_on_the_reference_page_are_the_code_defaults():
         "vector field of a dimension other than 2 or 3": defaultFieldTree(4),
         "scalar field (e.g. nonlocal damage)": defaultFieldTree(1),
     }
+    p1Block = page.split("The corner-node two-level cycle's default tree", 1)[1].split(".. code-block:: json", 1)[1]
+    assert json.JSONDecoder().raw_decode(p1Block.strip())[0] == defaultCornerNodeTwoLevelTree()

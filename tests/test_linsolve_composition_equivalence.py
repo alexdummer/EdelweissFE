@@ -58,6 +58,7 @@ from edelweissfe.linsolve.composition import (  # noqa: E402
     GapCompensation,
     Multiplicative,
     OnField,
+    RebuildPolicy,
     SchurComplement,
     SolveDumps,
     blockAMG,
@@ -135,7 +136,9 @@ def _beamWithDamage(seed: int = 0, couplingStrength: float = 1e-2):
 
 def _composed(coordinates, fields, **presetOptions) -> ComposedLinearSolver:
     composed = ComposedLinearSolver(
-        blockAMG(**presetOptions), nodeCoordinates={"displacement": coordinates}, verbosity="silent"
+        blockAMG(rebuild=RebuildPolicy(reuse=True), **presetOptions),
+        nodeCoordinates={"displacement": coordinates},
+        verbosity="silent",
     )
     composed.setFieldStructure(fields)
     return composed
@@ -346,7 +349,7 @@ def test_the_degradation_dumps_are_blockamgs_on_disk(tmp_path):
     """The files and manifest lines blockamg wrote, for every solve of a sequence (threshold 0: all dumped)."""
     A, b, fields, coordinates = _beamWithDamage()
     composed = ComposedLinearSolver(
-        blockAMG(),
+        blockAMG(rebuild=RebuildPolicy(reuse=True)),
         nodeCoordinates={"displacement": coordinates},
         verbosity="silent",
         dumps=SolveDumps(str(tmp_path), threshold=0, maxDumps=20),

@@ -73,6 +73,11 @@ _QUADRATIC_TOPOLOGY = {(2, 8): _QUAD8_TOPOLOGY, (3, 20): _HEXA20_TOPOLOGY}
 _KNOWN_LINEAR_NODE_COUNTS = {1, 2, 3, 4, 6, 8}
 
 
+class UnsupportedElementTopology(ValueError):
+    """An element whose corner/midside topology this module does not know (e.g. a Tet10): the field it carries has no
+    midside corners to build a corner-node interpolation from."""
+
+
 def classifyElementTopology(nSpatialDimensions, nNodes: int):
     """Return ``(cornerLocalIndices, edgeEndpointsLocal)`` for one element's local node numbering.
 
@@ -93,7 +98,7 @@ def classifyElementTopology(nSpatialDimensions, nNodes: int):
 
     Raises
     ------
-    ValueError
+    UnsupportedElementTopology
         If ``nNodes`` is neither a recognized quadratic-serendipity count for
         ``nSpatialDimensions`` nor among the verified pure-corner node counts -- silently
         misclassifying an unrecognized element's midside nodes as corners would quietly degrade
@@ -104,7 +109,7 @@ def classifyElementTopology(nSpatialDimensions, nNodes: int):
         return _QUADRATIC_TOPOLOGY[key]
     if nSpatialDimensions is None or nNodes in _KNOWN_LINEAR_NODE_COUNTS:
         return list(range(nNodes)), []
-    raise ValueError(
+    raise UnsupportedElementTopology(
         "p1topology: unrecognized element topology (nSpatialDimensions={:}, nNodes={:}) -- neither "
         "a known quadratic-serendipity family ((2, 8) Quad8, (3, 20) Hexa20) nor a verified linear "
         "node count. Add its corner/midside topology before including it in the midside corners.".format(
@@ -136,8 +141,8 @@ def buildMidsideCorners(model, fieldName: str):
     interface pattern. Treating the node as a corner instead is always *structurally* safe for a
     P1 restriction operator -- a corner is identity in ``P`` regardless of why it was classified
     that way, so this can only ever make the P1 space a little larger (a few extra corners) than
-    the theoretical minimum, never wrong. Every such fallback is recorded in the returned
-    ``warnings`` list rather than passed over silently.
+    the theoretical minimum, never wrong. Every such fallback is returned (``conflictingRows``)
+    rather than passed over silently.
 
     Parameters
     ----------
@@ -153,9 +158,9 @@ def buildMidsideCorners(model, fieldName: str):
     edgeEndpoints : np.ndarray
         Int, shape ``(nNodes, 2)``, ``-1`` for corner rows; for an exclusive midside row, the two
         edge-endpoint corner rows (both guaranteed corners themselves, by construction).
-    warnings : list[str]
-        One entry per node demoted to a corner because of a genuine edge-endpoint disagreement
-        between two elements (empty on an ordinary, conforming mesh).
+    conflictingRows : np.ndarray
+        Int, sorted: the rows to which two elements give different edge endpoints; they are corners
+        (empty on an ordinary, conforming mesh).
     """
     field = model.nodeFields[fieldName]
     nodeRows = {node: i for i, node in enumerate(field.nodes)}
@@ -199,14 +204,8 @@ def buildMidsideCorners(model, fieldName: str):
                 continue
             provisionalEdges[row] = candidate
 
-    warnings = []
-    for row in conflictingRows:
-        isCorner[row] = True
-        warnings.append(
-            "p1topology: node (row {:}, field '{:}') had conflicting edge-endpoint candidates "
-            "from different elements -- treated as a corner (safe: identity in P1 regardless), "
-            "not the exclusive midside a conforming mesh would make it.".format(row, fieldName)
-        )
+    conflictingRows = np.array(sorted(conflictingRows), dtype=int)
+    isCorner[conflictingRows] = True
 
     # a node of no element (e.g. the reference point of a rigid body) is a corner: identity in P1
     isCorner[~inSomeElement] = True
@@ -221,9 +220,9 @@ def buildMidsideCorners(model, fieldName: str):
                 "recorded edge endpoints -- every non-corner node must be an exclusive midside of "
                 "at least one element.".format(row, fieldName)
             )
-        edgeEndpoints[row] = tuple(candidate)
+        edgeEndpoints[row] = tuple(sorted(candidate))
 
-    return isCorner, edgeEndpoints, warnings
+    return isCorner, edgeEndpoints, conflictingRows
 
 
 def restrictMidsideCorners(isCorner: np.ndarray, edgeEndpoints: np.ndarray, remains: np.ndarray) -> tuple:

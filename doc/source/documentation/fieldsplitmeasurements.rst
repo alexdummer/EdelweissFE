@@ -220,6 +220,66 @@ and many more on the edge breakout, where midside diagonals are far smaller than
 ``DiagonalScaling(AMG(backendBlockSize=1))``, an AMG hierarchy with the rigid-body modes of the corners, needed as
 many or more iterations and more time on every system.
 
+These measurements were taken with the smoother of the time, degree 16 on both levels of the corner-node two-level
+cycle; the default is now degree 8 (:ref:`measured-corner-node-two-level-smoother`).
+
+.. _measured-rebuild-every-solve:
+
+Rebuilding the preconditioner for every solve
+---------------------------------------------
+
+See :ref:`blockamg-per-field-amg` and the reuse rules on :doc:`blockamgtheory`.
+
+Live, on the contact anchor model with many multi-point-constraint slaves, over a window of increments: two runs
+from the same checkpoint, the reuse rules of ``RebuildPolicy`` against ``reuse=False``, a new preconditioner for every
+solve. The two runs took slightly different paths (other hierarchies, other linear solutions
+within the tolerance), with about the same Newton iterations and simulated time reached.
+
+A new preconditioner for every solve was faster over the window. A reused preconditioner needed several times the
+outer iterations of a fresh one, and a share of its solves stopped at the iteration cap, against none with a new
+preconditioner for every solve; the far cheaper Krylov solves outweighed the more frequent builds. Offline replays of
+captured solves had shown the opposite, a reused preconditioner only a few iterations behind a fresh one and reuse
+faster: they did not reproduce how far a live Jacobian moves between solves. Not yet measured live on a second model.
+
+.. _measured-corner-node-two-level-smoother:
+
+The smoother of the corner-node two-level cycle
+-----------------------------------------------
+
+See :ref:`blockamg-p-multigrid` and :ref:`composed-default-field-trees`.
+
+The Chebyshev smoother -- its degree, the lower end of its interval relative to the spectral radius, and the cycle,
+V(0,1) or V(1,1) -- was swept for the three displacement preconditioners, ``AMG()``,
+``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` and ``TwoLevel(coarseSpace=CornerNodeInterpolation())``,
+offline on the displacement block alone: ``LGMRES(DiagonalScaling(.))`` to a true relative residual of 1e-6, setup
+included, first on three systems (the damaged tunnel lining, a late solve of the damage cylinder and of the edge
+breakout), then on the systems of :ref:`measured-scaled-corner-node-interpolation` and two post-onset cylinder solves.
+Every solve reached the tolerance. The smoother of ``CornerNodeInterpolation`` was set on both of its levels (the
+fine level and the rigid-body coarse level of its coarse solve), the others on every level they smooth.
+
+* **For** ``AMG()`` **and the rigid-body coarse level, degree 16 is within the run-to-run scatter of the best
+  setting.** The optimum is flat along a ridge: a wider interval needs a higher degree (degree 16 on 0.01 to 1.1,
+  degree 8 on 0.03 to 1.1 and V(1,1) with degree 4 on 0.03 to 1.1 tie). A lower degree made the tunnel lining faster
+  and the late cylinder solves slower, at more than twice the iterations, and moved no time overall. They keep
+  degree 16.
+* **For the corner-node two-level cycle, degree 16 is stronger than it pays.** The optimum is flat over degrees 6 to
+  10 and lower ends 0.02 to 0.05; degree 8 on 0.03 to 1.1 was faster on both levels than on the fine level alone.
+* A lower end of 0.1 lost everywhere; V(0,1) beat V(1,1) at the same number of polynomial applications for all three
+  preconditioners.
+* The outer iterations of the corner-node two-level cycle did not depend on the number of threads, and the gain was
+  larger at fewer threads.
+
+On all systems, the default ``TwoLevel(coarseSpace=CornerNodeInterpolation())`` (degree 8 on 0.03 to 1.1) against the
+former default written out,
+``TwoLevel(coarseSpace=CornerNodeInterpolation(DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate(),
+tree=t))), tree=t)`` with ``t = defaultFieldTree(3)``, needed more outer iterations on every system, but fewer than
+twice as many, at half the matrix products per smoothing sweep: it was faster or as fast on every system, most on the
+tunnel lining and the damage cylinder; the edge breakout, whose time is mostly the setup, ties. The iterations of
+``AMG()`` and of ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` with their defaults are unchanged by this
+default.
+
+Not yet measured live: with Newton in the loop, and with the hierarchies reused over several solves.
+
 .. _measured-defaults:
 
 Why the defaults are what they are
@@ -254,7 +314,8 @@ contact anchor model with many multi-point-constraint slaves):
 * ``LGMRES(restart=50)`` matches the outer-iteration cap (``maxIterations = 100``), so
   LGMRES restarts at most once within it; ``augmentationVectors`` only allocates its augmentation vectors without
   ever exhausting them before the cap.
-* ``RebuildPolicy(stalenessFactor=3)`` reuses hierarchies longer than the former factor of 1.5, which fired on
+* ``RebuildPolicy(stalenessFactor=3)``, where hierarchies are reused (``reuse=True``; since
+  :ref:`measured-rebuild-every-solve` not the default), reuses them longer than the former factor of 1.5, which fired on
   noise at small iteration counts; with the cap of 100 it can fire only while the solve the
   hierarchies were built for took fewer than about 34 iterations -- beyond that, only a cap hit (or a
   new increment, a pattern change) rebuilds them.
@@ -266,9 +327,9 @@ contact anchor model with many multi-point-constraint slaves):
   the continuations of the scaled system have nothing to do and are left at their own, otherwise
   inert, defaults.
 * ``pruneCondensedMatrixZeros`` (a nonlinear-solver option, not a component's) now defaults to
-  "off for a solver that needs the pattern stable", and a solver with a Krylov solve reports exactly that -- so on a
-  model with multi-point constraints the hierarchies are now reused automatically; the former setup
-  needed this set by hand (see the reuse rules on :doc:`blockamgtheory`).
+  "off for a solver that needs the pattern stable", and a solver whose Krylov solve reuses its preconditioner reports
+  exactly that -- so on a model with multi-point constraints the hierarchies can be reused (``reuse=True``) without
+  more settings; the former setup needed this set by hand (see the reuse rules on :doc:`blockamgtheory`).
 
 Measured live, from the same checkpoints, the defaults against the former defaults (no per-model settings in
 either run): the contact model's increments finished markedly faster; on the damage cylinder, the

@@ -40,7 +40,11 @@ from dataclasses import dataclass
 
 from edelweissfe.linsolve.composition.base import Preconditioner
 from edelweissfe.linsolve.composition.direct import DirectSolver
-from edelweissfe.linsolve.composition.krylov import FixedTolerance, GapCompensation
+from edelweissfe.linsolve.composition.krylov import (
+    FixedTolerance,
+    GapCompensation,
+    RebuildPolicy,
+)
 from edelweissfe.linsolve.composition.presets import blockAMG
 from edelweissfe.linsolve.composition.solvedumps import SolveDumps
 from edelweissfe.linsolve.composition.solver import ComposedLinearSolver
@@ -256,8 +260,16 @@ class BlockAMGSchema(LinearSolverSchema):
 
     rigidBodyModesPerAggregate: bool = schemaField(
         description=(
-            "A 3D displacement field gets the two-level cycle on its rigid-body modes (else one AMG hierarchy, on the "
-            "translations)."
+            "A (linear) 3D displacement field gets the two-level cycle on its rigid-body modes (else one AMG hierarchy, "
+            "on the translations)."
+        ),
+        dtype=bool,
+        default=True,
+    )
+    cornerNodeInterpolation: bool = schemaField(
+        description=(
+            "A quadratic 3D displacement field gets the two-level cycle on its corner nodes (else the case of a linear "
+            "one)."
         ),
         dtype=bool,
         default=True,
@@ -268,6 +280,14 @@ class BlockAMGSchema(LinearSolverSchema):
         default=None,
     )
     maxIterations: int = schemaField(description="The outer iteration cap.", dtype=int, default=100)
+    reusePreconditioner: bool = schemaField(
+        description=(
+            "Keep the preconditioner across solves until a new increment or a stale preconditioner asks for a rebuild "
+            "(false: a new preconditioner for every solve)."
+        ),
+        dtype=bool,
+        default=False,
+    )
     sweeps: int = schemaField(description="The block Gauss-Seidel sweeps over the fields.", dtype=int, default=1)
     symmetric: bool = schemaField(
         description="A symmetric block Gauss-Seidel sweep (forward, then backward).", dtype=bool, default=False
@@ -308,8 +328,10 @@ class BlockAMG(LinearSolverType):
     def tree(cls, configuration: BlockAMGSchema) -> Preconditioner:
         return blockAMG(
             rigidBodyModesPerAggregate=configuration.rigidBodyModesPerAggregate,
+            cornerNodeInterpolation=configuration.cornerNodeInterpolation,
             tolerance=None if configuration.tolerance is None else FixedTolerance(configuration.tolerance),
             maxIterations=configuration.maxIterations,
+            rebuild=RebuildPolicy(reuse=configuration.reusePreconditioner),
             sweeps=configuration.sweeps,
             symmetric=configuration.symmetric,
             krylovOnScaledSystem=configuration.krylovOnScaledSystem,

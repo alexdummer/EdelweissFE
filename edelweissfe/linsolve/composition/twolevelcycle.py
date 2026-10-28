@@ -74,7 +74,9 @@ class TwoLevelCycle:
         amgclTree
             The field's AMGCL tree. Its ``relax`` (a Chebyshev polynomial, without Jacobi scaling), ``npre`` and
             ``npost`` are the fine smoother, with AMGCL's defaults for what it leaves out; the default trees, the one
-            place of EdelweissFE's defaults, are :func:`~edelweissfe.linsolve.composition.amg.defaultFieldTree`.
+            place of EdelweissFE's defaults, are :func:`~edelweissfe.linsolve.composition.amg.defaultFieldTree` and,
+            for the corner-node two-level cycle,
+            :func:`~edelweissfe.linsolve.composition.amg.defaultCornerNodeTwoLevelTree`.
         backendBlockSize
             The storage of the fine operator: ``1`` (scalar entries), or ``2``/``3`` (node-wise blocks of the field's
             components: less memory traffic per product, the same cycle up to the order of summation).

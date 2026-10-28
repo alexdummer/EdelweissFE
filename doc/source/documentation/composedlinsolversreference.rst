@@ -298,15 +298,43 @@ relaxation as the 2D and 3D fields, on the scalar backend. ``AMG(backendBlockSiz
 field on the scalar backend, the only one that takes the rotations (:ref:`blockamg-block-nullspace`); a tree with another coarsening than
 smoothed aggregation on a block backend needs ``blockTranslationNullspace=False``, which is checked.
 
-The 3D displacement field of the ``blockAMG()`` preset gets the rigid-body coarse level
+A linear 3D displacement field of the ``blockAMG()`` preset gets the rigid-body coarse level
 (``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())``), configured by the same tree: its ``relax`` and ``npre``/``npost`` are the
 fine smoother of the rigid-body coarse level, its ``coarsening`` the aggregation of that level, and the whole tree the
-AMGCL hierarchy below it. ``TwoLevel(coarseSpace=CornerNodeInterpolation())`` reads its fine smoother from the tree in the same
-spelling; its coarse solve is a component of its own, ``CornerNodeInterpolation(coarseSolve=...)`` (by default
-``DiagonalScaling(AMG())``), with its own tree. Only a genuinely scalar field (nodal dimension 1) gets the plain scalar
-tree, which predates the vector recipe and was never re-tuned against it. AMGCL warns on stderr about a parameter key
-it does not recognise and otherwise ignores it, so check its stderr if an override appears to do nothing; a Chebyshev
-``relax``, EdelweissFE's own, rejects such a key instead.
+AMGCL hierarchy below it. Only a genuinely scalar field (nodal dimension 1) gets the plain scalar tree, which predates
+the vector recipe and was never re-tuned against it. AMGCL warns on stderr about a parameter key it does not recognise
+and otherwise ignores it, so check its stderr if an override appears to do nothing; a Chebyshev ``relax``,
+EdelweissFE's own, rejects such a key instead.
+
+The corner-node two-level cycle's default tree is another: ``TwoLevel(coarseSpace=CornerNodeInterpolation())`` reads
+its fine smoother from the tree in the same spelling (``relax``, ``npre``, ``npost``; it has no coarsening of its
+own). For the corner-node two-level cycle, degree 16 is stronger than it pays: degree 8 costs half the products per
+sweep for fewer than twice the outer iterations (:ref:`measured-corner-node-two-level-smoother`). So a ``TwoLevel`` on
+``CornerNodeInterpolation`` that is given no tree takes ``CornerNodeInterpolation.defaultTree(field)``: for a 3D
+displacement field, the vector field's tree with a Chebyshev polynomial of degree 8 on the interval from 0.03 to 1.1
+times the spectral radius (:func:`~edelweissfe.linsolve.composition.amg.defaultCornerNodeTwoLevelTree`), where it was
+measured; any other field keeps its default tree (``defaultFieldTree(field.dimension)``):
+
+.. code-block:: json
+
+    {
+        "coarsening": {
+            "type": "smoothed_aggregation",
+            "aggr": {"eps_strong": 0.01},
+            "estimate_spectral_radius": true
+        },
+        "relax": {"type": "chebyshev", "degree": 8, "lower": 0.03, "higher": 1.1},
+        "npre": 0,
+        "npost": 1
+    }
+
+``AMG()`` and ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` alone keep degree 16: there, degree 8 gained
+nothing. Each level has its own tree. One given to the corner-node two-level cycle
+(``TwoLevel(coarseSpace=CornerNodeInterpolation(), tree=...)``) is its fine smoother only; the coarse level has the tree
+of its coarse solve, ``CornerNodeInterpolation(coarseSolve=...)``. The default coarse solve, ``DiagonalScaling(AMG())``,
+takes AMG's default tree; the ``blockAMG()`` preset gives a 3D displacement field the same smoother on both levels,
+``CornerNodeInterpolation(coarseSolve=DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate(),
+tree=defaultCornerNodeTwoLevelTree())))``.
 
 Every spectral radius in these trees -- of the Chebyshev smoother (``relax``) and of the prolongation smoothing
 (``coarsening`` with ``estimate_spectral_radius``) -- is estimated by ``spectralRadiusSteps`` Arnoldi steps (default
@@ -319,8 +347,9 @@ that sets AMGCL's ``power_iters``, which the Arnoldi steps replace, is refused.
 The rigid-body coarse level: ``RigidBodyModesPerAggregate`` and ``TwoLevel``
 ----------------------------------------------------------------------------
 
-The ``blockAMG()`` preset (``type=blockamg``) gives the 3D displacement field the rigid-body coarse level; ``rigidBodyModesPerAggregate=false``
-switches it off. A 2D displacement field, or a 3D one with other options, gets it in a ``custom`` solver script,
+The ``blockAMG()`` preset (``type=blockamg``) gives a linear 3D displacement field the rigid-body coarse level, and
+the corner-node field of a quadratic one too (as the coarse solve of its corner-node two-level cycle);
+``rigidBodyModesPerAggregate=false`` switches it off, ``cornerNodeInterpolation=false`` the corner-node two-level cycle. A 2D displacement field, or a 3D one with other options, gets it in a ``custom`` solver script,
 ``OnField(name, TwoLevel(coarseSpace=RigidBodyModesPerAggregate(...), ...))``. The field must be on a block backend
 (``backendBlockSize`` 2 or 3, the default of a 2D or 3D field), and its tree must smooth with a Chebyshev polynomial
 (``relax.type`` ``chebyshev``, without ``relax.scale``, ``relax.spectralRadiusSteps`` at least 1) and coarsen by smoothed
