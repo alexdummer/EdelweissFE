@@ -280,6 +280,30 @@ by this default.
 
 Not yet measured live: with Newton in the loop, and with the hierarchies reused over several solves.
 
+.. _measured-two-level-written-out:
+
+The two-level cycle written out
+-------------------------------
+
+See :ref:`composed-two-level-two-ways`.
+
+The corner-node two-level cycle in C++, ``TwoLevel(coarseSpace=CornerNodeInterpolation(coarseSolve))``, against the
+same cycle written out, ``Multiplicative([CoarseCorrection(cornerNodeInterpolation, coarseSolve), smoother])``: the same
+:math:`P` (bit for bit), the same coarse solve, and as the smoother AMGCL's Chebyshev relaxation (degree 8, on the
+scalar double-precision matrix: EdelweissFE has no Chebyshev component). Offline, on the displacement blocks of three
+captured systems (a tunnel lining, a damage cylinder, an edge breakout), each inside ``LGMRES(DiagonalScaling(.))`` to
+:math:`10^{-6}`, in repetitions.
+
+Both forms need the same iterations on every system, and the written-out cycle takes markedly more wall time, in its
+applications and in its set-up. Forming ``CoarseCorrection``'s products with :math:`P` and :math:`P^T A P` threaded,
+instead of in SciPy, made each of them several times faster and the written-out cycle faster as a whole, most in the
+set-up, but not as fast as the C++ cycle. In one application of the written-out cycle the smoother takes most of the
+time; the residual of ``Multiplicative`` and the coarse correction take a small share each. The C++ cycle smooths on its
+fine level stored in single-precision 3x3 node blocks, half the bytes per product; the same C++ cycle on
+double-precision scalar entries (``backendBlockSize=1, backendPrecision="double"``) was slower per application on every
+system. What remains of the difference is that smoother, and in the set-up the bench script's own search for the
+Dirichlet rows in NumPy, on one thread.
+
 .. _measured-defaults:
 
 Why the defaults are what they are

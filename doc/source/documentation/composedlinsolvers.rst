@@ -139,7 +139,8 @@ Components
     * - ``CoarseCorrection(P, coarseSolve)``, ``Jacobi(omega)``
       - :math:`P A_c^{-1} P^T` with :math:`A_c = P^T A P`, and :math:`\omega \operatorname{diag}(A)^{-1}`: the pieces
         of a two-level cycle spelled out, ``Multiplicative([Jacobi(), CoarseCorrection(P, coarseSolve), Jacobi()])``
-        (slow, for learning and new coarse spaces; see :ref:`composed-two-level-two-ways`). ``P`` is a matrix, or a
+        (slower than ``TwoLevel``: for learning and new coarse spaces; see
+        :ref:`composed-performance-of-forms`). ``P`` is a matrix, or a
         callable ``(A, context) -> (P, coarseContext)`` that also says what the coarse dofs are, e.g.
         ``context.ofCoarseNodes(field, isCorner)`` for the P1 interpolant: then the coarse solve may be any solver
         of a displacement field, ``DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate()))``
@@ -174,14 +175,12 @@ production runs; ``blockAMG()`` (``type=blockamg``) uses it for 3D displacement 
 
 The spelled-out way builds the same cycle from general components, each of which can be replaced -- another smoother,
 a coarse space of your own (any :math:`P`), a direct coarse solve. Use it to learn how a two-level cycle works and to
-try a new coarse space or smoother. It is correct, but slow: on a 631k-dof displacement block it costs about twice as
-much per application as ``TwoLevel`` (101 ms plus about 98 ms). The difference is where the work runs:
-
-* ``TwoLevel`` keeps one compact copy of the field block (single precision, 3x3 node blocks) for the smoother and its
-  residuals; the spelled-out components work on the general double-precision matrix and so read about twice the bytes
-  per product;
-* ``TwoLevel`` forms :math:`P x`, :math:`P^T r` and :math:`P^T A P` threaded in C++; ``CoarseCorrection`` uses SciPy;
-* ``Multiplicative`` forms the residual :math:`r - A z` between its steps; ``TwoLevel`` takes it from the smoother.
+try a new coarse space or smoother. It is correct, but slower than ``TwoLevel``, at the same iterations
+(:ref:`measured-two-level-written-out`). Not because it is Python: its products all run threaded in C++ --
+``Multiplicative`` forms its residuals in the threaded pass of the field split, and ``CoarseCorrection`` forms
+:math:`P^T r`, :math:`P z` and :math:`P^T A P` with AMGCL's threaded products -- but because of the smoother.
+``TwoLevel`` keeps one compact copy of the field block (single precision, 3x3 node blocks) for its Chebyshev smoother,
+which reads half the bytes per product; a smoother component works on the general double-precision matrix.
 
 The testfile deck ``testfiles/edelweiss-only/TwoLevelSpelledOut`` runs the spelled-out cycle in a simulation, on
 quadratic elements with the P1 interpolant as the coarse space. Its prolongation callable returns :math:`P` together
@@ -205,9 +204,57 @@ for (about 3.7 there), so the default amplifies them and the cycle stalls.
 
 There is no native Chebyshev component yet, so the spelled-out way cannot reproduce ``TwoLevel`` exactly; a
 ``Chebyshev`` component is issue #237 (https://github.com/Edelweiss-Numerics/EdelweissFE/issues/237). The exception
-goes away once these three pieces exist natively: the compact field-block copy kept by the system matrix, a Chebyshev
-smoother component, and threaded products with :math:`P` in ``CoarseCorrection`` (with ``RigidBodyModesPerAggregate`` and
-``CornerNodeInterpolation`` building :math:`P`). Then ``TwoLevel`` is replaced by its spelled-out form.
+goes away once the remaining two pieces exist natively: the compact field-block copy kept by the system matrix, and a
+Chebyshev smoother component on it (``CoarseCorrection`` already multiplies with :math:`P` threaded). Then ``TwoLevel``
+is replaced by its spelled-out form.
+
+.. _composed-performance-of-forms:
+
+Which form to use: what each costs
+----------------------------------
+
+Every component composes with every other, and many methods can be written in more than one way. The ways do not
+cost the same. The rule: **a written-out form is for learning and for trying something new; for production runs,
+take the native component where one exists.** What each form costs, as far as it was measured:
+
+.. list-table::
+    :header-rows: 1
+    :widths: 32 38 30
+
+    * - Written as
+      - Costs
+      - For production runs
+    * - a two-level cycle spelled out, ``Multiplicative([smoother, CoarseCorrection(P, coarseSolve), smoother])``
+      - more wall time than ``TwoLevel``, at the same iterations (:ref:`measured-two-level-written-out`): a smoother
+        component reads the double-precision matrix, ``TwoLevel`` a single-precision copy in 3x3 node blocks, half the
+        bytes per product
+      - ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` or ``TwoLevel(coarseSpace=CornerNodeInterpolation())``
+    * - :math:`P` built by a callable of your own, in NumPy or in a Python loop over the nodes (the deck
+        ``TwoLevelSpelledOut``)
+      - one thread, at every set-up: on a large model a serial pass over its nodes or its matrix (e.g. a search for
+        the Dirichlet rows in NumPy, :ref:`measured-two-level-written-out`) is a noticeable share of a set-up of
+        ``TwoLevel``
+      - ``CornerNodeInterpolation`` (or ``RigidBodyModesPerAggregate``), which build :math:`P` threaded in C++
+    * - ``Jacobi`` as the smoother
+      - a weaker smoother than Chebyshev, and only one that damps at all for :math:`\omega < 2 / \lambda_{max}`
+        (0.4, not the textbook 2/3, on quadratic elements); not measured against Chebyshev on large systems
+      - the Chebyshev smoother inside ``TwoLevel`` or ``AMG``
+    * - ``AMG(backendBlockSize=1)`` or ``TwoLevel(..., backendBlockSize=1)`` on a 3D displacement field
+      - double-precision scalar entries, more bytes per product: the corner-node two-level cycle was slower per
+        application than on the default single-precision 3x3 blocks (:ref:`measured-two-level-written-out`)
+      - the defaults of :ref:`composed-amg-backend`; the scalar backend only where its near null-space is needed
+        (all rigid-body modes in one AMG hierarchy)
+    * - a component of your own in NumPy or SciPy (:ref:`composed-own-component`)
+      - NumPy and SciPy run on one thread: SciPy's sparse product too, whatever ``OMP_NUM_THREADS`` says
+      - fine for trying an idea; keep its products with :math:`A` few, or make them native once it pays
+    * - a preset copied into a solver script and changed
+      - nothing: the components are the same as the preset's, and the composition of ``blockAMG()`` reproduced the
+        former monolithic solver's iterations and its wall time
+      - --
+
+The combinators themselves cost nothing extra: ``Multiplicative`` and ``Additive`` form their residuals with the
+threaded products of the field split, and ``CoarseCorrection`` its products with :math:`P` and :math:`P^T A P`
+threaded too. What makes a written-out form slower is what it is written out *of*.
 
 .. _composed-presets:
 
@@ -313,6 +360,11 @@ script itself, if you like -- and calls ``super().__init__()`` in its constructo
 component. The matrix it is given, ``A``, is a :class:`~edelweissfe.linsolve.composition.systemmatrix.SystemMatrix`,
 not a SciPy matrix: ``A.matrix()`` gives the SciPy CSR matrix (the system matrix also forms the field blocks and the
 scaled matrix for the components that need them).
+
+.. note::
+
+    A component of your own in NumPy or SciPy runs on one thread (SciPy's sparse products too): fine for trying an
+    idea, but slower than the native components on a large model (:ref:`composed-performance-of-forms`).
 
 Four hooks make a component:
 
