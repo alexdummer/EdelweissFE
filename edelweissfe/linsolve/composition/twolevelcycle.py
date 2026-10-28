@@ -23,22 +23,24 @@
 #  The full text of the license can be found in the file LICENSE.md at
 #  the top level directory of EdelweissFE.
 #  ---------------------------------------------------------------------
-"""What the two-level cycles of a vector field (:class:`~edelweissfe.linsolve.composition.twolevel.TwoLevel`) share: the p-two-grid (:mod:`~edelweissfe.linsolve.composition.ptwogrid`) and the rigid-body coarse level
-(:mod:`~edelweissfe.linsolve.composition.rigidbodycoarselevel`).
+"""What the two-level cycles of a vector field (:class:`~edelweissfe.linsolve.composition.twolevel.TwoLevel`) share: the
+corner-node two-level cycle (:mod:`~edelweissfe.linsolve.composition.cornernodetwolevelcycle`) and the rigid-body coarse
+level (:mod:`~edelweissfe.linsolve.composition.rigidbodymodestwolevelcycle`).
 
-Both are one two-level cycle -- fine Chebyshev sweeps on the field's equilibrated block, and the coarse correction
-through an AMGCL hierarchy on the Galerkin coarse operator -- that differ in their coarse level alone, and both are built
-and applied in C++: the shared cycle is ``TwoLevelPreconditioner`` in ``amgcl-wrapper.hpp``, wrapped as
-``_PyAMGCLTwoLevel`` in ``amgcl.pyx``. :class:`TwoLevelPreconditioner` mirrors those bases here: it creates the C++ object,
-which validates every parameter, keeps the fine spectral radius a build may start from, and passes the cycle, the fine
-spectral radius a build ends with, the timings and the report through. A derived class chooses the parameters and builds
-its coarse level, in :meth:`TwoLevelPreconditioner.build`, whose signature is the same for both.
+Both are one two-level cycle -- fine Chebyshev sweeps on the field's scaled block, and the coarse correction on the
+Galerkin coarse operator -- that differ in their coarse level and coarse solve: the rigid-body coarse level solves with
+an AMGCL hierarchy of its own, the corner-node two-level cycle with a component of the composed solver. Both are built
+and applied in C++: the shared cycle is ``TwoLevelCycle`` in ``amgcl-wrapper.hpp``, wrapped as ``_PyAMGCLTwoLevelCycle``
+in ``amgcl.pyx``. :class:`TwoLevelCycle` mirrors those bases here: it creates the C++ object, which validates
+every parameter, keeps the fine spectral radius a build may start from, and passes the cycle, the fine spectral radius a
+build ends with, the timings and the report through. A derived class chooses the parameters and builds its coarse level,
+in its ``build``, from what that coarse level needs.
 """
 
 import numpy as np
 
 
-class TwoLevelPreconditioner:
+class TwoLevelCycle:
     """A two-level preconditioner of one vector field's equilibrated diagonal block, built once per hierarchy refresh and
     applied many times within the outer Krylov solve, with the ``build`` / ``applyPreconditioner`` life cycle of
     :class:`~edelweissfe.linsolve.amgcl.amgcl.PyAMGCLSolver`.
@@ -73,7 +75,7 @@ class TwoLevelPreconditioner:
             raise ValueError(str(error)) from error
 
     @staticmethod
-    def cycleParameters(amgclTree: dict, backendBlockSize: int, backendPrecision: str, coarseHierarchyPrecision: str):
+    def cycleParameters(amgclTree: dict, backendBlockSize: int, backendPrecision: str):
         """The parameters of the cycle, in the one spelling both C++ classes read (``TwoLevelCycleParameters`` in
         ``amgcl-wrapper.hpp``).
 
@@ -90,44 +92,12 @@ class TwoLevelPreconditioner:
             The value type of the stored fine operator and of :math:`P`, :math:`P^T`: ``"double"``, or ``"float"``
             (not for 2x2 blocks) for half the bytes per entry; vectors and sums stay double, and the spectral radius
             is estimated on the double operator.
-        coarseHierarchyPrecision
-            The value type of the AMGCL hierarchy of the coarse level (its whole setup): ``"double"`` or ``"float"``.
         """
         return {
             "amgcl": amgclTree,
             "backendBlockSize": backendBlockSize,
             "backendPrecision": backendPrecision,
-            "coarseHierarchyPrecision": coarseHierarchyPrecision,
         }
-
-    @classmethod
-    def parameterRejection(cls, *args, **kwargs) -> "str | None":
-        """Why these constructor arguments cannot be used, or ``None``. The C++ class checks its parameters as it is
-        created, so this creates one, without a build."""
-        try:
-            cls(*args, **kwargs)
-        except (TypeError, ValueError) as error:
-            return str(error)
-        return None
-
-    def build(self, A, scaling: np.ndarray, coordinates: "np.ndarray | None") -> None:
-        """Build the coarse level, its AMGCL hierarchy and the fine Chebyshev smoother for the field's equilibrated
-        diagonal block, all in C++: everything :meth:`applyPreconditioner` needs.
-
-        Parameters
-        ----------
-        A
-            The field's equilibrated diagonal block :math:`\\hat A = D A D` (scipy CSR), node-major, with its Dirichlet
-            identity rows.
-        scaling
-            The field's slice of the equilibration :math:`D`: a near null-space of :math:`\\hat A` is :math:`D^{-1}`
-            times one of :math:`A`.
-        coordinates
-            The field's node coordinates in its dof order, ``(nNodes, >= dimension)`` (columns beyond the field's
-            dimension, e.g. ``z`` of a 2D field, are ignored), or ``None`` if they are unavailable -- whether a coarse
-            level can do without them is its own business.
-        """
-        raise NotImplementedError()
 
     def _suppliedFineSpectralRadius(self) -> float:
         """The fine spectral radius to hand to the C++ build: the supplied one, or 0 for none, which the C++ build takes
@@ -163,5 +133,5 @@ class TwoLevelPreconditioner:
         return self._preconditioner.timings()
 
     def report(self) -> str:
-        """The coarse level in figures, and the report of its AMGCL hierarchy (diagnostics, not a convergence gate)."""
+        """The coarse level in figures, and the report of its coarse solve (diagnostics, not a convergence gate)."""
         return self._preconditioner.report()

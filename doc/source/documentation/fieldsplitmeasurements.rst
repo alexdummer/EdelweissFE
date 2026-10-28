@@ -177,6 +177,34 @@ hierarchy on the translations against the rigid-body coarse level for the displa
 * the damage cylinder (0.84 M unknowns, implicit dynamics): simulated time 0.215 against 0.185 in the same time,
   and 7.9 against 12.6 outer iterations per solve. The load agrees to 3e-4 at the same simulated times.
 
+.. _measured-scaled-corner-node-interpolation:
+
+The corner-node two-level cycle with scaled weights and a composed coarse solve
+-------------------------------------------------------------------------------
+
+See :ref:`blockamg-p-multigrid`.
+
+Offline, outer iterations and solve time (setup included) to a relative residual of 1e-6 on the displacement block
+alone, one cycle per outer iteration, on the captured systems of :ref:`measured-rigid-body-coarse-level`: the tunnel
+segment, elastic and damaged, and sequences of the damage cylinder and of the edge breakout.
+
+Against the former corner-node two-level cycle -- the plain weights :math:`\tfrac12, \tfrac12` and an AMG coarse
+solve inside its C++ cycle -- the scaled weights with the coarse solve
+``DiagonalScaling(TwoLevel(coarseSpace=RigidBodyModesPerAggregate()))`` needed many times fewer outer iterations on
+the tunnel segment, several times fewer on the damage cylinder and fewer on the edge breakout, and less time on every
+system. They also needed fewer outer iterations than the rigid-body coarse level on the whole field on every system;
+with the fine spectral radius estimated by fewer power iterations than the default trees' 300, they were also faster
+on almost every system, while the power iterations of the default trees, on the fine level of the cycle above all,
+take back much of that gain in setup. The iterations agree with those of the offline prototype the method was
+developed in. Calling the coarse component back from the C++ cycle, with the restriction and the prolongation, is a
+small part of an application next to the fine Chebyshev sweep.
+
+Other coarse solves on the corner-node field: ``TwoLevel(coarseSpace=RigidBodyModesPerAggregate())`` without the
+second scaling needed the same iterations where the scaling varies little along the edges (the tunnel, the cylinder),
+and many more on the edge breakout, where midside diagonals are far smaller than their corners';
+``DiagonalScaling(AMG(backendBlockSize=1))``, an AMG hierarchy with the rigid-body modes of the corners, needed as
+many or more iterations and more time on every system.
+
 .. _measured-defaults:
 
 Why the defaults are what they are
@@ -203,7 +231,7 @@ contact anchor model with many multi-point-constraint slaves):
   per simulated time, and the contact model, with more outer iterations at fewer Newton iterations; both
   ran no slower. The translations are the near-null-space of the elastic operator, and help less on a
   softening, indefinite one.
-* **The rigid-body coarse level** for the 3D displacement field (``rigidBodyCoarseLevel``), which holds the rotations
+* **The rigid-body coarse level** for the 3D displacement field (``rigidBodyModesPerAggregate``), which holds the rotations
   the translations cannot: offline, on captured systems of three models and of the testfile deck, never more outer
   iterations than the hierarchy on the translations and up to three times fewer on a bending-dominated one, at a setup
   of up to 1.2 times; live, faster on all three models measured, with the same results (see
