@@ -100,8 +100,7 @@ class AliasedCSRMatrix(csr_matrix):
         super().__setattr__(name, value)
 
     def copy(self):
-        # Always hand back a plain, unrestricted csr_matrix: once copied, the arrays
-        # are independent of the generator's buffer and safe to mutate freely.
+        # A plain csr_matrix: the copied arrays are independent of the generator's buffer.
         c = super().copy()
         return csr_matrix((c.data, c.indices, c.indptr), shape=c.shape)
 
@@ -213,8 +212,6 @@ cdef class CSRGenerator:
 
     def __init__(self, systemMatrix, bint patternOnly=False):
         # Ensure int32 dtype regardless of the source array's dtype.
-        # dofmanager.py already produces np.intc arrays, but we guard here
-        # in case CSRGenerator is called from outside the standard path.
         cdef int[::1] I = np.asarray(systemMatrix.I, dtype=np.intc)  # noqa
         cdef int[::1] J = np.asarray(systemMatrix.J, dtype=np.intc)
 
@@ -248,9 +245,7 @@ cdef class CSRGenerator:
 
         self.data_view = self.csrMatrix.data
 
-        # Construction (including scipy's own internal format check/prune) is done;
-        # from here on, structural mutation of this specific matrix is unsafe -- see
-        # AliasedCSRMatrix's docstring.
+        # Construction (incl. scipy's internal prune) is done; forbid structural mutation from now on.
         self.csrMatrix._locked = True
 
     def addToPattern(self, entries):

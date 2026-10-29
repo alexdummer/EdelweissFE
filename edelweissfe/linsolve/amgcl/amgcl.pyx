@@ -402,14 +402,11 @@ cdef int _preconditionerCallbackTrampoline(void* ctx, int n, const double* rhs, 
     """
     cdef _PreconditionerCallback callback = <_PreconditionerCallback> ctx
     cdef Py_ssize_t i
-    # rhs arrives as a `const double*` (C++'s own storage, never meant to be written through) -- copied into a fresh
-    # numpy array rather than wrapped in a zero-copy memoryview, which would need casting away the pointer's
-    # constness: one pass over a vector, small against the application itself.
+    # rhs is AMGCL's const internal storage: copied into a fresh numpy array rather than cast to non-const.
     cdef np.ndarray[np.float64_t, ndim=1, mode="c"] rhsArr
     cdef double[::1] xView
     try:
-        # inside the try: a MemoryError here must be kept and re-raised like any other failure, not swallowed by
-        # this noexcept function, which would leave x stale and the solve "successful"
+        # inside the try, so that a MemoryError is stashed and re-raised like any other failure
         rhsArr = np.empty(n, dtype=np.float64)
         for i in range(n):
             rhsArr[i] = rhs[i]

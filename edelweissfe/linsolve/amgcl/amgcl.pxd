@@ -31,10 +31,8 @@ from libcpp.vector cimport vector
 
 
 cdef extern from "amgcl-wrapper.hpp":
-    # The interface every AMGCL solver backend implements (scalar or B x B blocks, double or float):
-    # the matrix values and rhs/x are always double at this boundary, each backend converts
-    # internally -- see AMGCLSolverInterface. On a block backend set_nullspace() takes the translations
-    # only, one diagonal block per node (see amgcl-block-translations.hpp).
+    # The interface of every AMGCL solver backend (scalar or block, double or float); values are double
+    # at this boundary. On a block backend set_nullspace() takes the translations only.
     cdef cppclass AMGCLSolverInterface:
         void set_nullspace(const double* B, int rows, int cols) except +
         void build(int n, const int* ptr, const int* col, const double* val) except +
